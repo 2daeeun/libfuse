@@ -160,21 +160,27 @@ static void lo_init(void *userdata, struct fuse_conn_info *conn)
 	struct lo_data *lo = (struct lo_data *)userdata;
 	bool has_flag;
 
+	/* request kernel passthrough */
+	has_flag = fuse_set_feature_flag(conn, FUSE_CAP_PASSTHROUGH);
+	if (lo->debug && has_flag)
+		fuse_log(FUSE_LOG_DEBUG, "lo_init: enabling passthrough\n");
+
+	/* backing under FUSE only (safe default) */
+	conn->max_backing_stack_depth = FUSE_BACKING_STACKED_UNDER;
+
 	if (lo->writeback) {
-		has_flag =
-			fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
+		has_flag = fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
 		if (lo->debug && has_flag)
-			fuse_log(FUSE_LOG_DEBUG,
-				 "lo_init: activating writeback\n");
-	}
-	if (lo->flock && conn->capable & FUSE_CAP_FLOCK_LOCKS) {
-		has_flag = fuse_set_feature_flag(conn, FUSE_CAP_FLOCK_LOCKS);
-		if (lo->debug && has_flag)
-			fuse_log(FUSE_LOG_DEBUG,
-				 "lo_init: activating flock locks\n");
+			fuse_log(FUSE_LOG_DEBUG, "lo_init: activating writeback\n");
 	}
 
-	/* Disable the receiving and processing of FUSE_INTERRUPT requests */
+	if (lo->flock && (conn->capable & FUSE_CAP_FLOCK_LOCKS)) {
+		has_flag = fuse_set_feature_flag(conn, FUSE_CAP_FLOCK_LOCKS);
+		if (lo->debug && has_flag)
+			fuse_log(FUSE_LOG_DEBUG, "lo_init: activating flock locks\n");
+	}
+
+	/* we don't use FUSE_INTERRUPT */
 	conn->no_interrupt = 1;
 }
 
@@ -832,13 +838,29 @@ static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 
 	if (lo_debug(req))
 		fuse_log(FUSE_LOG_DEBUG,
-			 "lo_create(parent=%" PRIu64 ", name=%s)\n", parent,
-			 name);
+			 "lo_create(parent=%" PRIu64 ", name=%s)\n", parent, name);
 
 	fd = openat(lo_fd(req, parent), name,
 		    (fi->flags | O_CREAT) & ~O_NOFOLLOW, mode);
 	if (fd == -1)
-		return (void)fuse_reply_err(req, errno);
+		return (void) fuse_reply_err(req, errno);
+
+	/* register backing file for kernel passthrough (before reply) */
+	{
+		int backing_id = fuse_passthrough_open(req, fd);
+		if (backing_id > 0) {
+			fi->backing_id = backing_id;
+			if (lo->debug)
+				fuse_log(FUSE_LOG_DEBUG,
+					 "lo_create: backing_id=%d (passthrough on)\n",
+					 backing_id);
+		} else {
+			if (lo->debug)
+				fuse_log(FUSE_LOG_ERR,
+					 "lo_create: BACKING_OPEN failed errno=%d (fallback)\n",
+					 errno);
+		}
+	}
 
 	fi->fh = fd;
 	if (lo->cache == CACHE_NEVER)
@@ -846,9 +868,11 @@ static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 	else if (lo->cache == CACHE_ALWAYS)
 		fi->keep_cache = 1;
 
-	/* parallel_direct_writes feature depends on direct_io features.
-	   To make parallel_direct_writes valid, need set fi->direct_io
-	   in current function. */
+	/* honor O_DIRECT → enable direct_io for parallel_direct_writes */
+	if (fi->flags & O_DIRECT)
+		fi->direct_io = 1;
+
+	/* required for kernel parallel direct writes */
 	fi->parallel_direct_writes = 1;
 
 	err = lo_do_lookup(req, parent, name, &e);
@@ -881,26 +905,38 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 		fuse_log(FUSE_LOG_DEBUG, "lo_open(ino=%" PRIu64 ", flags=%d)\n",
 			 ino, fi->flags);
 
-	/* With writeback cache, kernel may send read requests even
-	   when userspace opened write-only */
+	/* writeback: WRONLY → RDWR */
 	if (lo->writeback && (fi->flags & O_ACCMODE) == O_WRONLY) {
 		fi->flags &= ~O_ACCMODE;
 		fi->flags |= O_RDWR;
 	}
 
-	/* With writeback cache, O_APPEND is handled by the kernel.
-	   This breaks atomicity (since the file may change in the
-	   underlying filesystem, so that the kernel's idea of the
-	   end of the file isn't accurate anymore). In this example,
-	   we just accept that. A more rigorous filesystem may want
-	   to return an error here */
+	/* writeback: strip O_APPEND */
 	if (lo->writeback && (fi->flags & O_APPEND))
 		fi->flags &= ~O_APPEND;
 
+	/* duplicate underlying fd via /proc/self/fd/<ino-fd> */
 	sprintf(buf, "/proc/self/fd/%i", lo_fd(req, ino));
 	fd = open(buf, fi->flags & ~O_NOFOLLOW);
 	if (fd == -1)
-		return (void)fuse_reply_err(req, errno);
+		return (void) fuse_reply_err(req, errno);
+
+	/* register backing file for kernel passthrough (before reply) */
+	{
+		int backing_id = fuse_passthrough_open(req, fd);
+		if (backing_id > 0) {
+			fi->backing_id = backing_id;
+			if (lo->debug)
+				fuse_log(FUSE_LOG_DEBUG,
+					 "lo_open: backing_id=%d (passthrough on)\n",
+					 backing_id);
+		} else {
+			if (lo->debug)
+				fuse_log(FUSE_LOG_ERR,
+					 "lo_open: BACKING_OPEN failed errno=%d (fallback)\n",
+					 errno);
+		}
+	}
 
 	fi->fh = fd;
 	if (lo->cache == CACHE_NEVER)
@@ -908,26 +944,29 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	else if (lo->cache == CACHE_ALWAYS)
 		fi->keep_cache = 1;
 
-	/* Enable direct_io when open has flags O_DIRECT to enjoy the feature
-        parallel_direct_writes (i.e., to get a shared lock, not exclusive lock,
-	for writes to the same file in the kernel). */
+	/* honor O_DIRECT → enable direct_io */
 	if (fi->flags & O_DIRECT)
 		fi->direct_io = 1;
 
-	/* parallel_direct_writes feature depends on direct_io features.
-	   To make parallel_direct_writes valid, need set fi->direct_io
-	   in current function. */
+	/* required for kernel parallel direct writes */
 	fi->parallel_direct_writes = 1;
 
 	fuse_reply_open(req, fi);
 }
 
-static void lo_release(fuse_req_t req, fuse_ino_t ino,
-		       struct fuse_file_info *fi)
+static void lo_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
 	(void)ino;
 
-	close(fi->fh);
+	/* release backing mapping first */
+	if ((int)fi->backing_id > 0) {
+		(void)fuse_passthrough_close(req, fi->backing_id);
+		fi->backing_id = 0;
+	}
+
+	if (fi->fh >= 0)
+		close(fi->fh);
+
 	fuse_reply_err(req, 0);
 }
 

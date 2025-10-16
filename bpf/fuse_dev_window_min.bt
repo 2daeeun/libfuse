@@ -1,0 +1,23 @@
+BEGIN {
+  printf("op,unit,fusedev_read_calls,fusedev_write_calls,fusedev_time_us,total_us\n");
+}
+
+/* 측정 윈도우: dd의 write 1회 */
+tracepoint:syscalls:sys_enter_write /comm=="dd"/ {
+  @t0 = nsecs; @tret = 0;
+  @fuse_us = 0; @fr = 0; @fw = 0;
+}
+
+kprobe:fuse_dev_do_read  /@t0/        { @tsr[tid] = nsecs; @fr++; }
+kretprobe:fuse_dev_do_read /@tsr[tid]/ { @fuse_us += (nsecs - @tsr[tid]) / 1000; delete(@tsr[tid]); }
+
+kprobe:fuse_dev_do_write  /@t0/        { @tsw[tid] = nsecs; @fw++; }
+kretprobe:fuse_dev_do_write /@tsw[tid]/ { @fuse_us += (nsecs - @tsw[tid]) / 1000; delete(@tsw[tid]); }
+
+tracepoint:syscalls:sys_exit_write /comm=="dd" && @t0/ { @tret = nsecs; }
+
+END /@t0 && @tret/ {
+  printf("WRITE,usec,%d,%d,%llu,%llu\n",
+         @fr, @fw, @fuse_us, (@tret - @t0)/1000);
+}
+

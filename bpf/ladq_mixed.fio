@@ -1,0 +1,40 @@
+# 혼합: 작은·동기(LLQ) + 대용량·배치(BQ) 동시 수행
+[global]
+ioengine=io_uring
+direct=0
+time_based=1
+runtime=60s
+ramp_time=5s
+group_reporting=0
+lat_percentiles=1
+percentile_list=50,90,95,99,99.5,99.9
+write_lat_log=sm_sync
+log_avg_msec=100
+
+[sm_sync]
+rw=randwrite
+bs=4k
+iodepth=1
+numjobs=1
+nrfiles=2000
+filesize=32k
+openfiles=64
+create_on_open=1
+unlink=1
+fsync=1
+directory=__MNT__/ladq_llq
+
+[bulk_q]
+rw=write
+bs=1M
+iodepth=128
+numjobs=8
+# iodepth=64
+# numjobs=4
+# 고유 파일명(중요): bulk_1.bin, bulk_2.bin ...
+filename_format=bulk_$jobnum.bin
+size=2G                      # 먼저 2G로 줄여 sanity 체크
+fallocate=1                  # 빠른 프리얼로케이션(가능하면)
+unlink=1
+directory=__MNT__/ladq_bq
+

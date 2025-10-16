@@ -1,0 +1,42 @@
+/* WRITE 1-shot breakdown (unit: usec)
+ * app: "dd", daemon: "passthrough_ll"  ← 필요시 이름만 바꾸세요
+ */
+BEGIN {
+  printf("op,unit,prepare_req_us,ctx_to_daemon_us,send_req_us,daemon_exec_us,send_reply_us,ctx_to_app_us,return_us,total_us\n");
+}
+
+/* app syscall */
+tracepoint:syscalls:sys_enter_write  /comm=="dd"/            { @t0 = nsecs; }
+tracepoint:syscalls:sys_exit_write   /comm=="dd" && @t0/     { @tret = nsecs; }
+
+/* first daemon wake /dev/fuse path */
+tracepoint:sched:sched_wakeup /args->comm=="passthrough_ll" && !@twake_daemon/ { @twake_daemon = nsecs; }
+
+tracepoint:syscalls:sys_enter_read /comm=="passthrough_ll"/  { if (!@td_read_in)  { @td_read_in  = nsecs; } }
+tracepoint:syscalls:sys_exit_read  /comm=="passthrough_ll" && @td_read_in && !@td_read_out/ { @td_read_out = nsecs; }
+
+tracepoint:syscalls:sys_enter_write /comm=="passthrough_ll"/ { if (!@td_write_in) { @td_write_in = nsecs; } }
+tracepoint:syscalls:sys_exit_write  /comm=="passthrough_ll" && @td_write_in && !@td_write_out/ { @td_write_out = nsecs; }
+
+/* wake app after reply */
+tracepoint:sched:sched_wakeup /@td_write_out && args->comm=="dd" && !@twake_app/ { @twake_app = nsecs; }
+
+/* print */
+END /@t0 && @tret/ {
+  $t0=@t0; $tret=@tret;
+  $wd=@twake_daemon; $rin=@td_read_in; $rout=@td_read_out;
+  $win=@td_write_in; $wout=@td_write_out; $wa=@twake_app;
+
+  $prep  = ($wd  && $t0  ) ? ($wd   - $t0 )/1000 : 0;
+  $ctxd  = ($rin && $wd  ) ? ($rin  - $wd )/1000 : 0;
+  $sreq  = ($rout&& $rin ) ? ($rout - $rin)/1000 : 0;
+  $dexec = ($win && $rout) ? ($win  - $rout)/1000: 0;
+  $srep  = ($wout&& $win ) ? ($wout - $win )/1000 : 0;
+  $ctxa  = ($wa  && $wout) ? ($wa   - $wout)/1000: 0;
+  $ret   = ($tret&& $wa  ) ? ($tret - $wa )/1000 : 0;
+  $total = ($tret - $t0)/1000;
+
+  printf("WRITE,usec,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+         $prep,$ctxd,$sreq,$dexec,$srep,$ctxa,$ret,$total);
+}
+

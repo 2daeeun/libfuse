@@ -1,0 +1,68 @@
+BEGIN {
+  printf("op,unit,prepare_req_us,ctx_to_daemon_us,send_req_us,daemon_exec_us,send_reply_us,ctx_to_app_us,return_us,total_us\n");
+}
+
+/* 앱 write 진입 시 '한 번 측정' 상태 초기화 */
+tracepoint:syscalls:sys_enter_write /comm=="dd"/ {
+  @t0 = nsecs; @tret = 0;
+  @twake_daemon = 0; @twake_app = 0;
+  @td_req_in = 0; @td_req_out = 0;      // daemon: 요청 수신( splice/read )
+  @td_rep_in = 0; @td_rep_out = 0;      // daemon: 응답 송신( splice/write )
+  @sp_stage = 0;                        // 0=요청, 1=응답 단계
+}
+
+/* 앱 write 리턴 */
+tracepoint:syscalls:sys_exit_write /comm=="dd" && @t0/ { @tret = nsecs; }
+
+/* 커널이 데몬을 깨움 */
+tracepoint:sched:sched_wakeup /args->comm=="passthrough_hp" && !@twake_daemon/ {
+  @twake_daemon = nsecs;
+}
+
+/* ----- 데몬 측 전송: splice 우선, 없으면 read/write ----- */
+/* 요청 수신 (첫 splice 또는 첫 read) */
+tracepoint:syscalls:sys_enter_splice /comm=="passthrough_hp"/ {
+  if (@sp_stage == 0 && !@td_req_in) { @td_req_in = nsecs; }
+}
+tracepoint:syscalls:sys_exit_splice /comm=="passthrough_hp"/ {
+  if (@sp_stage == 0 && @td_req_in && !@td_req_out) { @td_req_out = nsecs; @sp_stage = 1; }
+}
+/* 응답 송신 (두 번째 splice) */
+tracepoint:syscalls:sys_enter_splice /comm=="passthrough_hp"/ {
+  if (@sp_stage == 1 && !@td_rep_in) { @td_rep_in = nsecs; }
+}
+tracepoint:syscalls:sys_exit_splice /comm=="passthrough_hp"/ {
+  if (@sp_stage == 1 && @td_rep_in && !@td_rep_out) { @td_rep_out = nsecs; @sp_stage = 2; }
+}
+
+/* read/write 경로(혹시 splice가 비활성일 때 백업) */
+tracepoint:syscalls:sys_enter_read  /comm=="passthrough_hp"/ { if (@sp_stage == 0 && !@td_req_in) { @td_req_in = nsecs; } }
+tracepoint:syscalls:sys_exit_read   /comm=="passthrough_hp"/ { if (@sp_stage == 0 && @td_req_in && !@td_req_out) { @td_req_out = nsecs; @sp_stage = 1; } }
+tracepoint:syscalls:sys_enter_write /comm=="passthrough_hp"/ { if (@sp_stage == 1 && !@td_rep_in) { @td_rep_in = nsecs; } }
+tracepoint:syscalls:sys_exit_write  /comm=="passthrough_hp"/ { if (@sp_stage == 1 && @td_rep_in && !@td_rep_out) { @td_rep_out = nsecs; @sp_stage = 2; } }
+
+/* 응답 이후 앱 깨움 */
+tracepoint:sched:sched_wakeup /@td_rep_out && args->comm=="dd" && !@twake_app/ {
+  @twake_app = nsecs;
+}
+
+/* 출력 */
+END /@t0 && @tret/ {
+  $t0=@t0; $tret=@tret;
+  $wd=@twake_daemon; $wa=@twake_app;
+  $rin=@td_req_in; $rout=@td_req_out;
+  $pin=@td_rep_in; $pout=@td_rep_out;
+
+  $prep  = ($wd  && $t0 ) ? ($wd  - $t0 )/1000 : 0;
+  $ctxd  = ($rin && $wd ) ? ($rin - $wd )/1000 : 0;
+  $sreq  = ($rout&& $rin) ? ($rout- $rin)/1000 : 0;
+  $dexec = ($pin && $rout) ? ($pin - $rout)/1000 : 0;
+  $srep  = ($pout&& $pin) ? ($pout- $pin)/1000 : 0;
+  $ctxa  = ($wa  && $pout)? ($wa  - $pout)/1000: 0;
+  $ret   = ($tret&& $wa ) ? ($tret- $wa )/1000 : 0;
+  $total = ($tret- $t0 )/1000;
+
+  printf("WRITE,usec,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+         $prep,$ctxd,$sreq,$dexec,$srep,$ctxa,$ret,$total);
+}
+

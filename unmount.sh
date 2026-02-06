@@ -23,9 +23,17 @@
 # sudo mount /dev/nvme0n1p7 /mnt/nvme0n1p7/
 
 # # /mnt/nvme0n1p8/ (80GB)
-sudo rm -r /mnt/fuse/
-sudo mkdir /mnt/fuse/
-sudo umount /mnt/nvme0n1p8/
-sudo dd if=/dev/zero of=/dev/nvme0n1p8 bs=4M status=progress && sync
-sudo mkfs.ext4 /dev/nvme0n1p8
-sudo mount /dev/nvme0n1p8 /mnt/nvme0n1p8/
+# sudo rm -r /mnt/fuse/
+# sudo mkdir /mnt/fuse/
+# sudo umount /mnt/nvme0n1p8/
+# sudo dd if=/dev/zero of=/dev/nvme0n1p8 bs=4M status=progress && sync
+# sudo mkfs.ext4 /dev/nvme0n1p8
+# sudo mount /dev/nvme0n1p8 /mnt/nvme0n1p8/
+
+# # /mnt/nvme0n1p1 (1TB)
+# sudo rm -r /mnt/fuse/
+# sudo mkdir /mnt/fuse/
+# sudo umount /mnt/nvme0n1p1/
+# sudo dd if=/dev/zero of=/dev/nvme0n1p1 bs=4M status=progress && sync
+# sudo mkfs.ext4 /dev/nvme0n1p1
+# sudo mount /dev/nvme0n1p1 /mnt/nvme0n1p1

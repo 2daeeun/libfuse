@@ -1,3 +1,150 @@
+
+## 1) uring 활성화(enable_uring)
+
+```bash
+# 존재 확인
+ls -l /sys/module/fuse/parameters/enable_uring
+
+# 활성화(권장: tee 사용)
+echo 1 | sudo tee /sys/module/fuse/parameters/enable_uring
+cat /sys/module/fuse/parameters/enable_uring
+```
+
+---
+
+## 2) libfuse + passthrough_ll 컴파일
+
+Arch/EndeavourOS 기준 패키지:
+
+```bash
+sudo pacman -S --needed git base-devel meson ninja pkgconf fuse3
+```
+
+libfuse 빌드(예제 포함):
+
+```bash
+git clone https://github.com/libfuse/libfuse.git
+cd libfuse
+meson setup build -Dexamples=true
+ninja -C build
+```
+
+생성 바이너리 경로:
+
+```bash
+ls -l build/example/passthrough_ll
+```
+
+passthrough_ll 실행
+
+```bash
+sudo ./build/example/passthrough_ll \
+  -f -d -o debug \
+  -o source=/mnt/nvme0n1p8 \
+  -o io_uring -o io_uring_q_depth=64 \
+  /mnt/fuse
+```
+
+---
+
+## 3) bpftrace로 `fuse_uring_copy_to_ring()` 코어별 호출 횟수 카운트
+
+### 3-1) probe가 가능한 이름인지 확인
+
+64코어 환경에서 “안 나옴”은 심볼 이름이 바뀐 케이스가 많다(`.isra.0` 같은 suffix). 먼저 목록 확인.
+
+```bash
+sudo bpftrace -l 'kprobe:fuse_uring_copy_to_ring*'
+```
+
+출력 예:
+
+* `kprobe:fuse_uring_copy_to_ring`
+* `kprobe:fuse_uring_copy_to_ring.isra.0`
+
+### 3-2) 전체 누적 카운트
+
+```bash
+sudo bpftrace -e 'kprobe:fuse_uring_copy_to_ring { @cnt[cpu] = count(); }'
+```
+
+### 3-3) 60초 누적 카운트(자동 종료)
+
+
+```bash
+sudo bpftrace -e '
+kprobe:fuse_uring_copy_to_ring { @cnt[cpu] = count(); }
+interval:s:60 { exit(); }
+'
+```
+
+### 3-4) 매초 분포 확인
+
+```bash
+sudo bpftrace -e '
+kprobe:fuse_uring_copy_to_ring { @cnt[cpu] = count(); }
+interval:s:1 { print(@cnt); clear(@cnt); }
+'
+```
+
+---
+
+## 4) filebench + varmail 실행
+
+```bash
+git clone https://github.com/filebench/filebench.git
+cd filebench
+```
+
+GCC7을 기본 컴파일로 설정하여서 작업
+```bash
+libtoolize
+aclocal
+autoheader
+automake --add-missing
+autoconf
+```
+
+```bash
+./configure
+make -j"$(nproc)"
+sudo make install
+```
+
+ASLR 비활성화
+
+```bash
+# 현재 값 확인 (보통 2)
+cat /proc/sys/kernel/randomize_va_space
+
+# 0으로 변경
+sudo sysctl -w kernel.randomize_va_space=0
+```
+
+varmail 실행
+
+```bash
+sudo filebench -f ./varmail.f
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---
+
+
 libfuse
 =======
 

@@ -25,9 +25,13 @@ td += executable('test_signals', 'test_signals.c',
 td += executable('test_abi', 'test_abi.c',
                  dependencies: [ libfuse_dep ],
                  install: false)
+td += executable('test_extfuse_init', 'test_extfuse_init.c',
+                 dependencies: [ libfuse_dep ],
+                 install: false)
 
 test_scripts = [ 'conftest.py', 'pytest.ini', 'test_examples.py',
-                 'util.py', 'test_ctests.py', 'test_custom_io.py' ]
+                 'util.py', 'test_ctests.py', 'test_custom_io.py',
+                 'test_extfuse.py' ]
 td += custom_target('test_scripts', input: test_scripts,
                       output: test_scripts, build_by_default: true,
                       command: ['cp', '-fPp',

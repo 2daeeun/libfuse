@@ -36,3 +36,17 @@ Build Dependencies:
 - liburing (for io_uring support)
 - libnuma (required alongside liburing)
 - meson build system with option: -Denable-io-uring=true
+
+ExtFUSE interoperability:
+FUSE_CAP_EXTFUSE is independent of FUSE_CAP_OVER_IO_URING. An ExtFUSE-aware
+filesystem loads its BPF program before FUSE_INIT, then does the following in
+its init callback:
+
+    if (fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE))
+        conn->extfuse_prog_fd = prog_fd;
+
+Keep prog_fd open until the INIT response has been processed; keeping the BPF
+object open for the mounted session also preserves its maps and tail-call
+programs. Use the same callback for classic FUSE and for `-o io_uring`. If
+io_uring startup fails, libfuse removes only FUSE_OVER_IO_URING from the INIT
+response and keeps an independently requested ExtFUSE capability.

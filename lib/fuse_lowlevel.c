@@ -2746,6 +2746,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			se->conn.capable_ext |= FUSE_CAP_NO_EXPORT_SUPPORT;
 		if (inargflags & FUSE_OVER_IO_URING)
 			se->conn.capable_ext |= FUSE_CAP_OVER_IO_URING;
+		if (inargflags & FUSE_FS_EXTFUSE)
+			se->conn.capable_ext |= FUSE_CAP_EXTFUSE;
 
 	} else {
 		se->conn.max_readahead = 0;
@@ -2904,6 +2906,10 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_OVER_IO_URING;
 		enable_io_uring = true;
 	}
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE) {
+		outargflags |= FUSE_FS_EXTFUSE;
+		outarg.extfuse_prog_fd = se->conn.extfuse_prog_fd;
+	}
 
 	if ((inargflags & FUSE_REQUEST_TIMEOUT) && se->conn.request_timeout) {
 		outargflags |= FUSE_REQUEST_TIMEOUT;
@@ -2943,6 +2949,9 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		if (se->conn.want_ext & FUSE_CAP_PASSTHROUGH)
 			fuse_log(FUSE_LOG_DEBUG, "   max_stack_depth=%u\n",
 				outarg.max_stack_depth);
+		if (se->conn.want_ext & FUSE_CAP_EXTFUSE)
+			fuse_log(FUSE_LOG_DEBUG, "   extfuse_prog_fd=%u\n",
+				outarg.extfuse_prog_fd);
 	}
 	if (arg->minor < 5)
 		outargsize = FUSE_COMPAT_INIT_OUT_SIZE;

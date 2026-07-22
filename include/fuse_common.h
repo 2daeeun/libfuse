@@ -513,6 +513,16 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_OVER_IO_URING (1UL << 31)
 
 /**
+ * Indicates that the kernel supports ExtFUSE BPF extensions.
+ *
+ * This feature is disabled by default. A filesystem that wants to use it
+ * must load an ExtFUSE BPF program, store its file descriptor in
+ * `fuse_conn_info.extfuse_prog_fd`, and enable this capability with
+ * fuse_set_feature_flag() from its init() handler.
+ */
+#define FUSE_CAP_EXTFUSE (1ULL << 34)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine
@@ -706,10 +716,19 @@ struct fuse_conn_info {
 	 */
 	uint16_t request_timeout;
 
+	/* Reserved alignment slot consumed together with extfuse_prog_fd. */
+	uint16_t extfuse_padding;
+
+	/**
+	 * File descriptor of the ExtFUSE BPF program to pass to the kernel.
+	 * This field is used only when FUSE_CAP_EXTFUSE is enabled.
+	 */
+	uint32_t extfuse_prog_fd;
+
 	/**
 	 * For future use.
 	 */
-	uint16_t reserved[31];
+	uint16_t reserved[28];
 };
 
 struct fuse_session;

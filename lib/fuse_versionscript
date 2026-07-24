@@ -216,6 +216,7 @@ FUSE_3.18 {
 	global:
 		fuse_req_is_uring;
 		fuse_req_get_payload;
+		fuse_set_conn_flag;
 		fuse_lowlevel_notify_increment_epoch;
 
 		fuse_reply_statx;

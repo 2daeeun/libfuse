@@ -60,7 +60,9 @@ struct fuse_ring_queue {
 	struct io_uring ring;
 
 	pthread_mutex_t ring_lock;
-	bool cqe_processing;
+
+	/* batched inline replies across cqe handling; flushed by the loop */
+	_Atomic bool cqe_processing;
 
 	/* size depends on queue depth */
 	struct fuse_ring_ent ent[];
@@ -71,6 +73,9 @@ struct fuse_ring_queue {
  */
 struct fuse_ring_pool {
 	struct fuse_session *se;
+
+	/* mirror of se->conn.io_uring_single_issuer, fixed at ring creation */
+	bool single_issuer;
 
 	/* number of queues */
 	size_t nr_queues;
@@ -159,7 +164,7 @@ static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 				 struct fuse_ring_queue *queue,
 				 struct fuse_ring_ent *ring_ent)
 {
-	bool locked = false;
+	const bool locked = !ring_pool->single_issuer;
 	struct fuse_session *se = ring_pool->se;
 	struct fuse_uring_req_header *rrh = ring_ent->req_header;
 	struct fuse_out_header *out = (struct fuse_out_header *)&rrh->in_out;
@@ -167,10 +172,14 @@ static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 		(struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
 	struct io_uring_sqe *sqe;
 
-	if (pthread_self() != queue->tid) {
+	/*
+	 * Multi-issuer: serialise every submission-side SQ access under
+	 * ring_lock. Single-issuer: only the uring thread submits, so skip the
+	 * lock and batch inline replies (cqe_processing), flushed by the next
+	 * submit_and_wait().
+	 */
+	if (locked)
 		pthread_mutex_lock(&queue->ring_lock);
-		locked = true;
-	}
 
 	sqe = io_uring_get_sqe(&queue->ring);
 
@@ -181,6 +190,8 @@ static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 		 * SQEs matches the number tof requests.
 		 */
 
+		if (locked)
+			pthread_mutex_unlock(&queue->ring_lock);
 		se->error = -EIO;
 		fuse_log(FUSE_LOG_ERR, "Failed to get a ring SQEs\n");
 
@@ -197,7 +208,7 @@ static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 			 out->unique, ent_in_out->payload_sz);
 	}
 
-	if (!queue->cqe_processing)
+	if (!atomic_load_explicit(&queue->cqe_processing, memory_order_relaxed))
 		io_uring_submit(&queue->ring);
 
 	if (locked)
@@ -341,7 +352,8 @@ int fuse_send_msg_uring(fuse_req_t req, struct iovec *iov, int count)
 }
 
 static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
-				     size_t depth, int fd, int evfd)
+				     size_t depth, int fd, int evfd,
+				     bool single_issuer)
 {
 	int rc;
 	struct io_uring_params params = {0};
@@ -350,6 +362,11 @@ static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
 	depth += 1; /* for the eventfd poll SQE */
 
 	params.flags = IORING_SETUP_SQE128;
+
+	/* Replies are batched and flushed in one io_uring_enter; don't let a
+	 * single failing commit SQE stall submission of the rest of the batch.
+	 */
+	params.flags |= IORING_SETUP_SUBMIT_ALL;
 
 	/* Avoid cq overflow */
 	params.flags |= IORING_SETUP_CQSIZE;
@@ -383,6 +400,19 @@ static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
 			 "Failed to register files for ring idx %zu: %s",
 			 qid, strerror(errno));
 		return rc;
+	}
+
+	if (single_issuer) {
+		/*
+		 * Only fuse_uring_thread() issues io_uring_enter() on this
+		 * ring, so the registered ring-fd index is valid. Non-fatal -
+		 * older kernels just keep using the normal ring fd.
+		 */
+		rc = io_uring_register_ring_fd(ring);
+		if (rc < 0)
+			fuse_log(FUSE_LOG_DEBUG,
+				 "qid=%zu register_ring_fd failed: %s\n",
+				 qid, strerror(-rc));
 	}
 
 	return 0;
@@ -534,6 +564,7 @@ static struct fuse_ring_pool *fuse_create_ring(struct fuse_session *se)
 	fuse_ring->queue_depth = se->uring.q_depth;
 	fuse_ring->max_req_payload_sz = payload_sz;
 	fuse_ring->queue_mem_size = queue_sz;
+	fuse_ring->single_issuer = se->conn.io_uring_single_issuer;
 
 	/*
 	 * very basic queue initialization, that cannot fail and will
@@ -568,7 +599,11 @@ err:
 static void fuse_uring_resubmit(struct fuse_ring_queue *queue,
 				struct fuse_ring_ent *ent)
 {
+	const bool locked = !queue->ring_pool->single_issuer;
 	struct io_uring_sqe *sqe;
+
+	if (locked)
+		pthread_mutex_lock(&queue->ring_lock);
 
 	sqe = io_uring_get_sqe(&queue->ring);
 	if (sqe == NULL) {
@@ -578,6 +613,8 @@ static void fuse_uring_resubmit(struct fuse_ring_queue *queue,
 		 * SQEs matches the number tof requests.
 		 */
 
+		if (locked)
+			pthread_mutex_unlock(&queue->ring_lock);
 		queue->ring_pool->se->error = -EIO;
 		fuse_log(FUSE_LOG_ERR, "Failed to get a ring SQEs\n");
 
@@ -604,7 +641,10 @@ static void fuse_uring_resubmit(struct fuse_ring_queue *queue,
 		break;
 	}
 
-	/* caller submits */
+	if (!atomic_load_explicit(&queue->cqe_processing, memory_order_relaxed))
+		io_uring_submit(&queue->ring);
+	if (locked)
+		pthread_mutex_unlock(&queue->ring_lock);
 }
 
 static void fuse_uring_handle_cqe(struct fuse_ring_queue *queue,
@@ -755,14 +795,14 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 
 	res = fuse_queue_setup_io_uring(&queue->ring, queue->qid,
 					ring->queue_depth, se->fd,
-					queue->eventfd);
+					queue->eventfd, ring->single_issuer);
 	if (res != 0) {
 		fuse_log(FUSE_LOG_ERR, "qid=%d io_uring init failed\n",
 			 queue->qid);
 		return res;
 	}
 
-	queue->req_header_sz = ROUND_UP(sizeof(struct fuse_ring_ent),
+	queue->req_header_sz = ROUND_UP(sizeof(struct fuse_uring_req_header),
 				       page_sz);
 
 	for (size_t idx = 0; idx < ring->queue_depth; idx++) {
@@ -811,6 +851,7 @@ static void *fuse_uring_thread(void *arg)
 	struct fuse_ring_queue *queue = arg;
 	struct fuse_ring_pool *ring_pool = queue->ring_pool;
 	struct fuse_session *se = ring_pool->se;
+	const bool single_issuer = ring_pool->single_issuer;
 	int err;
 	char thread_name[16] = { 0 };
 
@@ -836,17 +877,58 @@ static void *fuse_uring_thread(void *arg)
 
 	sem_wait(&ring_pool->init_sem);
 
+	/*
+	 * Multi-issuer flushes the registration SQEs here - safe without
+	 * ring_lock, no request can reach this queue yet. Single-issuer's
+	 * first submit_and_wait() below flushes them instead.
+	 */
+	if (!single_issuer)
+		io_uring_submit(&queue->ring);
+
 	/* Not using fuse_session_exited(se), as that cannot be inlined */
 	while (!atomic_load_explicit(&se->mt_exited, memory_order_relaxed)) {
-		io_uring_submit_and_wait(&queue->ring, 1);
+		/*
+		 * Single-issuer: one combined submit_and_wait() flushes the
+		 * previous iteration's batched replies and waits. Multi-issuer:
+		 * split it - wait only here (no ring_lock) so off-thread
+		 * repliers keep submitting; the batched inline replies are
+		 * flushed below. The returned cqe is ignored; handle_cqes()
+		 * re-scans and advances the CQ.
+		 */
+		if (single_issuer) {
+			io_uring_submit_and_wait(&queue->ring, 1);
+		} else {
+			struct io_uring_cqe *cqe;
 
-		pthread_mutex_lock(&queue->ring_lock);
-		queue->cqe_processing = true;
+			io_uring_wait_cqe(&queue->ring, &cqe);
+		}
+
+		/*
+		 * Batch inline replies (commit_sqe()/resubmit()) across cqe
+		 * handling. Lock-free: the flag only gates who submits, while
+		 * the SQ stays serialised by ring_lock, so a reply that batched
+		 * here is always flushed by the submit below before the next
+		 * wait - it is never stranded.
+		 */
+		atomic_store_explicit(&queue->cqe_processing, true,
+				      memory_order_relaxed);
+
 		err = fuse_uring_queue_handle_cqes(queue);
-		queue->cqe_processing = false;
-		pthread_mutex_unlock(&queue->ring_lock);
 		if (err < 0)
 			goto err;
+
+		atomic_store_explicit(&queue->cqe_processing, false,
+				      memory_order_relaxed);
+
+		/*
+		 * Multi-issuer does not use io_uring_submit_and_wait(),
+		 * but io_uring_wait_cqe() and locked io_uring_submit().
+		 */
+		if (!single_issuer) {
+			pthread_mutex_lock(&queue->ring_lock);
+			io_uring_submit(&queue->ring);
+			pthread_mutex_unlock(&queue->ring_lock);
+		}
 	}
 
 	return NULL;
@@ -900,12 +982,6 @@ int fuse_uring_start(struct fuse_session *se)
 	}
 
 	se->uring.pool = fuse_ring;
-
-	/* Hold off threads from send fuse ring entries (SQEs) */
-	sem_init(&fuse_ring->init_sem, 0, 0);
-	pthread_cond_init(&fuse_ring->thread_start_cond, NULL);
-	pthread_mutex_init(&fuse_ring->thread_start_mutex, NULL);
-
 	err = fuse_uring_start_ring_threads(fuse_ring);
 	if (err)
 		goto err;

@@ -739,7 +739,7 @@ static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
 	if (num_completed)
 		io_uring_cq_advance(&queue->ring, num_completed);
 
-	return ret == 0 ? 0 : num_completed;
+	return ret;
 }
 
 /**
@@ -973,7 +973,9 @@ int fuse_uring_start(struct fuse_session *se)
 	int err = 0;
 	struct fuse_ring_pool *fuse_ring;
 
-	fuse_uring_sanity_check(se);
+	err = fuse_uring_sanity_check(se);
+	if (err)
+		return err;
 
 	fuse_ring = fuse_create_ring(se);
 	if (fuse_ring == NULL) {

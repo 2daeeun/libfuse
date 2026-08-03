@@ -67,11 +67,15 @@ struct _uintptr_to_must_hold_fuse_ino_t_dummy_struct \
 struct lo_inode {
 	struct lo_inode *next; /* protected by lo->mutex */
 	struct lo_inode *prev; /* protected by lo->mutex */
+	struct lo_inode *hash_next; /* protected by lo->mutex */
+	bool indexed; /* protected by lo->mutex */
 	int fd;
 	ino_t ino;
 	dev_t dev;
 	uint64_t refcount; /* protected by lo->mutex */
 };
+
+#define LO_INODE_INDEX_BUCKETS (1U << 16)
 
 enum {
 	CACHE_NEVER,
@@ -85,11 +89,14 @@ struct lo_data {
 	int writeback;
 	int flock;
 	int xattr;
+	int direct_io;
 	char *source;
 	double timeout;
 	int cache;
 	int timeout_set;
 	struct lo_inode root; /* protected by lo->mutex */
+	struct lo_inode **inode_index; /* protected by lo->mutex */
+	size_t inode_index_buckets;
 };
 
 static const struct fuse_opt lo_opts[] = {
@@ -107,6 +114,10 @@ static const struct fuse_opt lo_opts[] = {
 	  offsetof(struct lo_data, xattr), 1 },
 	{ "no_xattr",
 	  offsetof(struct lo_data, xattr), 0 },
+	{ "direct_io",
+	  offsetof(struct lo_data, direct_io), 1 },
+	{ "no_direct_io",
+	  offsetof(struct lo_data, direct_io), 0 },
 	{ "timeout=%lf",
 	  offsetof(struct lo_data, timeout), 0 },
 	{ "timeout=",
@@ -131,6 +142,8 @@ static void passthrough_ll_help(void)
 "    -o no_flock            Disable flock\n"
 "    -o xattr               Enable xattr\n"
 "    -o no_xattr            Disable xattr\n"
+"    -o direct_io           Enable direct I/O for regular files\n"
+"    -o no_direct_io        Disable forced direct I/O\n"
 "    -o timeout=1.0         Caching timeout\n"
 "    -o timeout=0/1         Timeout is set\n"
 "    -o cache=never         Disable cache\n"
@@ -288,28 +301,89 @@ out_err:
 	fuse_reply_err(req, saverr);
 }
 
+static struct lo_inode *lo_find_identity_locked(struct lo_data *lo, dev_t dev,
+						 ino_t ino);
+
 static struct lo_inode *lo_find(struct lo_data *lo, struct stat *st)
 {
-	struct lo_inode *p;
-	struct lo_inode *ret = NULL;
+	struct lo_inode *ret;
 
 	pthread_mutex_lock(&lo->mutex);
-	for (p = lo->root.next; p != &lo->root; p = p->next) {
-		if (p->ino == st->st_ino && p->dev == st->st_dev) {
-			assert(p->refcount > 0);
-			ret = p;
-			ret->refcount++;
-			break;
-		}
+	ret = lo_find_identity_locked(lo, st->st_dev, st->st_ino);
+	if (ret) {
+		assert(ret->refcount > 0);
+		ret->refcount++;
 	}
 	pthread_mutex_unlock(&lo->mutex);
 	return ret;
+}
+
+static size_t lo_inode_index_bucket(const struct lo_data *lo, dev_t dev,
+				    ino_t ino)
+{
+	uint64_t value = (uint64_t)ino;
+
+	value ^= (uint64_t)dev + UINT64_C(0x9e3779b97f4a7c15) +
+		 (value << 6) + (value >> 2);
+	value ^= value >> 33;
+	value *= UINT64_C(0xff51afd7ed558ccd);
+	value ^= value >> 33;
+	return (size_t)value & (lo->inode_index_buckets - 1);
+}
+
+static struct lo_inode *lo_find_identity_locked(struct lo_data *lo, dev_t dev,
+						 ino_t ino)
+{
+	struct lo_inode *inode;
+	size_t bucket;
+
+	assert(lo->inode_index);
+	assert(lo->inode_index_buckets);
+	bucket = lo_inode_index_bucket(lo, dev, ino);
+	for (inode = lo->inode_index[bucket]; inode;
+	     inode = inode->hash_next) {
+		if (inode->ino == ino && inode->dev == dev)
+			return inode;
+	}
+	return NULL;
+}
+
+static void lo_inode_index_insert_locked(struct lo_data *lo,
+					 struct lo_inode *inode)
+{
+	size_t bucket = lo_inode_index_bucket(lo, inode->dev, inode->ino);
+
+	assert(!inode->indexed);
+	inode->hash_next = lo->inode_index[bucket];
+	lo->inode_index[bucket] = inode;
+	inode->indexed = true;
+}
+
+static void lo_inode_index_remove_locked(struct lo_data *lo,
+					 struct lo_inode *inode)
+{
+	struct lo_inode **cursor;
+	size_t bucket = lo_inode_index_bucket(lo, inode->dev, inode->ino);
+
+	if (!inode->indexed)
+		return;
+	for (cursor = &lo->inode_index[bucket]; *cursor;
+	     cursor = &(*cursor)->hash_next) {
+		if (*cursor == inode) {
+			*cursor = inode->hash_next;
+			inode->hash_next = NULL;
+			inode->indexed = false;
+			return;
+		}
+	}
+	assert(!"inode missing from identity index");
 }
 
 
 static struct lo_inode *create_new_inode(int fd, struct fuse_entry_param *e, struct lo_data* lo)
 {
 	struct lo_inode *inode = NULL;
+	struct lo_inode *existing;
 	struct lo_inode *prev, *next;
 
 	inode = calloc(1, sizeof(struct lo_inode));
@@ -322,12 +396,22 @@ static struct lo_inode *create_new_inode(int fd, struct fuse_entry_param *e, str
 	inode->dev = e->attr.st_dev;
 
 	pthread_mutex_lock(&lo->mutex);
+	existing = lo_find_identity_locked(lo, inode->dev, inode->ino);
+	if (existing) {
+		assert(existing->refcount > 0);
+		existing->refcount++;
+		pthread_mutex_unlock(&lo->mutex);
+		close(inode->fd);
+		free(inode);
+		return existing;
+	}
 	prev = &lo->root;
 	next = prev->next;
 	next->prev = inode;
 	inode->next = next;
 	inode->prev = prev;
 	prev->next = inode;
+	lo_inode_index_insert_locked(lo, inode);
 	pthread_mutex_unlock(&lo->mutex);
 	return inode;
 }
@@ -552,6 +636,7 @@ static void unref_inode(struct lo_data *lo, struct lo_inode *inode, uint64_t n)
 	if (!inode->refcount) {
 		struct lo_inode *prev, *next;
 
+		lo_inode_index_remove_locked(lo, inode);
 		prev = inode->prev;
 		next = inode->next;
 		next->prev = prev;
@@ -804,7 +889,7 @@ static void lo_tmpfile(fuse_req_t req, fuse_ino_t parent,
 		return (void) fuse_reply_err(req, errno);
 
 	fi->fh = fd;
-	if (lo->cache == CACHE_NEVER)
+	if (lo->direct_io || lo->cache == CACHE_NEVER)
 		fi->direct_io = 1;
 	else if (lo->cache == CACHE_ALWAYS)
 		fi->keep_cache = 1;
@@ -839,7 +924,7 @@ static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		return (void) fuse_reply_err(req, errno);
 
 	fi->fh = fd;
-	if (lo->cache == CACHE_NEVER)
+	if (lo->direct_io || lo->cache == CACHE_NEVER)
 		fi->direct_io = 1;
 	else if (lo->cache == CACHE_ALWAYS)
 		fi->keep_cache = 1;
@@ -901,7 +986,7 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 		return (void) fuse_reply_err(req, errno);
 
 	fi->fh = fd;
-	if (lo->cache == CACHE_NEVER)
+	if (lo->direct_io || lo->cache == CACHE_NEVER)
 		fi->direct_io = 1;
 	else if (lo->cache == CACHE_ALWAYS)
 		fi->keep_cache = 1;
@@ -1297,6 +1382,14 @@ int main(int argc, char *argv[])
 	lo.root.next = lo.root.prev = &lo.root;
 	lo.root.fd = -1;
 	lo.cache = CACHE_NORMAL;
+	lo.inode_index_buckets = LO_INODE_INDEX_BUCKETS;
+	lo.inode_index = calloc(lo.inode_index_buckets,
+			       sizeof(*lo.inode_index));
+	if (!lo.inode_index) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: failed to allocate inode identity index\n");
+		return 1;
+	}
 
 	if (fuse_parse_cmdline(&args, &opts) != 0)
 		return 1;
@@ -1412,5 +1505,6 @@ err_out1:
 		close(lo.root.fd);
 
 	free(lo.source);
+	free(lo.inode_index);
 	return ret ? 1 : 0;
 }

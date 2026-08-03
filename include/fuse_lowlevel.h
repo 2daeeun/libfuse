@@ -2349,6 +2349,42 @@ void fuse_session_process_buf(struct fuse_session *se,
 			      const struct fuse_buf *buf);
 
 /**
+ * Start a zeroed, per-session native request-counting window.
+ *
+ * The counter is updated at libfuse's common request-dispatch boundary for
+ * both classic /dev/fuse and FUSE-over-io_uring transports.  Requests handled
+ * entirely in the kernel do not reach this boundary and are therefore not
+ * counted.  This API is intended for controlled benchmarking.
+ *
+ * @param se the session
+ * @return zero on success, -EINVAL for an invalid session, or -EBUSY if an
+ *         accounting window is already active
+ */
+int fuse_session_native_request_counter_start(struct fuse_session *se);
+
+/**
+ * Stop the active native request-counting window and wait for in-flight
+ * counter updates to finish.
+ *
+ * @param se the session
+ * @return zero on success, or a negative errno value
+ */
+int fuse_session_native_request_counter_stop(struct fuse_session *se);
+
+/**
+ * Read one raw FUSE opcode count after the accounting window has stopped.
+ * Opcodes 0 through 63 are supported.
+ *
+ * @param se the session
+ * @param opcode raw FUSE opcode
+ * @param value output request count
+ * @return zero on success, or a negative errno value
+ */
+int fuse_session_native_request_counter_read(struct fuse_session *se,
+					     uint32_t opcode,
+					     uint64_t *value);
+
+/**
  * Read a raw request from the kernel into the supplied buffer.
  *
  * Depending on file system options, system capabilities, and request

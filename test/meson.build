@@ -28,6 +28,12 @@ td += executable('test_abi', 'test_abi.c',
 td += executable('test_extfuse_init', 'test_extfuse_init.c',
                  dependencies: [ libfuse_dep ],
                  install: false)
+native_request_counter_test = executable(
+    'test_native_request_counter', 'test_native_request_counter.c',
+    dependencies: [ libfuse_dep ],
+    install: false)
+td += native_request_counter_test
+test('native request counter', native_request_counter_test)
 
 test_scripts = [ 'conftest.py', 'pytest.ini', 'test_examples.py',
                  'util.py', 'test_ctests.py', 'test_custom_io.py',

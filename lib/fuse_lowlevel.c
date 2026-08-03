@@ -21,6 +21,7 @@
 #include "fuse_uring_i.h"
 
 #include <pthread.h>
+#include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <inttypes.h>
@@ -102,6 +103,96 @@ static void trace_request_reply(uint64_t unique, unsigned int len,
 	(void)reply_err;
 }
 #endif
+
+static void native_request_counter_increment(struct fuse_session *se,
+					     uint32_t opcode)
+{
+	struct fuse_native_request_counter *counter =
+		&se->native_request_counter;
+	uint_fast64_t epoch;
+
+	if (opcode >= FUSE_NATIVE_REQUEST_COUNTER_SLOTS)
+		return;
+
+	epoch = atomic_load_explicit(&counter->epoch, memory_order_acquire);
+	if (!(epoch & 1))
+		return;
+
+	atomic_fetch_add_explicit(&counter->writers, 1, memory_order_acquire);
+	/*
+	 * Recheck the epoch after publishing this writer.  This excludes a
+	 * request which saw an old armed epoch but was descheduled across a
+	 * stop/start boundary from the new window.
+	 */
+	if (atomic_load_explicit(&counter->epoch, memory_order_acquire) == epoch)
+		atomic_fetch_add_explicit(&counter->values[opcode], 1,
+					  memory_order_relaxed);
+	atomic_fetch_sub_explicit(&counter->writers, 1, memory_order_release);
+}
+
+int fuse_session_native_request_counter_start(struct fuse_session *se)
+{
+	struct fuse_native_request_counter *counter;
+	uint_fast64_t epoch;
+	unsigned int opcode;
+
+	if (!se)
+		return -EINVAL;
+	counter = &se->native_request_counter;
+	epoch = atomic_load_explicit(&counter->epoch, memory_order_acquire);
+	if (epoch & 1)
+		return -EBUSY;
+
+	while (atomic_load_explicit(&counter->writers, memory_order_acquire))
+		sched_yield();
+	for (opcode = 0; opcode < FUSE_NATIVE_REQUEST_COUNTER_SLOTS; opcode++)
+		atomic_store_explicit(&counter->values[opcode], 0,
+				      memory_order_relaxed);
+
+	if (!atomic_compare_exchange_strong_explicit(
+			&counter->epoch, &epoch, epoch + 1,
+			memory_order_release, memory_order_acquire))
+		return -EBUSY;
+	return 0;
+}
+
+int fuse_session_native_request_counter_stop(struct fuse_session *se)
+{
+	struct fuse_native_request_counter *counter;
+	uint_fast64_t epoch;
+
+	if (!se)
+		return -EINVAL;
+	counter = &se->native_request_counter;
+	epoch = atomic_load_explicit(&counter->epoch, memory_order_acquire);
+	if (!(epoch & 1))
+		return -EINVAL;
+	if (!atomic_compare_exchange_strong_explicit(
+			&counter->epoch, &epoch, epoch + 1,
+			memory_order_release, memory_order_acquire))
+		return -EBUSY;
+	while (atomic_load_explicit(&counter->writers, memory_order_acquire))
+		sched_yield();
+	return 0;
+}
+
+int fuse_session_native_request_counter_read(struct fuse_session *se,
+					     uint32_t opcode,
+					     uint64_t *value)
+{
+	struct fuse_native_request_counter *counter;
+
+	if (!se || !value || opcode >= FUSE_NATIVE_REQUEST_COUNTER_SLOTS)
+		return -EINVAL;
+	counter = &se->native_request_counter;
+	if (atomic_load_explicit(&counter->epoch, memory_order_acquire) & 1)
+		return -EBUSY;
+	if (atomic_load_explicit(&counter->writers, memory_order_acquire))
+		return -EBUSY;
+	*value = atomic_load_explicit(&counter->values[opcode],
+				      memory_order_relaxed);
+	return 0;
+}
 
 static void convert_stat(const struct stat *stbuf, struct fuse_attr *attr)
 {
@@ -3649,6 +3740,7 @@ void fuse_session_process_buf_internal(struct fuse_session *se,
 	}
 
 	trace_request_process(in->opcode, in->unique);
+	native_request_counter_increment(se, in->opcode);
 
 	if (se->debug) {
 		fuse_log(FUSE_LOG_DEBUG,
@@ -3751,6 +3843,9 @@ void fuse_session_process_uring_cqe(struct fuse_session *se,
 				    void *op_payload, size_t payload_len)
 {
 	int err;
+
+	trace_request_process(in->opcode, in->unique);
+	native_request_counter_increment(se, in->opcode);
 
 	fuse_session_in2req(req, in);
 

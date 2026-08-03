@@ -70,6 +70,20 @@ struct fuse_session_uring {
 	struct fuse_ring_pool *pool;
 };
 
+/*
+ * Per-session request counters used by the explicit measurement-window API.
+ * Opcodes currently defined by the FUSE protocol fit below 64; CUSE_INIT is
+ * intentionally outside this benchmark-oriented counter bank.
+ */
+#define FUSE_NATIVE_REQUEST_COUNTER_SLOTS 64U
+
+struct fuse_native_request_counter {
+	/* Even epochs are stopped, odd epochs are armed. */
+	atomic_uint_fast64_t epoch;
+	atomic_uint_fast64_t writers;
+	atomic_uint_fast64_t values[FUSE_NATIVE_REQUEST_COUNTER_SLOTS];
+};
+
 struct fuse_session {
 	_Atomic(char *)mountpoint;
 	int fd;
@@ -110,6 +124,9 @@ struct fuse_session {
 
 	/* io_uring */
 	struct fuse_session_uring uring;
+
+	/* Explicitly armed native request-accounting window. */
+	struct fuse_native_request_counter native_request_counter;
 
 	/*
 	 * conn->want and conn_want_ext options set by libfuse , needed

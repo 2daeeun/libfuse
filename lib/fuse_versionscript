@@ -218,6 +218,9 @@ FUSE_3.18 {
 		fuse_req_get_payload;
 		fuse_set_conn_flag;
 		fuse_lowlevel_notify_increment_epoch;
+		fuse_session_native_request_counter_start;
+		fuse_session_native_request_counter_stop;
+		fuse_session_native_request_counter_read;
 
 		fuse_reply_statx;
 		fuse_fs_statx;

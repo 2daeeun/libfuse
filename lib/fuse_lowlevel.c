@@ -2850,6 +2850,9 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			se->conn.capable_ext |= FUSE_CAP_OVER_IO_URING;
 		if (inargflags & FUSE_FS_EXTFUSE)
 			se->conn.capable_ext |= FUSE_CAP_EXTFUSE;
+		if (inargflags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE)
+			se->conn.capable_ext |=
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE;
 
 	} else {
 		se->conn.max_readahead = 0;
@@ -3012,6 +3015,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_FS_EXTFUSE;
 		outarg.extfuse_prog_fd = se->conn.extfuse_prog_fd;
 	}
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE)
+		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE;
 
 	if ((inargflags & FUSE_REQUEST_TIMEOUT) && se->conn.request_timeout) {
 		outargflags |= FUSE_REQUEST_TIMEOUT;

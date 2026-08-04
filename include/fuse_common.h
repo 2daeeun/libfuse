@@ -523,6 +523,15 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_EXTFUSE (1ULL << 34)
 
 /**
+ * Indicates that native FUSE passthrough read/write/mmap paths notify the
+ * negotiated ExtFUSE BPF program so its metadata cache can remain coherent.
+ *
+ * This capability is meaningful only together with FUSE_CAP_EXTFUSE and
+ * FUSE_CAP_PASSTHROUGH. It is disabled by default.
+ */
+#define FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE (1ULL << 35)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine

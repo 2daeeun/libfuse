@@ -1,6 +1,14 @@
 libfuse
 =======
 
+## 빌드 방법
+```bash
+cd ~/Documents/github/libfuse
+rm -rf build build-extfuse
+meson setup build
+ninja -C build
+```
+
 About
 -----
 

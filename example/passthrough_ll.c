@@ -226,10 +226,10 @@ static void lo_getattr(fuse_req_t req, fuse_ino_t ino,
 	fuse_reply_attr(req, &buf, lo->timeout);
 }
 
-static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
-		       int valid, struct fuse_file_info *fi)
+static int lo_do_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
+			 int valid, struct fuse_file_info *fi,
+			 struct stat *out_attr)
 {
-	int saverr;
 	char procname[64];
 	struct lo_inode *inode = lo_inode(req, ino);
 	int ifd = inode->fd;
@@ -243,18 +243,18 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 			res = chmod(procname, attr->st_mode);
 		}
 		if (res == -1)
-			goto out_err;
+			return errno;
 	}
 	if (valid & (FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID)) {
-		uid_t uid = (valid & FUSE_SET_ATTR_UID) ?
-			attr->st_uid : (uid_t) -1;
-		gid_t gid = (valid & FUSE_SET_ATTR_GID) ?
-			attr->st_gid : (gid_t) -1;
+		uid_t uid = (valid & FUSE_SET_ATTR_UID) ? attr->st_uid :
+							  (uid_t)-1;
+		gid_t gid = (valid & FUSE_SET_ATTR_GID) ? attr->st_gid :
+							  (gid_t)-1;
 
 		res = fchownat(ifd, "", uid, gid,
 			       AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
 		if (res == -1)
-			goto out_err;
+			return errno;
 	}
 	if (valid & FUSE_SET_ATTR_SIZE) {
 		if (fi) {
@@ -264,7 +264,7 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 			res = truncate(procname, attr->st_size);
 		}
 		if (res == -1)
-			goto out_err;
+			return errno;
 	}
 	if (valid & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME)) {
 		struct timespec tv[2];
@@ -291,14 +291,27 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 			res = utimensat(AT_FDCWD, procname, tv, 0);
 		}
 		if (res == -1)
-			goto out_err;
+			return errno;
 	}
 
-	return lo_getattr(req, ino, fi);
+	res = fstatat(fi ? fi->fh : lo_fd(req, ino), "", out_attr,
+		      AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+	if (res == -1)
+		return errno;
 
-out_err:
-	saverr = errno;
-	fuse_reply_err(req, saverr);
+	return 0;
+}
+
+static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
+		       int valid, struct fuse_file_info *fi)
+{
+	struct stat out_attr;
+	int error = lo_do_setattr(req, ino, attr, valid, fi, &out_attr);
+
+	if (error)
+		fuse_reply_err(req, error);
+	else
+		fuse_reply_attr(req, &out_attr, lo_data(req)->timeout);
 }
 
 static struct lo_inode *lo_find_identity_locked(struct lo_data *lo, dev_t dev,
@@ -954,7 +967,8 @@ static void lo_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync,
 	fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
-static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+static int lo_do_open(fuse_req_t req, fuse_ino_t ino,
+		      struct fuse_file_info *fi)
 {
 	int fd;
 	char buf[64];
@@ -983,7 +997,7 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	sprintf(buf, "/proc/self/fd/%i", lo_fd(req, ino));
 	fd = open(buf, fi->flags & ~O_NOFOLLOW);
 	if (fd == -1)
-		return (void) fuse_reply_err(req, errno);
+		return errno;
 
 	fi->fh = fd;
 	if (lo->direct_io || lo->cache == CACHE_NEVER)
@@ -1001,8 +1015,17 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	   To make parallel_direct_writes valid, need set fi->direct_io
 	   in current function. */
 	fi->parallel_direct_writes = 1;
+	return 0;
+}
 
-	fuse_reply_open(req, fi);
+static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+{
+	int error = lo_do_open(req, ino, fi);
+
+	if (error)
+		fuse_reply_err(req, error);
+	else
+		fuse_reply_open(req, fi);
 }
 
 static void lo_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
@@ -1049,12 +1072,11 @@ static void lo_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	fuse_reply_data(req, &buf, FUSE_BUF_SPLICE_MOVE);
 }
 
-static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
-			 struct fuse_bufvec *in_buf, off_t off,
-			 struct fuse_file_info *fi)
+static ssize_t lo_do_write_buf(fuse_req_t req, fuse_ino_t ino,
+			       struct fuse_bufvec *in_buf, off_t off,
+			       struct fuse_file_info *fi)
 {
 	(void) ino;
-	ssize_t res;
 	struct fuse_bufvec out_buf = FUSE_BUFVEC_INIT(fuse_buf_size(in_buf));
 
 	out_buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
@@ -1065,11 +1087,19 @@ static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
 		fuse_log(FUSE_LOG_DEBUG, "lo_write(ino=%" PRIu64 ", size=%zd, off=%jd)\n",
 			ino, out_buf.buf[0].size, (intmax_t) off);
 
-	res = fuse_buf_copy(&out_buf, in_buf, 0);
-	if(res < 0)
+	return fuse_buf_copy(&out_buf, in_buf, 0);
+}
+
+static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
+			 struct fuse_bufvec *in_buf, off_t off,
+			 struct fuse_file_info *fi)
+{
+	ssize_t res = lo_do_write_buf(req, ino, in_buf, off, fi);
+
+	if (res < 0)
 		fuse_reply_err(req, -res);
 	else
-		fuse_reply_write(req, (size_t) res);
+		fuse_reply_write(req, (size_t)res);
 }
 
 static void lo_statfs(fuse_req_t req, fuse_ino_t ino)
@@ -1106,32 +1136,38 @@ static void lo_flock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi,
 	fuse_reply_err(req, res == -1 ? errno : 0);
 }
 
+static ssize_t lo_do_getxattr(fuse_req_t req, fuse_ino_t ino,
+			      const char *name, void *value, size_t size)
+{
+	char procname[64];
+	struct lo_inode *inode = lo_inode(req, ino);
+
+	if (!lo_data(req)->xattr) {
+		errno = ENOSYS;
+		return -1;
+	}
+	sprintf(procname, "/proc/self/fd/%i", inode->fd);
+	return getxattr(procname, name, value, size);
+}
+
 static void lo_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 			size_t size)
 {
 	char *value = NULL;
-	char procname[64];
-	struct lo_inode *inode = lo_inode(req, ino);
 	ssize_t ret;
 	int saverr;
-
-	saverr = ENOSYS;
-	if (!lo_data(req)->xattr)
-		goto out;
 
 	if (lo_debug(req)) {
 		fuse_log(FUSE_LOG_DEBUG, "lo_getxattr(ino=%" PRIu64 ", name=%s size=%zd)\n",
 			ino, name, size);
 	}
 
-	sprintf(procname, "/proc/self/fd/%i", inode->fd);
-
 	if (size) {
 		value = malloc(size);
 		if (!value)
 			goto out_err;
 
-		ret = getxattr(procname, name, value, size);
+		ret = lo_do_getxattr(req, ino, name, value, size);
 		if (ret == -1)
 			goto out_err;
 		saverr = 0;
@@ -1140,7 +1176,7 @@ static void lo_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 
 		fuse_reply_buf(req, value, ret);
 	} else {
-		ret = getxattr(procname, name, NULL, 0);
+		ret = lo_do_getxattr(req, ino, name, NULL, 0);
 		if (ret == -1)
 			goto out_err;
 

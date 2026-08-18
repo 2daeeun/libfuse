@@ -23,6 +23,10 @@ _Static_assert(FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE == (1ULL << 35),
 	       "unexpected passthrough-coherence capability bit");
 _Static_assert(FUSE_EXTFUSE_PASSTHROUGH_COHERENCE == (1ULL << 44),
 	       "unexpected passthrough-coherence wire bit");
+_Static_assert(FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2 == (1ULL << 36),
+	       "unexpected passthrough-coherence-v2 capability bit");
+_Static_assert(FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2 == (1ULL << 45),
+	       "unexpected passthrough-coherence-v2 wire bit");
 _Static_assert(FUSE_OVER_IO_URING == (1ULL << 41),
 	       "unexpected FUSE-over-io_uring wire capability bit");
 _Static_assert(sizeof(struct fuse_conn_info) == 128,
@@ -40,6 +44,7 @@ enum test_mode {
 	MODE_NOT_WANTED,
 	MODE_WANTED,
 	MODE_WANTED_COHERENCE,
+	MODE_WANTED_COHERENCE_V2,
 	MODE_FORCE_INVALID_WANT,
 };
 
@@ -48,8 +53,11 @@ struct test_state {
 	bool saw_capability;
 	bool saw_uring_capability;
 	bool saw_coherence_capability;
+	bool saw_coherence_v2_capability;
 	bool helper_enabled;
+	bool passthrough_helper_enabled;
 	bool coherence_helper_enabled;
+	bool coherence_v2_helper_enabled;
 	_Alignas(max_align_t)
 	unsigned char reply[sizeof(struct fuse_out_header) +
 			    sizeof(struct fuse_init_out)];
@@ -66,15 +74,26 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 		fuse_get_feature_flag(conn, FUSE_CAP_OVER_IO_URING);
 	state->saw_coherence_capability = fuse_get_feature_flag(
 		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE);
+	state->saw_coherence_v2_capability = fuse_get_feature_flag(
+		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2);
 
 	if (state->mode == MODE_WANTED ||
-	    state->mode == MODE_WANTED_COHERENCE) {
+	    state->mode == MODE_WANTED_COHERENCE ||
+	    state->mode == MODE_WANTED_COHERENCE_V2) {
 		state->helper_enabled =
 			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE);
-		if (state->mode == MODE_WANTED_COHERENCE)
+		if (state->mode == MODE_WANTED_COHERENCE ||
+		    state->mode == MODE_WANTED_COHERENCE_V2) {
+			state->passthrough_helper_enabled = fuse_set_feature_flag(
+				conn, FUSE_CAP_PASSTHROUGH);
 			state->coherence_helper_enabled = fuse_set_feature_flag(
 				conn,
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE);
+		}
+		if (state->mode == MODE_WANTED_COHERENCE_V2)
+			state->coherence_v2_helper_enabled = fuse_set_feature_flag(
+				conn,
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2);
 		conn->extfuse_prog_fd = TEST_PROG_FD;
 	} else if (state->mode == MODE_FORCE_INVALID_WANT) {
 		conn->want_ext |= FUSE_CAP_EXTFUSE;
@@ -113,7 +132,8 @@ static ssize_t unused_read(int fd, void *buf, size_t buf_len, void *userdata)
 }
 
 static int run_case(bool advertise, bool advertise_uring,
-		    bool advertise_coherence, enum test_mode mode,
+		    bool advertise_coherence, bool advertise_coherence_v2,
+		    enum test_mode mode,
 		    bool expect_error, const char *name)
 {
 	struct {
@@ -167,8 +187,12 @@ static int run_case(bool advertise, bool advertise_uring,
 	if (advertise_uring)
 		request.init.flags2 |= (uint32_t)(FUSE_OVER_IO_URING >> 32);
 	if (advertise_coherence)
+		request.init.flags2 |= (uint32_t)(
+			(FUSE_PASSTHROUGH |
+			 FUSE_EXTFUSE_PASSTHROUGH_COHERENCE) >> 32);
+	if (advertise_coherence_v2)
 		request.init.flags2 |= (uint32_t)
-			(FUSE_EXTFUSE_PASSTHROUGH_COHERENCE >> 32);
+			(FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2 >> 32);
 
 	request_buf = (struct fuse_buf) {
 		.size = sizeof(request),
@@ -192,8 +216,11 @@ static int run_case(bool advertise, bool advertise_uring,
 				name, reply_header->error);
 			goto out_session;
 		}
-		if (state.saw_capability) {
-			fprintf(stderr, "%s: absent capability reported present\n",
+		if (state.saw_capability != advertise ||
+		    state.saw_uring_capability != advertise_uring ||
+		    state.saw_coherence_capability != advertise_coherence ||
+		    state.saw_coherence_v2_capability != advertise_coherence_v2) {
+			fprintf(stderr, "%s: error-path capability mapping mismatch\n",
 				name);
 			goto out_session;
 		}
@@ -226,12 +253,18 @@ static int run_case(bool advertise, bool advertise_uring,
 			name);
 		goto out_session;
 	}
+	if (state.saw_coherence_v2_capability != advertise_coherence_v2) {
+		fprintf(stderr,
+			"%s: coherence-v2 capable_ext mapping mismatch\n", name);
+		goto out_session;
+	}
 	if (reply_flags & FUSE_OVER_IO_URING) {
 		fprintf(stderr, "%s: io_uring enabled without mount option\n",
 			name);
 		goto out_session;
 	}
-	if ((mode == MODE_WANTED || mode == MODE_WANTED_COHERENCE) &&
+	if ((mode == MODE_WANTED || mode == MODE_WANTED_COHERENCE ||
+	     mode == MODE_WANTED_COHERENCE_V2) &&
 	    advertise) {
 		if (!state.helper_enabled ||
 		    !(reply_flags & FUSE_FS_EXTFUSE) ||
@@ -245,8 +278,11 @@ static int run_case(bool advertise, bool advertise_uring,
 		fprintf(stderr, "%s: ExtFUSE was enabled without opt-in\n", name);
 		goto out_session;
 	}
-	if (mode == MODE_WANTED_COHERENCE && advertise_coherence) {
-		if (!state.coherence_helper_enabled ||
+	if ((mode == MODE_WANTED_COHERENCE ||
+	     mode == MODE_WANTED_COHERENCE_V2) && advertise_coherence) {
+		if (!state.passthrough_helper_enabled ||
+		    !state.coherence_helper_enabled ||
+		    !(reply_flags & FUSE_PASSTHROUGH) ||
 		    !(reply_flags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE)) {
 			fprintf(stderr,
 				"%s: coherence opt-in was not serialized\n", name);
@@ -254,6 +290,19 @@ static int run_case(bool advertise, bool advertise_uring,
 		}
 	} else if (reply_flags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE) {
 		fprintf(stderr, "%s: coherence was enabled without opt-in\n", name);
+		goto out_session;
+	}
+	if (mode == MODE_WANTED_COHERENCE_V2 && advertise_coherence_v2) {
+		if (!state.coherence_v2_helper_enabled ||
+		    !(reply_flags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2)) {
+			fprintf(stderr,
+				"%s: coherence-v2 opt-in was not serialized\n",
+				name);
+			goto out_session;
+		}
+	} else if (reply_flags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2) {
+		fprintf(stderr,
+			"%s: coherence-v2 was enabled without opt-in\n", name);
 		goto out_session;
 	}
 
@@ -275,17 +324,25 @@ int main(void)
 {
 	int failed = 0;
 
-	failed |= run_case(false, false, false, MODE_NOT_WANTED, false,
+	failed |= run_case(false, false, false, false, MODE_NOT_WANTED, false,
 			   "not-advertised-not-wanted");
-	failed |= run_case(true, false, false, MODE_NOT_WANTED, false,
+	failed |= run_case(true, false, false, false, MODE_NOT_WANTED, false,
 			   "advertised-not-wanted");
-	failed |= run_case(true, false, false, MODE_WANTED, false,
+	failed |= run_case(true, false, false, false, MODE_WANTED, false,
 			   "advertised-wanted");
-	failed |= run_case(true, true, false, MODE_WANTED, false,
+	failed |= run_case(true, true, false, false, MODE_WANTED, false,
 			   "extfuse-and-io-uring-advertised-classic");
-	failed |= run_case(true, false, true, MODE_WANTED_COHERENCE, false,
+	failed |= run_case(true, false, true, false, MODE_WANTED_COHERENCE,
+			   false,
 			   "extfuse-coherence-advertised-wanted");
-	failed |= run_case(false, false, false, MODE_FORCE_INVALID_WANT, true,
+	failed |= run_case(true, false, true, true,
+			   MODE_WANTED_COHERENCE_V2, false,
+			   "extfuse-coherence-v2-advertised-wanted");
+	failed |= run_case(true, false, false, true,
+			   MODE_WANTED_COHERENCE_V2, true,
+			   "extfuse-coherence-v2-without-base-rejected");
+	failed |= run_case(false, false, false, false,
+			   MODE_FORCE_INVALID_WANT, true,
 			   "not-advertised-forced-want");
 
 	return failed ? EXIT_FAILURE : EXIT_SUCCESS;

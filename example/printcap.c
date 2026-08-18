@@ -67,6 +67,10 @@ static const struct cap_info capabilities[] = {
     {FUSE_CAP_PASSTHROUGH,		"FUSE_CAP_PASSTHROUGH"},
     {FUSE_CAP_OVER_IO_URING,		"FUSE_CAP_OVER_IO_URING"},
     {FUSE_CAP_EXTFUSE,			"FUSE_CAP_EXTFUSE"},
+	{FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE,
+					"FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE"},
+	{FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2,
+					"FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2"},
     // Add any new capabilities here
     {0, NULL} // Sentinel to mark the end of the array
 };

@@ -532,6 +532,18 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE (1ULL << 35)
 
 /**
+ * Indicates that native passthrough coherence notifications carry explicit
+ * BEGIN/END phases and participate in a shared per-inode sequence protocol.
+ * Cached values can therefore be rejected while native I/O is active and
+ * after any overlapping native I/O.
+ *
+ * This capability is meaningful only together with
+ * FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE, FUSE_CAP_EXTFUSE and
+ * FUSE_CAP_PASSTHROUGH. It is disabled by default.
+ */
+#define FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2 (1ULL << 36)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine

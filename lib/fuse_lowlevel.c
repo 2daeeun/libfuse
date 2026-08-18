@@ -2652,6 +2652,26 @@ static bool want_flags_valid(uint64_t capable, uint64_t want)
 	return true;
 }
 
+static bool want_flag_dependencies_valid(uint64_t want)
+{
+	const uint64_t coherence_dependencies =
+		FUSE_CAP_EXTFUSE | FUSE_CAP_PASSTHROUGH;
+
+	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE) &&
+	    (want & coherence_dependencies) != coherence_dependencies) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: ExtFUSE passthrough coherence requires ExtFUSE and passthrough\n");
+		return false;
+	}
+	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2) &&
+	    !(want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE)) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: ExtFUSE passthrough coherence V2 requires the base capability\n");
+		return false;
+	}
+	return true;
+}
+
 /**
  * Get the wanted capability flags, converting from old format if necessary
  */
@@ -2853,6 +2873,9 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		if (inargflags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE)
 			se->conn.capable_ext |=
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE;
+		if (inargflags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2)
+			se->conn.capable_ext |=
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2;
 
 	} else {
 		se->conn.max_readahead = 0;
@@ -2920,7 +2943,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		fuse_convert_to_conn_want_ext(&se->conn);
 	}
 
-	if (!want_flags_valid(se->conn.capable_ext, se->conn.want_ext)) {
+	if (!want_flags_valid(se->conn.capable_ext, se->conn.want_ext) ||
+	    !want_flag_dependencies_valid(se->conn.want_ext)) {
 		fuse_reply_err(req, EPROTO);
 		se->error = -EPROTO;
 		fuse_session_exit(se);
@@ -3017,6 +3041,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	}
 	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE)
 		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE;
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2)
+		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2;
 
 	if ((inargflags & FUSE_REQUEST_TIMEOUT) && se->conn.request_timeout) {
 		outargflags |= FUSE_REQUEST_TIMEOUT;

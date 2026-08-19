@@ -2656,6 +2656,10 @@ static bool want_flag_dependencies_valid(uint64_t want)
 {
 	const uint64_t coherence_dependencies =
 		FUSE_CAP_EXTFUSE | FUSE_CAP_PASSTHROUGH;
+	const uint64_t attr_refresh_dependencies =
+		coherence_dependencies |
+		FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE |
+		FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2;
 
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE) &&
 	    (want & coherence_dependencies) != coherence_dependencies) {
@@ -2667,6 +2671,13 @@ static bool want_flag_dependencies_valid(uint64_t want)
 	    !(want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE)) {
 		fuse_log(FUSE_LOG_ERR,
 			 "fuse: ExtFUSE passthrough coherence V2 requires the base capability\n");
+		return false;
+	}
+	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH) &&
+	    (want & attr_refresh_dependencies) != attr_refresh_dependencies) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: ExtFUSE attr refresh requires passthrough "
+			 "coherence V2 and its prerequisites\n");
 		return false;
 	}
 	return true;
@@ -2876,6 +2887,9 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		if (inargflags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2)
 			se->conn.capable_ext |=
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2;
+		if (inargflags & FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH)
+			se->conn.capable_ext |=
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
 
 	} else {
 		se->conn.max_readahead = 0;
@@ -3043,6 +3057,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE;
 	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2)
 		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2;
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH)
+		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
 
 	if ((inargflags & FUSE_REQUEST_TIMEOUT) && se->conn.request_timeout) {
 		outargflags |= FUSE_REQUEST_TIMEOUT;

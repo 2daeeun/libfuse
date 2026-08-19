@@ -544,6 +544,18 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2 (1ULL << 36)
 
 /**
+ * Indicates that the kernel can lazily refresh regular-file attributes through
+ * the ExtFUSE identity view after a native passthrough operation invalidates
+ * cached attributes.
+ *
+ * This opt-in capability is meaningful only together with
+ * FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2,
+ * FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE, FUSE_CAP_EXTFUSE and
+ * FUSE_CAP_PASSTHROUGH. It is disabled by default.
+ */
+#define FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH (1ULL << 37)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine

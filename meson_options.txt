@@ -27,3 +27,12 @@ option('enable-usdt', type : 'boolean', value : false,
 
 option('enable-io-uring', type: 'boolean', value: true,
        description: 'Enable fuse-over-io-uring support')
+
+option('enable-extfuse-example', type: 'boolean', value: false,
+       description: 'Build the local ExtFUSE passthrough example and BPF object')
+
+option('extfuse-kernel-source', type: 'string', value: '',
+       description: 'Linux source root used to compile the ExtFUSE BPF object')
+
+option('extfuse-kernel-build', type: 'string', value: '',
+       description: 'Prepared Linux build root used to compile the ExtFUSE BPF object')

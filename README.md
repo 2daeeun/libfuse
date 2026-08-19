@@ -9,6 +9,14 @@ meson setup build
 ninja -C build
 ```
 
+## fig9_mo hand 전용 ExtFUSE 예제
+
+`fuse_exp/fig9_mo/hand`는 일반 `passthrough_ll`을 감싼
+`example/extfuse/extfuse_passthrough.c`를 사용한다. daemon, loader, BPF object와
+libfuse shared library는 모두 이 저장소의 별도 `build-hand/`에서 빌드되며
+`fuse_exp/fig9_mo/runtime/`에 의존하지 않는다. 준비 명령과 산출물 경로는
+`example/extfuse/README.md`에 정리되어 있다.
+
 About
 -----
 

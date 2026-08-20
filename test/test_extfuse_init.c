@@ -31,6 +31,11 @@ _Static_assert(FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH == (1ULL << 37),
 	       "unexpected passthrough-attr-refresh capability bit");
 _Static_assert(FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH == (1ULL << 46),
 	       "unexpected passthrough-attr-refresh wire bit");
+_Static_assert(FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER ==
+		       (1ULL << 38),
+	       "unexpected passthrough-attr-release-barrier capability bit");
+_Static_assert(FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER == (1ULL << 47),
+	       "unexpected passthrough-attr-release-barrier wire bit");
 _Static_assert(FUSE_OVER_IO_URING == (1ULL << 41),
 	       "unexpected FUSE-over-io_uring wire capability bit");
 _Static_assert(sizeof(struct fuse_conn_info) == 128,
@@ -50,8 +55,10 @@ enum test_mode {
 	MODE_WANTED_COHERENCE,
 	MODE_WANTED_COHERENCE_V2,
 	MODE_WANTED_ATTR_REFRESH,
+	MODE_WANTED_ATTR_RELEASE_BARRIER,
 	MODE_FORCE_INVALID_WANT,
 	MODE_FORCE_ATTR_REFRESH_WANT,
+	MODE_FORCE_ATTR_RELEASE_BARRIER_WANT,
 };
 
 struct test_state {
@@ -61,11 +68,13 @@ struct test_state {
 	bool saw_coherence_capability;
 	bool saw_coherence_v2_capability;
 	bool saw_attr_refresh_capability;
+	bool saw_attr_release_barrier_capability;
 	bool helper_enabled;
 	bool passthrough_helper_enabled;
 	bool coherence_helper_enabled;
 	bool coherence_v2_helper_enabled;
 	bool attr_refresh_helper_enabled;
+	bool attr_release_barrier_helper_enabled;
 	_Alignas(max_align_t)
 	unsigned char reply[sizeof(struct fuse_out_header) +
 			    sizeof(struct fuse_init_out)];
@@ -86,16 +95,20 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2);
 	state->saw_attr_refresh_capability = fuse_get_feature_flag(
 		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH);
+	state->saw_attr_release_barrier_capability = fuse_get_feature_flag(
+		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
 
 	if (state->mode == MODE_WANTED ||
 	    state->mode == MODE_WANTED_COHERENCE ||
 	    state->mode == MODE_WANTED_COHERENCE_V2 ||
-	    state->mode == MODE_WANTED_ATTR_REFRESH) {
+	    state->mode == MODE_WANTED_ATTR_REFRESH ||
+	    state->mode == MODE_WANTED_ATTR_RELEASE_BARRIER) {
 		state->helper_enabled =
 			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE);
 		if (state->mode == MODE_WANTED_COHERENCE ||
 		    state->mode == MODE_WANTED_COHERENCE_V2 ||
-		    state->mode == MODE_WANTED_ATTR_REFRESH) {
+		    state->mode == MODE_WANTED_ATTR_REFRESH ||
+		    state->mode == MODE_WANTED_ATTR_RELEASE_BARRIER) {
 			state->passthrough_helper_enabled = fuse_set_feature_flag(
 				conn, FUSE_CAP_PASSTHROUGH);
 			state->coherence_helper_enabled = fuse_set_feature_flag(
@@ -103,20 +116,30 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE);
 		}
 		if (state->mode == MODE_WANTED_COHERENCE_V2 ||
-		    state->mode == MODE_WANTED_ATTR_REFRESH)
+		    state->mode == MODE_WANTED_ATTR_REFRESH ||
+		    state->mode == MODE_WANTED_ATTR_RELEASE_BARRIER)
 			state->coherence_v2_helper_enabled = fuse_set_feature_flag(
 				conn,
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2);
-		if (state->mode == MODE_WANTED_ATTR_REFRESH)
+		if (state->mode == MODE_WANTED_ATTR_REFRESH ||
+		    state->mode == MODE_WANTED_ATTR_RELEASE_BARRIER)
 			state->attr_refresh_helper_enabled = fuse_set_feature_flag(
 				conn,
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH);
+		if (state->mode == MODE_WANTED_ATTR_RELEASE_BARRIER)
+			state->attr_release_barrier_helper_enabled =
+				fuse_set_feature_flag(
+					conn,
+					FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
 		conn->extfuse_prog_fd = TEST_PROG_FD;
 	} else if (state->mode == MODE_FORCE_INVALID_WANT) {
 		conn->want_ext |= FUSE_CAP_EXTFUSE;
 		conn->extfuse_prog_fd = TEST_PROG_FD;
 	} else if (state->mode == MODE_FORCE_ATTR_REFRESH_WANT) {
 		conn->want_ext |= FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
+	} else if (state->mode == MODE_FORCE_ATTR_RELEASE_BARRIER_WANT) {
+		conn->want_ext |=
+			FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
 	}
 }
 
@@ -152,7 +175,8 @@ static ssize_t unused_read(int fd, void *buf, size_t buf_len, void *userdata)
 
 static int run_case(bool advertise, bool advertise_uring,
 		    bool advertise_coherence, bool advertise_coherence_v2,
-		    bool advertise_attr_refresh, enum test_mode mode,
+		    bool advertise_attr_refresh,
+		    bool advertise_attr_release_barrier, enum test_mode mode,
 		    bool expect_error, const char *name)
 {
 	struct {
@@ -215,6 +239,9 @@ static int run_case(bool advertise, bool advertise_uring,
 	if (advertise_attr_refresh)
 		request.init.flags2 |=
 			(uint32_t)(FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH >> 32);
+	if (advertise_attr_release_barrier)
+		request.init.flags2 |= (uint32_t)(
+			FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER >> 32);
 
 	request_buf = (struct fuse_buf) {
 		.size = sizeof(request),
@@ -244,7 +271,9 @@ static int run_case(bool advertise, bool advertise_uring,
 		    state.saw_coherence_v2_capability !=
 			    advertise_coherence_v2 ||
 		    state.saw_attr_refresh_capability !=
-			    advertise_attr_refresh) {
+			    advertise_attr_refresh ||
+		    state.saw_attr_release_barrier_capability !=
+			    advertise_attr_release_barrier) {
 			fprintf(stderr, "%s: error-path capability mapping mismatch\n",
 				name);
 			goto out_session;
@@ -289,6 +318,13 @@ static int run_case(bool advertise, bool advertise_uring,
 			name);
 		goto out_session;
 	}
+	if (state.saw_attr_release_barrier_capability !=
+	    advertise_attr_release_barrier) {
+		fprintf(stderr,
+			"%s: attr-release-barrier capable_ext mapping mismatch\n",
+			name);
+		goto out_session;
+	}
 	if (reply_flags & FUSE_OVER_IO_URING) {
 		fprintf(stderr, "%s: io_uring enabled without mount option\n",
 			name);
@@ -296,7 +332,8 @@ static int run_case(bool advertise, bool advertise_uring,
 	}
 	if ((mode == MODE_WANTED || mode == MODE_WANTED_COHERENCE ||
 	     mode == MODE_WANTED_COHERENCE_V2 ||
-	     mode == MODE_WANTED_ATTR_REFRESH) &&
+	     mode == MODE_WANTED_ATTR_REFRESH ||
+	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER) &&
 	    advertise) {
 		if (!state.helper_enabled ||
 		    !(reply_flags & FUSE_FS_EXTFUSE) ||
@@ -312,7 +349,8 @@ static int run_case(bool advertise, bool advertise_uring,
 	}
 	if ((mode == MODE_WANTED_COHERENCE ||
 	     mode == MODE_WANTED_COHERENCE_V2 ||
-	     mode == MODE_WANTED_ATTR_REFRESH) &&
+	     mode == MODE_WANTED_ATTR_REFRESH ||
+	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER) &&
 	    advertise_coherence) {
 		if (!state.passthrough_helper_enabled ||
 		    !state.coherence_helper_enabled ||
@@ -327,7 +365,8 @@ static int run_case(bool advertise, bool advertise_uring,
 		goto out_session;
 	}
 	if ((mode == MODE_WANTED_COHERENCE_V2 ||
-	     mode == MODE_WANTED_ATTR_REFRESH) &&
+	     mode == MODE_WANTED_ATTR_REFRESH ||
+	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER) &&
 	    advertise_coherence_v2) {
 		if (!state.coherence_v2_helper_enabled ||
 		    !(reply_flags & FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2)) {
@@ -341,7 +380,9 @@ static int run_case(bool advertise, bool advertise_uring,
 			"%s: coherence-v2 was enabled without opt-in\n", name);
 		goto out_session;
 	}
-	if (mode == MODE_WANTED_ATTR_REFRESH && advertise_attr_refresh) {
+	if ((mode == MODE_WANTED_ATTR_REFRESH ||
+	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER) &&
+	    advertise_attr_refresh) {
 		if (!state.attr_refresh_helper_enabled ||
 		    !(reply_flags & FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH)) {
 			fprintf(stderr,
@@ -351,6 +392,23 @@ static int run_case(bool advertise, bool advertise_uring,
 		}
 	} else if (reply_flags & FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH) {
 		fprintf(stderr, "%s: attr refresh was enabled without opt-in\n",
+			name);
+		goto out_session;
+	}
+	if (mode == MODE_WANTED_ATTR_RELEASE_BARRIER &&
+	    advertise_attr_release_barrier) {
+		if (!state.attr_release_barrier_helper_enabled ||
+		    !(reply_flags &
+		      FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER)) {
+			fprintf(stderr,
+				"%s: attr release barrier opt-in was not serialized\n",
+				name);
+			goto out_session;
+		}
+	} else if (reply_flags &
+		   FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER) {
+		fprintf(stderr,
+			"%s: attr release barrier was enabled without opt-in\n",
 			name);
 		goto out_session;
 	}
@@ -373,38 +431,53 @@ int main(void)
 {
 	int failed = 0;
 
-	failed |= run_case(false, false, false, false, false, MODE_NOT_WANTED,
+	failed |= run_case(false, false, false, false, false, false, MODE_NOT_WANTED,
 			   false, "not-advertised-not-wanted");
-	failed |= run_case(true, false, false, false, false, MODE_NOT_WANTED,
+	failed |= run_case(true, false, false, false, false, false, MODE_NOT_WANTED,
 			   false, "advertised-not-wanted");
-	failed |= run_case(true, false, false, false, false, MODE_WANTED, false,
+	failed |= run_case(true, false, false, false, false, false, MODE_WANTED, false,
 			   "advertised-wanted");
-	failed |= run_case(true, true, false, false, false, MODE_WANTED, false,
+	failed |= run_case(true, true, false, false, false, false, MODE_WANTED, false,
 			   "extfuse-and-io-uring-advertised-classic");
-	failed |= run_case(true, false, true, false, false,
+	failed |= run_case(true, false, true, false, false, false,
 			   MODE_WANTED_COHERENCE, false,
 			   "extfuse-coherence-advertised-wanted");
-	failed |= run_case(true, false, true, true, false,
+	failed |= run_case(true, false, true, true, false, false,
 			   MODE_WANTED_COHERENCE_V2, false,
 			   "extfuse-coherence-v2-advertised-wanted");
-	failed |= run_case(true, false, false, true, false,
+	failed |= run_case(true, false, false, true, false, false,
 			   MODE_WANTED_COHERENCE_V2, true,
 			   "extfuse-coherence-v2-without-base-rejected");
-	failed |= run_case(true, false, true, true, true, MODE_NOT_WANTED,
+	failed |= run_case(true, false, true, true, true, false, MODE_NOT_WANTED,
 			   false, "extfuse-attr-refresh-advertised-not-wanted");
-	failed |= run_case(true, false, true, true, true,
+	failed |= run_case(true, false, true, true, true, false,
 			   MODE_WANTED_ATTR_REFRESH, false,
 			   "extfuse-attr-refresh-advertised-wanted");
-	failed |= run_case(true, false, true, false, true,
+	failed |= run_case(true, false, true, false, true, false,
 			   MODE_WANTED_ATTR_REFRESH, true,
 			   "extfuse-attr-refresh-without-v2-rejected");
 	failed |= run_case(
-		false, false, false, false, true, MODE_WANTED_ATTR_REFRESH,
+		false, false, false, false, true, false, MODE_WANTED_ATTR_REFRESH,
 		true, "extfuse-attr-refresh-without-prerequisites-rejected");
-	failed |= run_case(true, false, true, true, false,
+	failed |= run_case(true, false, true, true, false, false,
 			   MODE_FORCE_ATTR_REFRESH_WANT, true,
 			   "extfuse-attr-refresh-unadvertised-forced-want");
-	failed |= run_case(false, false, false, false, false,
+	failed |= run_case(true, false, true, true, true, true,
+			   MODE_NOT_WANTED, false,
+			   "extfuse-attr-release-barrier-advertised-not-wanted");
+	failed |= run_case(true, false, true, true, true, true,
+			   MODE_WANTED_ATTR_RELEASE_BARRIER, false,
+			   "extfuse-attr-release-barrier-advertised-wanted");
+	failed |= run_case(true, false, true, true, false, true,
+			   MODE_WANTED_ATTR_RELEASE_BARRIER, true,
+			   "extfuse-attr-release-barrier-without-refresh-rejected");
+	failed |= run_case(false, false, false, false, false, true,
+			   MODE_WANTED_ATTR_RELEASE_BARRIER, true,
+			   "extfuse-attr-release-barrier-without-prerequisites-rejected");
+	failed |= run_case(true, false, true, true, true, false,
+			   MODE_FORCE_ATTR_RELEASE_BARRIER_WANT, true,
+			   "extfuse-attr-release-barrier-unadvertised-forced-want");
+	failed |= run_case(false, false, false, false, false, false,
 			   MODE_FORCE_INVALID_WANT, true,
 			   "not-advertised-forced-want");
 

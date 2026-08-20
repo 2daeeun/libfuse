@@ -556,6 +556,25 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH (1ULL << 37)
 
 /**
+ * Indicates that the kernel can serialize regular-file RELEASE metadata
+ * publication with ExtFUSE passthrough attribute refresh, so a concurrent
+ * GETATTR never observes a transient cache-publication gap.
+ *
+ * This opt-in capability is meaningful only together with
+ * FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH,
+ * FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2,
+ * FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE, FUSE_CAP_EXTFUSE and
+ * FUSE_CAP_PASSTHROUGH. It is disabled by default.
+ *
+ * A filesystem opting in must publish current attributes, retain an existing
+ * token-invalid cache row, or invalidate that row before replying to RELEASE;
+ * the RELEASE reply is the barrier completion point.  A RELEASE handler must
+ * not issue a synchronous GETATTR for the same inode through the same FUSE
+ * mount before replying.  It should inspect the pinned backing inode instead.
+ */
+#define FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER (1ULL << 38)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine

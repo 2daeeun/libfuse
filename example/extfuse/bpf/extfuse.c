@@ -556,6 +556,28 @@ static int attr_needs_native_refresh(const lookup_attr_val_t *attr,
 	return attr->stale || attr->native_state != native_state;
 }
 
+static int attr_needs_refresh(const lookup_attr_val_t *attr, __u64 daemon_state,
+			      __u64 native_state)
+{
+	return attr->daemon_state != daemon_state ||
+	       attr_needs_native_refresh(attr, native_state);
+}
+
+static int old_daemon_token_refresh_allowed(const lookup_attr_val_t *attr,
+					    __u64 daemon_state)
+{
+	if (attr->daemon_state == daemon_state)
+		return 1;
+	/*
+	 * Only the negotiated release barrier retains an old daemon-token row
+	 * as a refresh seed.  A lower stat cannot reconstruct daemon-only
+	 * FUSE_ATTR_* flags, so mismatched rows carrying any such flag remain a
+	 * conservative upcall.
+	 */
+	return policy_enabled(EXTFUSE_POLICY_ATTR_RELEASE_BARRIER) &&
+	       !attr->out.attr.flags;
+}
+
 /*
  * After a native operation END, the next ordinary GETATTR may lazily take a
  * fresh lower inode snapshot.  Hand the kernel exact coherence tokens only
@@ -577,13 +599,12 @@ HANDLER(EXTFUSE_PASSTHROUGH_ATTR_PREPARE,
 	if (!attr)
 		return UPCALL;
 	if (!daemon_state_inactive(key.nodeid, &cookie.daemon_state) ||
-	    attr->daemon_state != cookie.daemon_state)
+	    !old_daemon_token_refresh_allowed(attr, cookie.daemon_state))
 		return UPCALL;
 	if (!native_state_inactive(key.nodeid, &cookie.native_state) ||
-	    !attr_needs_native_refresh(attr, cookie.native_state))
+	    !attr_needs_refresh(attr, cookie.daemon_state, cookie.native_state))
 		return UPCALL;
-	if (bpf_extfuse_write_args(ctx, OUT_PARAM_0, &cookie,
-				    sizeof(cookie)))
+	if (bpf_extfuse_write_args(ctx, OUT_PARAM_0, &cookie, sizeof(cookie)))
 		return UPCALL;
 	return RETURN;
 }
@@ -622,14 +643,19 @@ HANDLER(EXTFUSE_PASSTHROUGH_ATTR_COMMIT,
 	daemon_attr_flags = replacement.out.attr.flags;
 	if (!daemon_state_inactive(key.nodeid, &daemon_state) ||
 	    daemon_state != cookie.daemon_state ||
-	    replacement.daemon_state != cookie.daemon_state)
+	    !old_daemon_token_refresh_allowed(&replacement, daemon_state))
 		return UPCALL;
 	if (!native_state_inactive(key.nodeid, &native_state) ||
-	    native_state != cookie.native_state ||
-	    !attr_needs_native_refresh(&replacement, cookie.native_state))
+	    native_state != cookie.native_state)
 		return UPCALL;
 	if (has_passthrough_mmap_marker(key.nodeid))
 		return UPCALL;
+	/* Preserve the legacy fallback unless the release barrier was negotiated. */
+	if (!attr_needs_refresh(&replacement, daemon_state, native_state)) {
+		if (policy_enabled(EXTFUSE_POLICY_ATTR_RELEASE_BARRIER))
+			return RETURN;
+		return UPCALL;
+	}
 
 	replacement.stale = 0;
 	replacement.daemon_state = cookie.daemon_state;

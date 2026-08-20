@@ -2660,6 +2660,9 @@ static bool want_flag_dependencies_valid(uint64_t want)
 		coherence_dependencies |
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE |
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2;
+	const uint64_t attr_release_barrier_dependencies =
+		attr_refresh_dependencies |
+		FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
 
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE) &&
 	    (want & coherence_dependencies) != coherence_dependencies) {
@@ -2678,6 +2681,14 @@ static bool want_flag_dependencies_valid(uint64_t want)
 		fuse_log(FUSE_LOG_ERR,
 			 "fuse: ExtFUSE attr refresh requires passthrough "
 			 "coherence V2 and its prerequisites\n");
+		return false;
+	}
+	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER) &&
+	    (want & attr_release_barrier_dependencies) !=
+		    attr_release_barrier_dependencies) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: ExtFUSE %s requires attr refresh and its prerequisites\n",
+			 "attr release barrier");
 		return false;
 	}
 	return true;
@@ -2890,6 +2901,10 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		if (inargflags & FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH)
 			se->conn.capable_ext |=
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
+		if (inargflags &
+		    FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER)
+			se->conn.capable_ext |=
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
 
 	} else {
 		se->conn.max_readahead = 0;
@@ -3059,6 +3074,9 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2;
 	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH)
 		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
+	if (se->conn.want_ext &
+	    FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER)
+		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
 
 	if ((inargflags & FUSE_REQUEST_TIMEOUT) && se->conn.request_timeout) {
 		outargflags |= FUSE_REQUEST_TIMEOUT;

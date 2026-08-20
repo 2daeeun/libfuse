@@ -358,6 +358,18 @@ int ebpf_data_update(ebpf_context_t *context, const void *key,
 	return bpf_map_update_elem(fd, key, value, flags);
 }
 
+int ebpf_data_replace(ebpf_context_t *context, const void *key,
+		      const void *value, int idx)
+{
+	int fd = checked_data_fd(context, idx);
+
+	if (fd < 0 || !key || !value) {
+		errno = EINVAL;
+		return -1;
+	}
+	return bpf_map_update_elem(fd, key, value, BPF_EXIST);
+}
+
 int ebpf_data_delete(ebpf_context_t *context, const void *key, int idx)
 {
 	int fd = checked_data_fd(context, idx);

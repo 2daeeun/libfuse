@@ -73,6 +73,8 @@ static const struct cap_info capabilities[] = {
 					"FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2"},
 	{FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH,
 					"FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH"},
+	{FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER,
+			"FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER"},
     // Add any new capabilities here
     {0, NULL} // Sentinel to mark the end of the array
 };

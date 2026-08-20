@@ -74,6 +74,9 @@ int ebpf_data_lookup(ebpf_context_t *context, const void *key, void *value,
 		     int idx);
 int ebpf_data_update(ebpf_context_t *context, const void *key,
 		     const void *value, int idx, int overwrite);
+/* Replace an existing element with BPF_EXIST; never create a missing row. */
+int ebpf_data_replace(ebpf_context_t *context, const void *key,
+		      const void *value, int idx);
 int ebpf_data_delete(ebpf_context_t *context, const void *key, int idx);
 
 #ifdef __cplusplus

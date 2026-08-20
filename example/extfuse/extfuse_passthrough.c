@@ -138,6 +138,7 @@ struct xattr_value {
 #define PERF_XATTR_MAX_ENTRIES (1U << 16)
 #define PERF_XATTR_LOCK_BUCKETS 4096U
 #define PERF_CAPABILITY_XATTR "security.capability"
+#define PERF_ATTR_RELEASE_BARRIER_INIT_FMT "%s=%u %s=%u %s=%u "
 #define PERF_POSIX_ACL_ACCESS_XATTR "system.posix_acl_access"
 
 enum perf_backing_mode {
@@ -152,6 +153,7 @@ struct perf_backing {
 	int backing_id;
 	uint64_t open_count;
 	enum perf_backing_mode mode;
+	bool registration_may_modify;
 };
 
 #define PERF_TOMBSTONE_BUCKETS 16384U
@@ -188,6 +190,15 @@ struct perf_cache_mutation {
 struct perf_cache_snapshot {
 	uint64_t daemon_state;
 	uint64_t native_state;
+};
+
+enum perf_cache_attr_outcome {
+	PERF_CACHE_ATTR_DISABLED,
+	PERF_CACHE_ATTR_PUBLISHED,
+	PERF_CACHE_ATTR_UNSTABLE,
+	PERF_CACHE_ATTR_SUPPRESSED,
+	PERF_CACHE_ATTR_MISSING,
+	PERF_CACHE_ATTR_ERROR,
 };
 
 _Static_assert(sizeof(struct entry_key) == 264, "entry key ABI");
@@ -245,7 +256,15 @@ struct perf_counters {
 	atomic_uint_fast64_t passthrough_state_errors;
 	atomic_uint_fast64_t passthrough_attr_suppressions;
 	atomic_uint_fast64_t passthrough_mmap_suppressions;
+	atomic_uint_fast64_t passthrough_release_readonly_fast;
+	atomic_uint_fast64_t passthrough_release_may_modify;
+	atomic_uint_fast64_t passthrough_release_registration_refreshes;
 	atomic_uint_fast64_t passthrough_release_attr_snapshots;
+	atomic_uint_fast64_t passthrough_release_attr_published;
+	atomic_uint_fast64_t passthrough_release_attr_unstable;
+	atomic_uint_fast64_t passthrough_release_attr_suppressed;
+	atomic_uint_fast64_t passthrough_release_attr_missing;
+	atomic_uint_fast64_t passthrough_release_attr_disabled;
 	atomic_uint_fast64_t passthrough_release_attr_retired_skips;
 	atomic_uint_fast64_t passthrough_release_attr_errors;
 	atomic_uint_fast64_t passthrough_tombstones;
@@ -282,6 +301,8 @@ struct perf_state {
 	bool passthrough_coherence_v2_requested;
 	bool passthrough_attr_refresh_capable;
 	bool passthrough_attr_refresh_requested;
+	bool passthrough_attr_release_barrier_capable;
+	bool passthrough_attr_release_barrier_requested;
 	bool require_passthrough_coherence;
 	uint32_t bpf_policy_flags;
 	pthread_rwlock_t namespace_lock;
@@ -317,6 +338,20 @@ static bool metadata_hits_enabled(void)
 static bool native_passthrough_enabled(void)
 {
 	return perf_state.mode == PERF_MODE_ALLOPT;
+}
+
+static bool attr_release_barrier_enabled(void)
+{
+	return perf_state.passthrough_coherence_v2_requested &&
+	       perf_state.passthrough_attr_release_barrier_requested &&
+	       (perf_state.bpf_policy_flags &
+		EXTFUSE_POLICY_ATTR_RELEASE_BARRIER);
+}
+
+static bool file_may_modify(int flags)
+{
+	/* RELEASE has no dirty bit, so writable/truncating opens are conservative. */
+	return (flags & O_ACCMODE) != O_RDONLY || (flags & O_TRUNC);
 }
 
 static uint64_t counter_value(atomic_uint_fast64_t *counter)
@@ -889,21 +924,35 @@ static int disable_xattr_cache_locked(const char *reason)
 
 static int cache_attr_locked(fuse_ino_t nodeid, const struct stat *st,
 			     double timeout, uint64_t daemon_state,
-			     uint64_t native_state)
+			     uint64_t native_state, bool existing_only,
+			     bool *missing)
 {
 	struct attr_key key = { .nodeid = nodeid };
 	struct attr_value value = {
 		.native_state = native_state,
 		.daemon_state = daemon_state,
 	};
+	int result;
 
+	if (missing)
+		*missing = false;
 	value.out.attr_valid = timeout_seconds(timeout);
 	value.out.attr_valid_nsec = timeout_nanoseconds(timeout);
 	stat_to_fuse_attr(st, &value.out.attr);
-	if (ebpf_data_update(perf_state.bpf, &key, &value,
-			     EXTFUSE_ATTR_MAP, 1)) {
+	if (existing_only)
+		result = ebpf_data_replace(perf_state.bpf, &key, &value,
+					   EXTFUSE_ATTR_MAP);
+	else
+		result = ebpf_data_update(perf_state.bpf, &key, &value,
+					  EXTFUSE_ATTR_MAP, 1);
+	if (result) {
 		uint64_t errors;
 
+		if (existing_only && errno == ENOENT) {
+			if (missing)
+				*missing = true;
+			return 0;
+		}
 		counter_increment(&perf_state.counters.cache_update_errors);
 		errors = counter_value(&perf_state.counters.cache_update_errors);
 		if (errors <= 8)
@@ -918,21 +967,26 @@ static int cache_attr_locked(fuse_ino_t nodeid, const struct stat *st,
 	return 0;
 }
 
-static int cache_attr(fuse_ino_t nodeid, const struct stat *st,
-		      double timeout, const struct perf_cache_snapshot *snapshot,
-		      double *reply_timeout)
+static enum perf_cache_attr_outcome
+cache_attr(fuse_ino_t nodeid, const struct stat *st, double timeout,
+	   const struct perf_cache_snapshot *snapshot, bool existing_only,
+	   double *reply_timeout)
 {
+	bool missing;
 	bool suppressed;
 	bool mmap_suppressed;
 	bool stable;
-	int result = 0;
+	enum perf_cache_attr_outcome outcome = PERF_CACHE_ATTR_DISABLED;
 
 	*reply_timeout = timeout;
 	if (!metadata_hits_enabled())
-		return 0;
+		return outcome;
 	pthread_mutex_lock(&perf_state.backing_mutex);
-	stable = !perf_state.cache_bypass &&
-		 cache_snapshot_stable_locked(nodeid, snapshot);
+	if (perf_state.cache_bypass) {
+		*reply_timeout = 0;
+		goto out;
+	}
+	stable = cache_snapshot_stable_locked(nodeid, snapshot);
 	suppressed = attr_cache_suppressed_locked(nodeid, &mmap_suppressed);
 	/*
 	 * generation은 userspace가 관리하는 BPF cache만 보호한다. 관계없는
@@ -944,6 +998,7 @@ static int cache_attr(fuse_ino_t nodeid, const struct stat *st,
 	 */
 	if (!stable) {
 		*reply_timeout = 0;
+		outcome = PERF_CACHE_ATTR_UNSTABLE;
 		goto out;
 	}
 	if (suppressed) {
@@ -955,14 +1010,21 @@ static int cache_attr(fuse_ino_t nodeid, const struct stat *st,
 			counter_increment(
 				&perf_state.counters.passthrough_attr_suppressions);
 		}
+		outcome = PERF_CACHE_ATTR_SUPPRESSED;
 		goto out;
 	}
-	result = cache_attr_locked(nodeid, st, timeout,
-				   snapshot->daemon_state,
-				   snapshot->native_state);
+	if (cache_attr_locked(nodeid, st, timeout, snapshot->daemon_state,
+			      snapshot->native_state, existing_only, &missing))
+		outcome = PERF_CACHE_ATTR_ERROR;
+	else if (missing) {
+		*reply_timeout = 0;
+		outcome = PERF_CACHE_ATTR_MISSING;
+	} else {
+		outcome = PERF_CACHE_ATTR_PUBLISHED;
+	}
 out:
 	pthread_mutex_unlock(&perf_state.backing_mutex);
-	return result;
+	return outcome;
 }
 
 static int cache_entry(fuse_ino_t parent, const char *name,
@@ -1024,7 +1086,7 @@ static int cache_entry(fuse_ino_t parent, const char *name,
 		   cache_attr_locked(entry->ino, &entry->attr,
 				     entry->attr_timeout,
 				     snapshot->daemon_state,
-				     snapshot->native_state)) {
+				     snapshot->native_state, false, NULL)) {
 		result = -1;
 		goto out;
 	}
@@ -1460,6 +1522,7 @@ static void attach_native_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 	backing->ino = ino;
 	backing->open_count = 1;
 	backing->mode = PERF_BACKING_DAEMON;
+	backing->registration_may_modify = file_may_modify(fi->flags);
 	backing->next = *link;
 	*link = backing;
 	counter_increment(&perf_state.counters.passthrough_tracked_records);
@@ -1529,6 +1592,46 @@ static void attach_native_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 	pthread_mutex_unlock(&perf_state.backing_mutex);
 }
 
+static bool classify_native_passthrough_release(fuse_ino_t ino,
+						bool handle_may_modify,
+						bool *may_modify,
+						bool *registration_refresh)
+{
+	struct perf_backing *backing;
+	uint64_t errors;
+
+	*may_modify = handle_may_modify;
+	*registration_refresh = false;
+	pthread_mutex_lock(&perf_state.backing_mutex);
+	backing = find_backing_locked(ino, NULL);
+	if (!backing || !backing->open_count) {
+		counter_increment(
+			&perf_state.counters.passthrough_state_errors);
+		errors = counter_value(
+			&perf_state.counters.passthrough_state_errors);
+		if (errors <= 8)
+			fprintf(stderr,
+				"PASSTHROUGH_STATE_ERROR operation=%s nodeid=%" PRIu64 "\n",
+				"release-plan",
+				(uint64_t)ino);
+		request_allopt_session_exit();
+		pthread_mutex_unlock(&perf_state.backing_mutex);
+		return false;
+	}
+
+	/*
+	 * The kernel-held registered file can outlive its originating handle.
+	 * Refresh when that writable registration is finally retired, even if the
+	 * userspace handle delivering the last RELEASE was opened read-only.
+	 */
+	if (backing->open_count == 1 && backing->registration_may_modify) {
+		*may_modify = true;
+		*registration_refresh = !handle_may_modify;
+	}
+	pthread_mutex_unlock(&perf_state.backing_mutex);
+	return true;
+}
+
 static bool release_native_passthrough(fuse_req_t req, fuse_ino_t ino)
 {
 	struct perf_backing **link;
@@ -1587,7 +1690,14 @@ static bool release_native_passthrough(fuse_req_t req, fuse_ino_t ino)
 				&perf_state.counters.passthrough_closes);
 	}
 
-	advance_inode_generation_locked(ino, "backing-release");
+	/*
+	 * A negotiated release barrier makes backing lifetime independent of
+	 * attr validity.  Modified RELEASE is already bracketed by the daemon
+	 * mutation token, while a clean read-only RELEASE changes no metadata.
+	 * Older kernels retain the original conservative generation advance.
+	 */
+	if (!attr_release_barrier_enabled())
+		advance_inode_generation_locked(ino, "backing-release");
 	*link = backing->next;
 	counter_decrement(
 		&perf_state.counters.passthrough_tracked_records);
@@ -1734,6 +1844,8 @@ static int configure_bpf_policy(void)
 	    perf_state.profile == PERF_PROFILE_PAPER_LIKE)
 		flags = EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA |
 			EXTFUSE_POLICY_RELAX_NATIVE_MMAP_METADATA;
+	if (perf_state.passthrough_attr_release_barrier_requested)
+		flags |= EXTFUSE_POLICY_ATTR_RELEASE_BARRIER;
 	if (flags & ~EXTFUSE_POLICY_KNOWN_MASK) {
 		errno = EINVAL;
 		return -1;
@@ -1757,13 +1869,17 @@ static int configure_bpf_policy(void)
 	}
 	perf_state.bpf_policy_flags = flags;
 	fprintf(stderr,
-		"BPF_POLICY flags=0x%08x paper_native_read_metadata=%s "
-		"paper_native_mmap_metadata=%s\n",
+		"BPF_POLICY flags=0x%08x %s=%s %s=%s %s=%s\n",
 		flags,
+		"paper_native_read_metadata",
 		(flags & EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA) ?
 			"relaxed" : "strict",
+		"paper_native_mmap_metadata",
 		(flags & EXTFUSE_POLICY_RELAX_NATIVE_MMAP_METADATA) ?
-			"relaxed" : "strict");
+			"relaxed" : "strict",
+		"attr_release_barrier",
+		(flags & EXTFUSE_POLICY_ATTR_RELEASE_BARRIER) ?
+			"enabled" : "disabled");
 	return 0;
 }
 
@@ -1936,7 +2052,15 @@ static void print_counters(const char *phase)
 		" passthrough_state_errors=%" PRIu64
 		" passthrough_attr_suppressions=%" PRIu64
 		" passthrough_mmap_suppressions=%" PRIu64
+		" passthrough_release_readonly_fast=%" PRIu64
+		" passthrough_release_may_modify=%" PRIu64
+		" passthrough_release_registration_refreshes=%" PRIu64
 		" passthrough_release_attr_snapshots=%" PRIu64
+		" passthrough_release_attr_published=%" PRIu64
+		" passthrough_release_attr_unstable=%" PRIu64
+		" passthrough_release_attr_suppressed=%" PRIu64
+		" passthrough_release_attr_missing=%" PRIu64
+		" passthrough_release_attr_disabled=%" PRIu64
 		" passthrough_release_attr_retired_skips=%" PRIu64
 		" passthrough_release_attr_errors=%" PRIu64
 		" passthrough_tombstones=%" PRIu64
@@ -2002,8 +2126,24 @@ static void print_counters(const char *phase)
 				&perf_state.counters.passthrough_attr_suppressions),
 		counter_value(
 			&perf_state.counters.passthrough_mmap_suppressions),
+		counter_value(&perf_state.counters
+				      .passthrough_release_readonly_fast),
+		counter_value(&perf_state.counters
+				      .passthrough_release_may_modify),
+		counter_value(&perf_state.counters
+				      .passthrough_release_registration_refreshes),
 		counter_value(
 			&perf_state.counters.passthrough_release_attr_snapshots),
+		counter_value(&perf_state.counters
+				      .passthrough_release_attr_published),
+		counter_value(&perf_state.counters
+				      .passthrough_release_attr_unstable),
+		counter_value(&perf_state.counters
+				      .passthrough_release_attr_suppressed),
+		counter_value(&perf_state.counters
+				      .passthrough_release_attr_missing),
+		counter_value(&perf_state.counters
+				      .passthrough_release_attr_disabled),
 		counter_value(&perf_state.counters
 				      .passthrough_release_attr_retired_skips),
 		counter_value(
@@ -2053,6 +2193,9 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 	perf_state.passthrough_attr_refresh_capable =
 		(conn->capable_ext &
 		 FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH) != 0;
+	perf_state.passthrough_attr_release_barrier_capable =
+		(conn->capable_ext &
+		 FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER) != 0;
 	if (native_passthrough_enabled()) {
 		fuse_unset_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
 		lo->writeback = 0;
@@ -2085,6 +2228,12 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 				fuse_set_feature_flag(
 					conn,
 					FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH);
+		if (perf_state.passthrough_attr_refresh_requested &&
+		    perf_state.passthrough_attr_release_barrier_capable)
+			perf_state.passthrough_attr_release_barrier_requested =
+				fuse_set_feature_flag(
+					conn,
+					FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
 		if (perf_state.require_passthrough_coherence &&
 		    !perf_state.passthrough_coherence_v2_requested) {
 			if (!perf_state.init_rc)
@@ -2108,6 +2257,22 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2 |
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
 		}
+		/*
+		 * Retaining an old-token attr row across RELEASE is safe only when
+		 * both sides negotiated the release barrier.  Fail closed instead of
+		 * silently running the new userspace policy against an older kernel.
+		 */
+		if (!perf_state.passthrough_attr_release_barrier_capable ||
+		    perf_state.passthrough_attr_release_barrier_capable !=
+			perf_state.passthrough_attr_release_barrier_requested) {
+			if (!perf_state.init_rc)
+				perf_state.init_rc = -EOPNOTSUPP;
+			conn->want_ext |=
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE |
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2 |
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH |
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
+		}
 	}
 	if (!strcmp(perf_state.transport, "uring"))
 		perf_state.single_issuer = fuse_set_conn_flag(
@@ -2123,6 +2288,12 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 				perf_state.init_rc = extfuse_rc;
 		}
 	}
+	if (perf_state.passthrough_attr_release_barrier_requested &&
+	    perf_state.requested && configure_bpf_policy()) {
+		if (!perf_state.init_rc)
+			perf_state.init_rc = -EIO;
+		request_allopt_session_exit();
+	}
 	fprintf(stderr,
 		"INIT mode=%s transport=%s capable=%u requested=%u "
 		"passthrough_capable=%u passthrough_requested=%u "
@@ -2132,6 +2303,7 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		"passthrough_coherence_v2_requested=%u "
 		"passthrough_attr_refresh_capable=%u "
 		"passthrough_attr_refresh_requested=%u "
+		PERF_ATTR_RELEASE_BARRIER_INIT_FMT
 		"paper_native_read_metadata_relaxed=%u "
 		"paper_native_mmap_metadata_relaxed=%u "
 		"readdirplus_policy=stackfs-compatible-disabled "
@@ -2151,6 +2323,12 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		perf_state.passthrough_coherence_v2_requested,
 		perf_state.passthrough_attr_refresh_capable,
 		perf_state.passthrough_attr_refresh_requested,
+		"passthrough_attr_release_barrier_capable",
+		perf_state.passthrough_attr_release_barrier_capable,
+		"passthrough_attr_release_barrier_requested",
+		perf_state.passthrough_attr_release_barrier_requested,
+		"passthrough_attr_release_barrier_policy",
+		attr_release_barrier_enabled(),
 		(perf_state.bpf_policy_flags &
 		 EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA) != 0,
 		(perf_state.bpf_policy_flags &
@@ -2268,7 +2446,8 @@ void perf_getattr(fuse_req_t req, fuse_ino_t ino,
 		fuse_reply_err(req, errno);
 		return;
 	}
-	cache_attr(ino, &st, lo->timeout, &snapshot, &reply_timeout);
+	cache_attr(ino, &st, lo->timeout, &snapshot, false,
+		   &reply_timeout);
 	/* Root and getattr-only inodes also need the paper's proactive xattr fill. */
 	prefetch_capability(req, ino);
 	fuse_reply_attr(req, &st, reply_timeout);
@@ -2485,7 +2664,8 @@ static void cache_pinned_inode_attr(struct lo_data *lo, fuse_ino_t ino,
 	double reply_timeout;
 
 	if (snapshot_pinned_inode_attr(ino, fd, dev, lower_ino, &st, &snapshot))
-		cache_attr(ino, &st, lo->timeout, &snapshot, &reply_timeout);
+		cache_attr(ino, &st, lo->timeout, &snapshot, false,
+			   &reply_timeout);
 }
 
 static double cache_inode_attr_snapshot(fuse_req_t req, fuse_ino_t ino,
@@ -2497,7 +2677,7 @@ static double cache_inode_attr_snapshot(fuse_req_t req, fuse_ino_t ino,
 	struct perf_cache_snapshot snapshot;
 
 	if (snapshot_inode_attr(req, ino, &st, &snapshot)) {
-		cache_attr(ino, &st, lo->timeout, &snapshot,
+		cache_attr(ino, &st, lo->timeout, &snapshot, false,
 			   &reply_timeout);
 		if (reply_attr)
 			*reply_attr = st;
@@ -2988,9 +3168,14 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 	struct stat st;
 	double ignored_reply_timeout;
 	struct perf_cache_snapshot snapshot;
+	enum perf_cache_attr_outcome outcome;
 	pthread_mutex_t *xattr_lock;
 	uint64_t errors;
 	int snapshot_error;
+	bool barrier;
+	bool handle_may_modify;
+	bool may_modify = true;
+	bool registration_refresh = false;
 	bool retired;
 	bool released;
 
@@ -3001,18 +3186,57 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 	}
 	xattr_lock = xattr_lock_for_inode(ino);
 	pthread_mutex_lock(xattr_lock);
+	barrier = attr_release_barrier_enabled();
+	handle_may_modify = file_may_modify(fi->flags);
+	if (barrier &&
+	    !classify_native_passthrough_release(ino, handle_may_modify,
+					    &may_modify,
+					    &registration_refresh)) {
+		/* Fatal state loss must not leave an exact-token row serviceable. */
+		invalidate_attr(ino);
+		invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
+		close(fi->fh);
+		pthread_mutex_unlock(xattr_lock);
+		fuse_reply_err(req, 0);
+		return;
+	}
+	if (barrier && !may_modify) {
+		released = release_native_passthrough(req, ino);
+		close(fi->fh);
+		if (released)
+			counter_increment(&perf_state.counters
+					 .passthrough_release_readonly_fast);
+		/* No metadata publication remains when the barrier is disarmed. */
+		pthread_mutex_unlock(xattr_lock);
+		fuse_reply_err(req, 0);
+		return;
+	}
+	if (barrier) {
+		counter_increment(&perf_state.counters
+				 .passthrough_release_may_modify);
+		if (registration_refresh)
+			counter_increment(&perf_state.counters
+					 .passthrough_release_registration_refreshes);
+	}
 	cache_mutation_add(&mutation, ino);
 	if (!cache_mutation_begin(&mutation)) {
 		cache_mutation_end(&mutation);
+		if (barrier) {
+			invalidate_attr(ino);
+			invalidate_xattr_serialized(
+				ino, PERF_CAPABILITY_XATTR, true);
+		}
 		pthread_mutex_unlock(xattr_lock);
 		fuse_reply_err(req, EIO);
 		return;
 	}
-	invalidate_attr(ino);
+	if (!barrier)
+		invalidate_attr(ino);
 	invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
 	released = release_native_passthrough(req, ino);
 	close(fi->fh);
-	invalidate_attr(ino);
+	if (!barrier)
+		invalidate_attr(ino);
 	invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
 	cache_mutation_end(&mutation);
 	if (released && perf_state.passthrough_coherence_v2_requested) {
@@ -3023,14 +3247,35 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 		 */
 		lo = lo_data(req);
 		if (snapshot_inode_attr(req, ino, &st, &snapshot)) {
-			if (cache_attr(ino, &st, lo->timeout,
-				       &snapshot,
-				       &ignored_reply_timeout)) {
+			counter_increment(&perf_state.counters
+					 .passthrough_release_attr_snapshots);
+			outcome = cache_attr(ino, &st, lo->timeout, &snapshot,
+					     barrier, &ignored_reply_timeout);
+			switch (outcome) {
+			case PERF_CACHE_ATTR_PUBLISHED:
+				counter_increment(&perf_state.counters
+						 .passthrough_release_attr_published);
+				break;
+			case PERF_CACHE_ATTR_UNSTABLE:
+				counter_increment(&perf_state.counters
+						 .passthrough_release_attr_unstable);
+				break;
+			case PERF_CACHE_ATTR_SUPPRESSED:
+				counter_increment(&perf_state.counters
+						 .passthrough_release_attr_suppressed);
+				break;
+			case PERF_CACHE_ATTR_MISSING:
+				counter_increment(&perf_state.counters
+						 .passthrough_release_attr_missing);
+				break;
+			case PERF_CACHE_ATTR_DISABLED:
+				counter_increment(&perf_state.counters
+						 .passthrough_release_attr_disabled);
+				break;
+			case PERF_CACHE_ATTR_ERROR:
 				counter_increment(&perf_state.counters
 						 .passthrough_release_attr_errors);
-			} else {
-				counter_increment(&perf_state.counters
-						 .passthrough_release_attr_snapshots);
+				break;
 			}
 			prefetch_xattr_serialized(req, ino,
 						  PERF_CAPABILITY_XATTR);
@@ -3060,10 +3305,19 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 						(uint64_t)ino, snapshot_error,
 						strerror(snapshot_error));
 			}
-			/* snapshot을 못 얻었으면 기존 attr가 노출되지 않게 지운다. */
-			invalidate_attr(ino);
+			/*
+			 * The barrier leaves a non-retired old-token row in place.  It
+			 * cannot be served, but it remains a BPF_EXIST refresh seed.
+			 */
+			if (!barrier || retired)
+				invalidate_attr(ino);
 		}
 	}
+	/*
+	 * The kernel disarms the negotiated RELEASE barrier when this reply is
+	 * consumed.  Keep it after attr publication (or safe old-token retention)
+	 * and all serialized capability-xattr work.
+	 */
 	pthread_mutex_unlock(xattr_lock);
 	fuse_reply_err(req, 0);
 }
@@ -3128,7 +3382,7 @@ void perf_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	cache_snapshot_begin(ino, &snapshot);
 	if (!extfuse_snapshot_pinned_inode(inode_fd, inode->dev, inode->ino,
 					    &st))
-		cache_attr(ino, &st, lo->timeout, &snapshot,
+		cache_attr(ino, &st, lo->timeout, &snapshot, false,
 			   &ignored_reply_timeout);
 }
 
@@ -3175,7 +3429,7 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 		cache_snapshot_begin(ino, &snapshot);
 		if (!extfuse_snapshot_pinned_inode(inode_fd, inode->dev,
 						    inode->ino, &st))
-			cache_attr(ino, &st, lo->timeout, &snapshot,
+			cache_attr(ino, &st, lo->timeout, &snapshot, false,
 				   &ignored_reply_timeout);
 		fuse_reply_write(req, (size_t)result);
 	} else {

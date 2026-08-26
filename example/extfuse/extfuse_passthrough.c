@@ -31,10 +31,12 @@ int upstream_passthrough_main(int argc, char *argv[]);
 #include <bpf/bpf.h>
 #include <ebpf.h>
 #include <extfuse_coherence.h>
+#include <fuse_i.h>
 #include <fuse_kernel.h>
 #include <linux/bpf.h>
 #include <linux/xattr.h>
 #include <stdatomic.h>
+#include <time.h>
 
 #include "read_cache_fd.h"
 
@@ -284,6 +286,7 @@ struct perf_state {
 	const char *mode_name;
 	const char *transport;
 	bool count_callbacks;
+	bool trace_metadata_upcalls;
 	ebpf_context_t *bpf;
 	struct fuse_conn_info_opts *conn_opts;
 	struct fuse_session *session;
@@ -321,6 +324,425 @@ static struct perf_state perf_state = {
 	.namespace_lock = PTHREAD_RWLOCK_INITIALIZER,
 	.backing_mutex = PTHREAD_MUTEX_INITIALIZER,
 };
+
+#define PERF_METADATA_EVIDENCE_MAX (4U * 1024U * 1024U)
+
+struct perf_metadata_bytes {
+	unsigned char *data;
+	size_t size;
+};
+
+struct perf_metadata_upcall {
+	int64_t monotonic_ns;
+	struct timespec start;
+	uint64_t unique;
+	uint32_t opcode;
+	uint64_t nodeid;
+	intmax_t origin_pid;
+	intmax_t origin_tgid;
+	intmax_t origin_tid;
+	intmax_t uid;
+	intmax_t gid;
+	int lower_fd;
+	uintmax_t lower_dev;
+	uintmax_t lower_ino;
+	bool lower_stat_available;
+	int evidence_errors;
+	struct perf_metadata_bytes comm;
+	struct perf_metadata_bytes cmdline;
+	struct perf_metadata_bytes exe;
+	struct perf_metadata_bytes cwd;
+	struct perf_metadata_bytes lower_path;
+	struct perf_metadata_bytes kernel_stack;
+	const char *path_state;
+	intmax_t getattr_fi_present;
+	intmax_t getattr_fi_flags;
+	intmax_t getattr_fh;
+	const unsigned char *name;
+	size_t name_size;
+	intmax_t size;
+};
+
+static int64_t perf_timespec_ns(const struct timespec *time)
+{
+	return (int64_t)time->tv_sec * INT64_C(1000000000) + time->tv_nsec;
+}
+
+static void perf_metadata_bytes_reset(struct perf_metadata_bytes *bytes)
+{
+	free(bytes->data);
+	bytes->data = NULL;
+	bytes->size = 0;
+}
+
+static int perf_metadata_read_fd(int fd, struct perf_metadata_bytes *bytes)
+{
+	size_t capacity = 4096;
+	unsigned char *data;
+
+	data = malloc(capacity + 1);
+	if (!data)
+		return -1;
+	for (;;) {
+		ssize_t result;
+
+		if (bytes->size == capacity) {
+			unsigned char *resized;
+			size_t new_capacity;
+
+			if (capacity == PERF_METADATA_EVIDENCE_MAX) {
+				errno = EOVERFLOW;
+				goto error;
+			}
+			new_capacity = capacity * 2;
+			if (new_capacity > PERF_METADATA_EVIDENCE_MAX)
+				new_capacity = PERF_METADATA_EVIDENCE_MAX;
+			resized = realloc(data, new_capacity + 1);
+			if (!resized)
+				goto error;
+			data = resized;
+			capacity = new_capacity;
+		}
+		result = read(fd, data + bytes->size, capacity - bytes->size);
+		if (result > 0) {
+			bytes->size += (size_t)result;
+			continue;
+		}
+		if (!result)
+			break;
+		if (errno == EINTR)
+			continue;
+		goto error;
+	}
+	data[bytes->size] = '\0';
+	bytes->data = data;
+	return 0;
+
+error:
+	free(data);
+	bytes->size = 0;
+	return -1;
+}
+
+static int perf_metadata_read_file(const char *path,
+				   struct perf_metadata_bytes *bytes)
+{
+	int fd;
+	int result;
+	int saved_error;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	result = perf_metadata_read_fd(fd, bytes);
+	saved_error = errno;
+	close(fd);
+	errno = saved_error;
+	return result;
+}
+
+static int perf_metadata_proc_path(char *path, size_t path_size, pid_t pid,
+				   const char *leaf)
+{
+	int result = snprintf(path, path_size, "/proc/%jd/%s", (intmax_t)pid,
+			      leaf);
+
+	if (result < 0 || (size_t)result >= path_size) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	return 0;
+}
+
+static int perf_metadata_read_proc(pid_t pid, const char *leaf,
+				   struct perf_metadata_bytes *bytes)
+{
+	char path[64];
+
+	if (perf_metadata_proc_path(path, sizeof(path), pid, leaf))
+		return -1;
+	return perf_metadata_read_file(path, bytes);
+}
+
+static int perf_metadata_readlink(const char *path,
+				  struct perf_metadata_bytes *bytes)
+{
+	size_t capacity = 256;
+	unsigned char *data;
+
+	data = malloc(capacity + 1);
+	if (!data)
+		return -1;
+	for (;;) {
+		ssize_t result = readlink(path, (char *)data, capacity);
+
+		if (result < 0)
+			goto error;
+		if ((size_t)result < capacity) {
+			bytes->size = (size_t)result;
+			data[bytes->size] = '\0';
+			bytes->data = data;
+			return 0;
+		}
+		if (capacity == PERF_METADATA_EVIDENCE_MAX) {
+			errno = EOVERFLOW;
+			goto error;
+		}
+		capacity *= 2;
+		if (capacity > PERF_METADATA_EVIDENCE_MAX)
+			capacity = PERF_METADATA_EVIDENCE_MAX;
+		{
+			unsigned char *resized = realloc(data, capacity + 1);
+
+			if (!resized)
+				goto error;
+			data = resized;
+		}
+	}
+
+error:
+	free(data);
+	bytes->size = 0;
+	return -1;
+}
+
+static int perf_metadata_read_proc_link(pid_t pid, const char *leaf,
+					struct perf_metadata_bytes *bytes)
+{
+	char path[64];
+
+	if (perf_metadata_proc_path(path, sizeof(path), pid, leaf))
+		return -1;
+	return perf_metadata_readlink(path, bytes);
+}
+
+static int perf_metadata_parse_tgid(const struct perf_metadata_bytes *status,
+				    intmax_t *tgid)
+{
+	const char *cursor = (const char *)status->data;
+	const char *end = cursor + status->size;
+
+	while (cursor < end) {
+		const char *line_end = memchr(cursor, '\n', (size_t)(end - cursor));
+		char *number_end;
+		intmax_t value;
+
+		if (!line_end)
+			line_end = end;
+		if ((size_t)(line_end - cursor) < 5 ||
+		    memcmp(cursor, "Tgid:", 5)) {
+			cursor = line_end < end ? line_end + 1 : end;
+			continue;
+		}
+		cursor += 5;
+		while (cursor < line_end && (*cursor == ' ' || *cursor == '\t'))
+			cursor++;
+		errno = 0;
+		value = strtoimax(cursor, &number_end, 10);
+		if (errno || number_end == cursor || number_end > line_end) {
+			errno = EINVAL;
+			return -1;
+		}
+		while (number_end < line_end &&
+		       (*number_end == ' ' || *number_end == '\t'))
+			number_end++;
+		if (number_end != line_end || value <= 0) {
+			errno = EINVAL;
+			return -1;
+		}
+		*tgid = value;
+		return 0;
+	}
+	errno = ENODATA;
+	return -1;
+}
+
+static void perf_metadata_capture_proc(struct perf_metadata_upcall *upcall,
+				       pid_t pid)
+{
+	struct perf_metadata_bytes status = { 0 };
+
+	if (perf_metadata_read_proc(pid, "status", &status) ||
+	    perf_metadata_parse_tgid(&status, &upcall->origin_tgid))
+		upcall->evidence_errors++;
+	perf_metadata_bytes_reset(&status);
+	if (perf_metadata_read_proc(pid, "comm", &upcall->comm))
+		upcall->evidence_errors++;
+	else if (upcall->comm.size &&
+		 upcall->comm.data[upcall->comm.size - 1] == '\n')
+		upcall->comm.size--;
+	if (perf_metadata_read_proc(pid, "cmdline", &upcall->cmdline))
+		upcall->evidence_errors++;
+	if (perf_metadata_read_proc_link(pid, "exe", &upcall->exe))
+		upcall->evidence_errors++;
+	if (perf_metadata_read_proc_link(pid, "cwd", &upcall->cwd))
+		upcall->evidence_errors++;
+	if (perf_metadata_read_proc(pid, "stack", &upcall->kernel_stack))
+		upcall->evidence_errors++;
+}
+
+static void perf_metadata_capture_path(struct perf_metadata_upcall *upcall)
+{
+	static const char deleted_suffix[] = " (deleted)";
+	char path[64];
+	struct stat st;
+	int result;
+
+	if (fstat(upcall->lower_fd, &st))
+		upcall->evidence_errors++;
+	else {
+		upcall->lower_dev = (uintmax_t)st.st_dev;
+		upcall->lower_ino = (uintmax_t)st.st_ino;
+		upcall->lower_stat_available = true;
+	}
+	result = snprintf(path, sizeof(path), "/proc/self/fd/%d",
+			  upcall->lower_fd);
+	if (result < 0 || (size_t)result >= sizeof(path) ||
+	    perf_metadata_readlink(path, &upcall->lower_path)) {
+		upcall->evidence_errors++;
+		return;
+	}
+	upcall->path_state = "live";
+	if (upcall->lower_path.size >= sizeof(deleted_suffix) - 1 &&
+	    !memcmp(upcall->lower_path.data + upcall->lower_path.size -
+			    (sizeof(deleted_suffix) - 1),
+		    deleted_suffix, sizeof(deleted_suffix) - 1))
+		upcall->path_state = "deleted";
+}
+
+static void perf_metadata_upcall_begin(struct perf_metadata_upcall *upcall,
+				       fuse_req_t req, fuse_ino_t ino,
+				       uint32_t opcode, int lower_fd,
+				       const struct fuse_file_info *fi,
+				       const char *name, intmax_t size)
+{
+	const struct fuse_ctx *context;
+
+	memset(upcall, 0, sizeof(*upcall));
+	upcall->monotonic_ns = -1;
+	upcall->origin_pid = -1;
+	upcall->origin_tgid = -1;
+	upcall->origin_tid = -1;
+	upcall->uid = -1;
+	upcall->gid = -1;
+	upcall->lower_fd = lower_fd;
+	upcall->path_state = "unavailable";
+	upcall->getattr_fi_present = -1;
+	upcall->getattr_fi_flags = -1;
+	upcall->getattr_fh = -1;
+	upcall->size = size;
+	upcall->opcode = opcode;
+	upcall->nodeid = (uint64_t)ino;
+	upcall->unique = ((struct fuse_req *)req)->unique;
+	if (clock_gettime(CLOCK_MONOTONIC, &upcall->start))
+		upcall->evidence_errors++;
+	else
+		upcall->monotonic_ns = perf_timespec_ns(&upcall->start);
+	context = fuse_req_ctx(req);
+	if (!context) {
+		upcall->evidence_errors++;
+	} else {
+		upcall->origin_pid = context->pid;
+		upcall->origin_tid = context->pid;
+		upcall->uid = context->uid;
+		upcall->gid = context->gid;
+		if (context->pid > 0)
+			perf_metadata_capture_proc(upcall, context->pid);
+		else
+			upcall->evidence_errors += 6;
+	}
+	perf_metadata_capture_path(upcall);
+	if (opcode == FUSE_GETATTR) {
+		upcall->getattr_fi_present = fi != NULL;
+		if (fi) {
+			upcall->getattr_fi_flags = fi->flags;
+			upcall->getattr_fh = (intmax_t)fi->fh;
+		}
+	}
+	if (name) {
+		upcall->name = (const unsigned char *)name;
+		upcall->name_size = strlen(name);
+	}
+}
+
+static void perf_metadata_emit_hex(const unsigned char *data, size_t size)
+{
+	static const char digits[] = "0123456789abcdef";
+	size_t index;
+
+	for (index = 0; index < size; index++) {
+		fputc(digits[data[index] >> 4], stderr);
+		fputc(digits[data[index] & 0xf], stderr);
+	}
+}
+
+static void perf_metadata_upcall_end(struct perf_metadata_upcall *upcall,
+				     intmax_t result, int callback_errno)
+{
+	struct timespec end;
+	int64_t duration_ns = -1;
+	int saved_error = errno;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &end))
+		upcall->evidence_errors++;
+	else if (upcall->monotonic_ns >= 0)
+		duration_ns = perf_timespec_ns(&end) - upcall->monotonic_ns;
+
+	flockfile(stderr);
+	fprintf(stderr,
+		"FIG9_METADATA_UPCALL_V1\tmonotonic_ns=%" PRId64
+		"\tduration_ns=%" PRId64 "\tunique=%" PRIu64
+		"\topcode=%u\tnodeid=%" PRIu64
+		"\torigin_pid=%" PRIdMAX "\torigin_tgid=%" PRIdMAX
+		"\torigin_tid=%" PRIdMAX "\tuid=%" PRIdMAX
+		"\tgid=%" PRIdMAX "\tlower_fd=%d\tlower_dev=",
+		upcall->monotonic_ns, duration_ns, upcall->unique,
+		upcall->opcode, upcall->nodeid, upcall->origin_pid,
+		upcall->origin_tgid, upcall->origin_tid, upcall->uid,
+		upcall->gid, upcall->lower_fd);
+	if (upcall->lower_stat_available)
+		fprintf(stderr, "%" PRIuMAX, upcall->lower_dev);
+	else
+		fputs("-1", stderr);
+	fputs("\tlower_ino=", stderr);
+	if (upcall->lower_stat_available)
+		fprintf(stderr, "%" PRIuMAX, upcall->lower_ino);
+	else
+		fputs("-1", stderr);
+	fprintf(stderr,
+		"\tresult=%" PRIdMAX "\terrno=%d\tevidence_errors=%d\tcomm_hex=",
+		result, callback_errno, upcall->evidence_errors);
+	perf_metadata_emit_hex(upcall->comm.data, upcall->comm.size);
+	fputs("\tcmdline_hex=", stderr);
+	perf_metadata_emit_hex(upcall->cmdline.data, upcall->cmdline.size);
+	fputs("\texe_hex=", stderr);
+	perf_metadata_emit_hex(upcall->exe.data, upcall->exe.size);
+	fputs("\tcwd_hex=", stderr);
+	perf_metadata_emit_hex(upcall->cwd.data, upcall->cwd.size);
+	fputs("\tlower_path_hex=", stderr);
+	perf_metadata_emit_hex(upcall->lower_path.data, upcall->lower_path.size);
+	fputs("\tkernel_stack_hex=", stderr);
+	perf_metadata_emit_hex(upcall->kernel_stack.data,
+			       upcall->kernel_stack.size);
+	fprintf(stderr,
+		"\tpath_state=%s\tgetattr_fi_present=%" PRIdMAX
+		"\tgetattr_fi_flags=%" PRIdMAX "\tgetattr_fh=%" PRIdMAX
+		"\tname_hex=",
+		upcall->path_state, upcall->getattr_fi_present,
+		upcall->getattr_fi_flags, upcall->getattr_fh);
+	perf_metadata_emit_hex(upcall->name, upcall->name_size);
+	fprintf(stderr, "\tsize=%" PRIdMAX "\tmode=%s\ttransport=%s\n",
+		upcall->size, perf_state.mode_name, perf_state.transport);
+	funlockfile(stderr);
+
+	perf_metadata_bytes_reset(&upcall->comm);
+	perf_metadata_bytes_reset(&upcall->cmdline);
+	perf_metadata_bytes_reset(&upcall->exe);
+	perf_metadata_bytes_reset(&upcall->cwd);
+	perf_metadata_bytes_reset(&upcall->lower_path);
+	perf_metadata_bytes_reset(&upcall->kernel_stack);
+	errno = saved_error;
+}
 
 _Static_assert((PERF_XATTR_LOCK_BUCKETS &
 		(PERF_XATTR_LOCK_BUCKETS - 1)) == 0,
@@ -2430,26 +2852,38 @@ void perf_getattr(fuse_req_t req, fuse_ino_t ino,
 {
 	struct lo_data *lo;
 	struct stat st;
+	struct perf_metadata_upcall upcall;
 	double reply_timeout;
 	struct perf_cache_snapshot snapshot;
+	int result;
+	int saved_error;
 	int fd;
 
+	fd = fi ? (int)fi->fh : lo_fd(req, ino);
+	if (perf_state.trace_metadata_upcalls)
+		perf_metadata_upcall_begin(&upcall, req, ino, FUSE_GETATTR, fd,
+					   fi, NULL, -1);
 	callback_increment(&perf_state.counters.getattr);
 	if (!metadata_hits_enabled()) {
 		lo_getattr(req, ino, fi);
 		return;
 	}
 	lo = lo_data(req);
-	fd = fi ? (int)fi->fh : lo_fd(req, ino);
 	cache_snapshot_begin(ino, &snapshot);
-	if (fstatat(fd, "", &st, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW)) {
-		fuse_reply_err(req, errno);
+	result = fstatat(fd, "", &st, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+	if (result < 0) {
+		saved_error = errno;
+		if (perf_state.trace_metadata_upcalls)
+			perf_metadata_upcall_end(&upcall, result, saved_error);
+		fuse_reply_err(req, saved_error);
 		return;
 	}
 	cache_attr(ino, &st, lo->timeout, &snapshot, false,
 		   &reply_timeout);
 	/* Root and getattr-only inodes also need the paper's proactive xattr fill. */
 	prefetch_capability(req, ino);
+	if (perf_state.trace_metadata_upcalls)
+		perf_metadata_upcall_end(&upcall, result, 0);
 	fuse_reply_attr(req, &st, reply_timeout);
 }
 
@@ -2522,12 +2956,17 @@ void perf_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 {
 	uint8_t cache_value[PERF_XATTR_VALUE_MAX];
 	char *value = NULL;
+	struct perf_metadata_upcall upcall;
 	pthread_mutex_t *xattr_lock;
 	struct perf_cache_snapshot snapshot;
 	ssize_t result;
 	ssize_t cached_result;
 	int saved_error;
 
+	if (perf_state.trace_metadata_upcalls)
+		perf_metadata_upcall_begin(&upcall, req, ino, FUSE_GETXATTR,
+					   lo_fd(req, ino),
+					   NULL, name, (intmax_t)size);
 	callback_increment(&perf_state.counters.getxattr);
 	if (!metadata_hits_enabled()) {
 		lo_getxattr(req, ino, name, size);
@@ -2537,6 +2976,8 @@ void perf_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 	if (size) {
 		value = malloc(size);
 		if (!value) {
+			if (perf_state.trace_metadata_upcalls)
+				perf_metadata_upcall_end(&upcall, -1, ENOMEM);
 			fuse_reply_err(req, ENOMEM);
 			return;
 		}
@@ -2558,6 +2999,8 @@ void perf_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 			invalidate_xattr_serialized(ino, name, false);
 		pthread_mutex_unlock(xattr_lock);
 		free(value);
+		if (perf_state.trace_metadata_upcalls)
+			perf_metadata_upcall_end(&upcall, result, saved_error);
 		fuse_reply_err(req, saved_error);
 		return;
 	}
@@ -2570,6 +3013,8 @@ void perf_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 		else
 			invalidate_xattr_serialized(ino, name, false);
 		pthread_mutex_unlock(xattr_lock);
+		if (perf_state.trace_metadata_upcalls)
+			perf_metadata_upcall_end(&upcall, result, 0);
 		if (result)
 			fuse_reply_buf(req, value, (size_t)result);
 		else
@@ -2591,6 +3036,8 @@ void perf_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 		invalidate_xattr_serialized(ino, name, false);
 	}
 	pthread_mutex_unlock(xattr_lock);
+	if (perf_state.trace_metadata_upcalls)
+		perf_metadata_upcall_end(&upcall, result, 0);
 	fuse_reply_xattr(req, (size_t)result);
 }
 
@@ -4175,6 +4622,25 @@ static int parse_profile(const char *name, enum perf_profile *profile)
 	return 0;
 }
 
+static int parse_metadata_upcall_tracing(bool *enabled)
+{
+	const char *text = getenv("EXTFUSE_TRACE_METADATA_UPCALLS");
+
+	if (!text) {
+		*enabled = false;
+		return 0;
+	}
+	if (!strcmp(text, "0")) {
+		*enabled = false;
+		return 0;
+	}
+	if (!strcmp(text, "1")) {
+		*enabled = true;
+		return 0;
+	}
+	return -1;
+}
+
 static int parse_uring_q_depth(unsigned int *q_depth)
 {
 	const char *text = getenv("EXTFUSE_URING_Q_DEPTH");
@@ -4236,6 +4702,19 @@ int main(int argc, char **argv)
 	}
 	perf_state.mode_name = argv[1];
 	perf_state.transport = argv[2];
+	if (parse_metadata_upcall_tracing(
+		    &perf_state.trace_metadata_upcalls)) {
+		fprintf(stderr,
+			"EXTFUSE_TRACE_METADATA_UPCALLS must be 0 or 1\n");
+		return 2;
+	}
+	if (perf_state.trace_metadata_upcalls &&
+	    perf_state.mode != PERF_MODE_HIT &&
+	    perf_state.mode != PERF_MODE_ALLOPT) {
+		fprintf(stderr,
+			"EXTFUSE_TRACE_METADATA_UPCALLS requires a metadata-hit mode\n");
+		return 2;
+	}
 	if (parse_uring_q_depth(&uring_q_depth)) {
 		fprintf(stderr,
 			"EXTFUSE_URING_Q_DEPTH must be an integer in [1,4096]\n");

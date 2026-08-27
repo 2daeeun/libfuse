@@ -1653,6 +1653,107 @@ out:
 	return result;
 }
 
+/* The caller holds xattr_lock_for_inode(nodeid). */
+static bool negative_capability_cache_current_serialized(fuse_ino_t nodeid,
+							 uint64_t *daemon_state)
+{
+	struct xattr_key key;
+	struct xattr_value value;
+	bool current = false;
+
+	*daemon_state = 0;
+	if (!metadata_hits_enabled() ||
+	    fill_xattr_key(&key, nodeid, PERF_CAPABILITY_XATTR))
+		return false;
+
+	pthread_mutex_lock(&perf_state.backing_mutex);
+	if (perf_state.xattr_cache_bypass ||
+	    (native_passthrough_enabled() &&
+	     has_passthrough_mmap_marker_locked(nodeid)))
+		goto out;
+	if (ebpf_data_lookup(perf_state.bpf, &key, &value, EXTFUSE_XATTR_MAP)) {
+		if (errno == ENOENT)
+			goto out;
+		counter_increment(&perf_state.counters.cache_update_errors);
+		fprintf(stderr,
+			"CACHE_ERROR map=xattr operation=negative-lookup nodeid=%" PRIu64
+			" errno=%d error=%s\n",
+			(uint64_t)nodeid, errno, strerror(errno));
+		disable_xattr_cache_locked("negative-capability-lookup");
+		goto out;
+	}
+	current = value.error == ENODATA && !value.size &&
+		  inode_generation_stable_locked(nodeid, value.daemon_state);
+	if (current)
+		*daemon_state = value.daemon_state;
+out:
+	pthread_mutex_unlock(&perf_state.backing_mutex);
+	return current;
+}
+
+/*
+ * The caller still holds xattr_lock_for_inode(nodeid) after a successful data
+ * write.  A data write can remove security.capability, but cannot create one,
+ * so a previously current ENODATA result remains true.  Refresh only that
+ * existing row: an eviction or any coherence race must remain a normal miss.
+ */
+static void
+refresh_negative_capability_serialized(fuse_ino_t nodeid,
+				       uint64_t previous_daemon_state)
+{
+	struct perf_inode_generation *state;
+	struct xattr_key key;
+	struct xattr_value current;
+	struct xattr_value replacement = {
+		.error = ENODATA,
+	};
+
+	if (!metadata_hits_enabled() ||
+	    fill_xattr_key(&key, nodeid, PERF_CAPABILITY_XATTR))
+		return;
+
+	pthread_mutex_lock(&perf_state.backing_mutex);
+	if (perf_state.xattr_cache_bypass ||
+	    (native_passthrough_enabled() &&
+	     has_passthrough_mmap_marker_locked(nodeid)))
+		goto out;
+	state = find_inode_generation_locked(nodeid);
+	if (!inode_generation_value_locked(state, &replacement.daemon_state)) {
+		counter_increment(
+			&perf_state.counters.passthrough_state_errors);
+		disable_all_caches_locked("negative-capability-state");
+		goto out;
+	}
+	if (replacement.daemon_state & EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
+		goto out;
+	if (ebpf_data_lookup(perf_state.bpf, &key, &current,
+			     EXTFUSE_XATTR_MAP)) {
+		if (errno == ENOENT)
+			goto out;
+		goto error;
+	}
+	if (current.error != ENODATA || current.size ||
+	    current.daemon_state != previous_daemon_state)
+		goto out;
+	replacement.native_state = current.native_state;
+	if (!ebpf_data_replace(perf_state.bpf, &key, &replacement,
+			       EXTFUSE_XATTR_MAP)) {
+		counter_increment(&perf_state.counters.cache_xattr_updates);
+		goto out;
+	}
+	if (errno == ENOENT)
+		goto out;
+error:
+	counter_increment(&perf_state.counters.cache_update_errors);
+	fprintf(stderr,
+		"CACHE_ERROR map=xattr operation=negative-refresh nodeid=%" PRIu64
+		" errno=%d error=%s\n",
+		(uint64_t)nodeid, errno, strerror(errno));
+	disable_xattr_cache_locked("negative-capability-refresh");
+out:
+	pthread_mutex_unlock(&perf_state.backing_mutex);
+}
+
 static int invalidate_xattr_locked(fuse_ino_t nodeid, const char *name,
 				   bool positive_only)
 {
@@ -3526,10 +3627,14 @@ static void perf_copy_file_range(fuse_req_t req, fuse_ino_t ino_in,
 	}
 	cache_mutation_end(&mutation);
 	pthread_mutex_unlock(xattr_lock);
-	if (result < 0)
+	if (result < 0) {
 		fuse_reply_err(req, saved_error);
-	else
+	} else {
+		cache_inode_attr_snapshot(req, ino_in, NULL);
+		if (ino_out != ino_in)
+			cache_inode_attr_snapshot(req, ino_out, NULL);
 		fuse_reply_write(req, (size_t)result);
+	}
 }
 #endif
 
@@ -3845,6 +3950,8 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 	struct stat st;
 	double ignored_reply_timeout;
 	struct perf_cache_snapshot snapshot;
+	bool carry_negative_capability;
+	uint64_t negative_capability_daemon_state;
 	ssize_t result;
 	int inode_fd;
 
@@ -3858,6 +3965,9 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 	inode_fd = inode->fd;
 	xattr_lock = xattr_lock_for_inode(ino);
 	pthread_mutex_lock(xattr_lock);
+	carry_negative_capability =
+		negative_capability_cache_current_serialized(
+			ino, &negative_capability_daemon_state);
 	cache_mutation_add(&mutation, ino);
 	if (!cache_mutation_begin(&mutation)) {
 		cache_mutation_end(&mutation);
@@ -3866,9 +3976,13 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 		return;
 	}
 	invalidate_attr(ino);
-	invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
+	if (!carry_negative_capability)
+		invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
 	result = lo_do_write_buf(req, ino, buffer, offset, fi);
 	cache_mutation_end(&mutation);
+	if (result >= 0 && carry_negative_capability)
+		refresh_negative_capability_serialized(
+			ino, negative_capability_daemon_state);
 	pthread_mutex_unlock(xattr_lock);
 
 	if (result >= 0) {

@@ -12,6 +12,7 @@
 
 #include "fuse_i.h"
 #include "fuse_kernel.h"
+#include "fuse_uring_affinity.h"
 #include "fuse_uring_i.h"
 
 #include <stdlib.h>
@@ -25,7 +26,6 @@
 #include <numa.h>
 #include <pthread.h>
 #include <stdio.h>
-#include <linux/sched.h>
 #include <poll.h>
 #include <sys/eventfd.h>
 
@@ -742,36 +742,66 @@ static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
 	return ret;
 }
 
-/**
- * In per-core-queue configuration we have thread per core - the thread
- * to that core
+/*
+ * The kernel selects a queue from task_cpu(current). Binding that queue's
+ * userspace thread to the same CPU makes synchronous request issuers and their
+ * handlers time-share one CPU. Keep the queue on the same NUMA node when
+ * possible, but use a different CPU allowed by the daemon's affinity mask.
  */
-static void fuse_uring_set_thread_core(int qid)
+static void fuse_uring_set_thread_cpu(struct fuse_ring_queue *queue)
 {
-	cpu_set_t mask;
+	struct bitmask *allowed_cpus;
+	struct bitmask *local_cpus;
+	int target_cpu;
 	int rc;
 
-	CPU_ZERO(&mask);
-	CPU_SET(qid, &mask);
-	rc = sched_setaffinity(0, sizeof(cpu_set_t), &mask);
-	if (rc != 0)
-		fuse_log(FUSE_LOG_ERR, "Failed to bind qid=%d to its core: %s\n",
-			 qid, strerror(errno));
-
-	if (0) {
-		const int policy = SCHED_IDLE;
-		const struct sched_param param = {
-			.sched_priority = sched_get_priority_min(policy),
-		};
-
-		/* Set the lowest possible priority, so that the application
-		 * submitting requests is not moved away from the current core.
-		 */
-		rc = sched_setscheduler(0, policy, &param);
-		if (rc != 0)
-			fuse_log(FUSE_LOG_ERR, "Failed to set scheduler: %s\n",
-				strerror(errno));
+	allowed_cpus = numa_allocate_cpumask();
+	local_cpus = numa_allocate_cpumask();
+	if (allowed_cpus == NULL || local_cpus == NULL) {
+		fuse_log(FUSE_LOG_ERR,
+			 "Failed to allocate affinity masks for qid=%d\n",
+			 queue->qid);
+		goto out;
 	}
+
+	rc = numa_sched_getaffinity(0, allowed_cpus);
+	if (rc != 0) {
+		fuse_log(FUSE_LOG_ERR,
+			 "Failed to read affinity for qid=%d: %s\n", queue->qid,
+			 strerror(errno));
+		goto out;
+	}
+
+	numa_bitmask_clearall(local_cpus);
+	if (queue->numa_node >= 0 &&
+	    numa_node_to_cpus(queue->numa_node, local_cpus) != 0)
+		numa_bitmask_clearall(local_cpus);
+
+	target_cpu = fuse_uring_select_thread_cpu(queue->qid, allowed_cpus,
+						  local_cpus);
+	if (target_cpu < 0) {
+		fuse_log(FUSE_LOG_ERR, "No allowed CPU for qid=%d\n",
+			 queue->qid);
+		goto out;
+	}
+
+	numa_bitmask_clearall(local_cpus);
+	numa_bitmask_setbit(local_cpus, target_cpu);
+	rc = numa_sched_setaffinity(0, local_cpus);
+	if (rc != 0) {
+		fuse_log(FUSE_LOG_ERR, "Failed to bind qid=%d to CPU=%d: %s\n",
+			 queue->qid, target_cpu, strerror(errno));
+		goto out;
+	}
+
+	fuse_log(FUSE_LOG_DEBUG, "Bound qid=%d ring thread to CPU=%d\n",
+		 queue->qid, target_cpu);
+
+out:
+	if (local_cpus != NULL)
+		numa_free_cpumask(local_cpus);
+	if (allowed_cpus != NULL)
+		numa_free_cpumask(allowed_cpus);
 }
 
 /*
@@ -859,7 +889,7 @@ static void *fuse_uring_thread(void *arg)
 	thread_name[15] = '\0';
 	fuse_set_thread_name(thread_name);
 
-	fuse_uring_set_thread_core(queue->qid);
+	fuse_uring_set_thread_cpu(queue);
 
 	err = fuse_uring_init_queue(queue);
 	pthread_mutex_lock(&ring_pool->thread_start_mutex);

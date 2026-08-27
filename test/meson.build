@@ -35,6 +35,16 @@ native_request_counter_test = executable(
 td += native_request_counter_test
 test('native request counter', native_request_counter_test)
 
+if private_cfg.get('HAVE_URING', false)
+    uring_affinity_test = executable(
+        'test_uring_affinity', 'test_uring_affinity.c',
+        include_directories: include_dirs,
+        dependencies: [ libnuma ],
+        install: false)
+    td += uring_affinity_test
+    test('io_uring thread affinity', uring_affinity_test)
+endif
+
 test_scripts = [ 'conftest.py', 'pytest.ini', 'test_examples.py',
                  'util.py', 'test_ctests.py', 'test_custom_io.py',
                  'test_extfuse.py' ]

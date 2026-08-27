@@ -11,8 +11,12 @@ achieved with the libfuse option '-o io_uring'.
 Default queue-depth is 8 and can be changed with the parameter
 '-oio_uring_q_depth'.
 
-As of now there is always one queue per core. A reduced number
-of cores in development.
+As of now there is always one queue per logical CPU. A reduced number
+of queues is in development. Each ring thread prefers the next CPU allowed by
+the daemon's affinity mask on the same NUMA node. The kernel selects a queue
+from the request issuer's CPU, so running the corresponding ring thread on a
+different CPU lets synchronous issuers and handlers make progress in parallel.
+If the daemon is allowed to use only one CPU, the ring thread stays there.
 
 Benefits:
 - Improved performance by using io_uring for kernel/userspace communication

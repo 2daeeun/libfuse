@@ -14,6 +14,7 @@
 #include "fuse_kernel.h"
 #include "fuse_uring_affinity.h"
 #include "fuse_uring_i.h"
+#include "fuse_uring_reply.h"
 
 #include <stdlib.h>
 #include <liburing.h>
@@ -243,6 +244,7 @@ int fuse_req_get_payload(fuse_req_t req, char **payload, size_t *payload_sz,
 
 int send_reply_uring(fuse_req_t req, int error, const void *arg, size_t argsize)
 {
+	int validation_error;
 	int res;
 	struct fuse_ring_ent *ring_ent =
 		container_of(req, struct fuse_ring_ent, req);
@@ -255,18 +257,23 @@ int send_reply_uring(fuse_req_t req, int error, const void *arg, size_t argsize)
 	struct fuse_ring_pool *ring_pool = queue->ring_pool;
 	size_t max_payload_sz = ring_pool->max_req_payload_sz;
 
-	if (argsize > max_payload_sz) {
-		fuse_log(FUSE_LOG_ERR, "argsize %zu exceeds buffer size %zu",
-			 argsize, max_payload_sz);
+	if (!error && argsize && arg == NULL) {
+		fuse_log(FUSE_LOG_ERR, "non-empty io_uring reply has no payload");
 		error = -EINVAL;
-	} else if (argsize) {
-		if (arg != ring_ent->op_payload)
-			memcpy(ring_ent->op_payload, arg, argsize);
+		argsize = 0;
 	}
-	ent_in_out->payload_sz = argsize;
 
-	out->error  = error;
-	out->unique = req->unique;
+	validation_error = fuse_uring_prepare_reply(
+		out, ent_in_out, req->unique, error, argsize, max_payload_sz);
+	if (validation_error) {
+		fuse_log(FUSE_LOG_ERR,
+			 "io_uring reply payload %zu exceeds limit %zu: %s",
+			 argsize, max_payload_sz, strerror(-validation_error));
+	} else if (!out->error && ent_in_out->payload_sz) {
+		if (arg != ring_ent->op_payload)
+			memcpy(ring_ent->op_payload, arg,
+			       ent_in_out->payload_sz);
+	}
 
 	res = fuse_uring_commit_sqe(ring_pool, queue, ring_ent);
 
@@ -296,10 +303,13 @@ int fuse_reply_data_uring(fuse_req_t req, struct fuse_bufvec *bufv,
 
 	res = fuse_buf_copy(&dest_vec, bufv, flags);
 
-	out->error  = res < 0 ? res : 0;
-	out->unique = req->unique;
-
-	ent_in_out->payload_sz = res > 0 ? res : 0;
+	if (fuse_uring_prepare_reply(out, ent_in_out, req->unique,
+				     res < 0 ? res : 0,
+				     res > 0 ? (size_t)res : 0,
+				     max_payload_sz))
+		fuse_log(FUSE_LOG_ERR,
+			 "copied io_uring reply exceeds buffer size %zu",
+			 max_payload_sz);
 
 	res = fuse_uring_commit_sqe(ring_pool, queue, ring_ent);
 
@@ -322,31 +332,51 @@ int fuse_send_msg_uring(fuse_req_t req, struct iovec *iov, int count)
 	struct fuse_out_header *out = (struct fuse_out_header *)&rrh->in_out;
 	struct fuse_uring_ent_in_out *ent_in_out =
 		(struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
+	const struct fuse_out_header *source_out;
 	size_t max_buf = ring_pool->max_req_payload_sz;
 	size_t len = 0;
-	int res = 0;
+	int error;
+	int res;
 
-	/* copy iov into the payload, idx=0 is the header section */
-	for (int idx = 1; idx < count; idx++) {
-		struct iovec *cur = &iov[idx];
-
-		if (len + cur->iov_len > max_buf) {
-			fuse_log(FUSE_LOG_ERR,
-				 "iov[%d] exceeds buffer size %zu",
-				 idx, max_buf);
-			res = -EINVAL; /* Gracefully handle this? */
-			break;
-		}
-
-		memcpy(ring_ent->op_payload + len, cur->iov_base, cur->iov_len);
-		len += cur->iov_len;
+	res = fuse_uring_iov_payload_size(iov, count, max_buf, &len);
+	if (res) {
+		fuse_log(FUSE_LOG_ERR, "invalid io_uring reply iovec: %s",
+			 strerror(-res));
+		error = -EINVAL;
+		len = 0;
+		goto prepare;
 	}
 
-	ent_in_out->payload_sz = len;
+	source_out = iov[0].iov_base;
+	error = source_out->error;
+	if (source_out->unique != req->unique ||
+	    source_out->len != sizeof(*source_out) + len) {
+		fuse_log(FUSE_LOG_ERR,
+			 "invalid io_uring reply header for unique %" PRIu64,
+			 req->unique);
+		error = -EINVAL;
+		len = 0;
+	}
 
-	out->error  = res;
-	out->unique = req->unique;
-	out->len = len;
+prepare:
+	res = fuse_uring_prepare_reply(out, ent_in_out, req->unique, error,
+				       len, max_buf);
+	if (res) {
+		fuse_log(FUSE_LOG_ERR, "invalid io_uring reply payload: %s",
+			 strerror(-res));
+		len = 0;
+	}
+
+	if (!out->error) {
+		len = 0;
+		for (int idx = 1; idx < count; idx++) {
+			const struct iovec *cur = &iov[idx];
+
+			memcpy(ring_ent->op_payload + len, cur->iov_base,
+			       cur->iov_len);
+			len += cur->iov_len;
+		}
+	}
 
 	return fuse_uring_commit_sqe(ring_pool, queue, ring_ent);
 }
@@ -765,7 +795,7 @@ static void fuse_uring_set_thread_cpu(struct fuse_ring_queue *queue)
 	}
 
 	rc = numa_sched_getaffinity(0, allowed_cpus);
-	if (rc != 0) {
+	if (fuse_uring_affinity_query_failed(rc)) {
 		fuse_log(FUSE_LOG_ERR,
 			 "Failed to read affinity for qid=%d: %s\n", queue->qid,
 			 strerror(errno));

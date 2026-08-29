@@ -32,6 +32,9 @@ int main(void)
 
 	assert(allowed_cpus != NULL);
 	assert(local_cpus != NULL);
+	assert(fuse_uring_affinity_query_failed(-1));
+	assert(!fuse_uring_affinity_query_failed(0));
+	assert(!fuse_uring_affinity_query_failed(16));
 
 	set_mask(allowed_cpus, cpu0123, 4);
 	set_mask(local_cpus, cpu01, 2);

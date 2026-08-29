@@ -11,6 +11,12 @@
 
 #include <limits.h>
 #include <numa.h>
+#include <stdbool.h>
+
+static inline bool fuse_uring_affinity_query_failed(int result)
+{
+	return result < 0;
+}
 
 static inline int
 fuse_uring_select_thread_cpu(unsigned int qid,

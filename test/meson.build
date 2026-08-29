@@ -42,6 +42,12 @@ td += native_request_counter_test
 test('native request counter', native_request_counter_test)
 
 if private_cfg.get('HAVE_URING', false)
+    uring_reply_test = executable(
+        'test_uring_reply', 'test_uring_reply.c',
+        include_directories: include_dirs,
+        install: false)
+    td += uring_reply_test
+    test('io_uring reply header', uring_reply_test)
     uring_affinity_test = executable(
         'test_uring_affinity', 'test_uring_affinity.c',
         include_directories: include_dirs,

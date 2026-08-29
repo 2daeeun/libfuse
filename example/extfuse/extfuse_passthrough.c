@@ -33,6 +33,7 @@ int upstream_passthrough_main(int argc, char *argv[]);
 #include <extfuse_coherence.h>
 #include <fuse_i.h>
 #include <fuse_kernel.h>
+#include <extfuse_v3_cache.h>
 #include <linux/bpf.h>
 #include <linux/xattr.h>
 #include <stdatomic.h>
@@ -141,6 +142,12 @@ struct xattr_value {
 #define PERF_XATTR_LOCK_BUCKETS 4096U
 #define PERF_CAPABILITY_XATTR "security.capability"
 #define PERF_ATTR_RELEASE_BARRIER_INIT_FMT "%s=%u %s=%u %s=%u "
+#define PERF_COHERENCE_V3_INIT_FMT \
+	"coherence_v3_capable=%u coherence_v3_requested=%u "
+#define PERF_MUTATION_METADATA_INIT_FMT \
+	"mutation_metadata_capable=%u mutation_metadata_requested=%u "
+#define PERF_NOTIFY_INVAL_XATTR_INIT_FMT \
+	"notify_inval_xattr_capable=%u notify_inval_xattr_requested=%u "
 #define PERF_POSIX_ACL_ACCESS_XATTR "system.posix_acl_access"
 
 enum perf_backing_mode {
@@ -215,6 +222,34 @@ _Static_assert(offsetof(struct attr_value, out) == 24,
 	       "attr value alignment");
 _Static_assert(sizeof(struct xattr_key) == 264, "xattr key ABI");
 _Static_assert(sizeof(struct xattr_value) == 280, "xattr value ABI");
+_Static_assert(sizeof(struct extfuse_v3_entry_key) == 280,
+	       "V3 entry key ABI");
+_Static_assert(offsetof(struct extfuse_v3_entry_key, name) == 20,
+	       "V3 entry credential key alignment");
+_Static_assert(sizeof(struct extfuse_v3_entry_value) == 152,
+	       "V3 entry value ABI");
+_Static_assert(offsetof(struct extfuse_v3_entry_value, out) == 24,
+	       "V3 entry value alignment");
+_Static_assert(sizeof(struct extfuse_v3_attr_value) == 120,
+	       "V3 attr value ABI");
+_Static_assert(offsetof(struct extfuse_v3_attr_value, out) == 16,
+	       "V3 attr value alignment");
+_Static_assert(sizeof(struct extfuse_v3_xattr_key) == 280,
+	       "V3 xattr key ABI");
+_Static_assert(offsetof(struct extfuse_v3_xattr_key, name) == 20,
+	       "V3 credential key alignment");
+_Static_assert(sizeof(struct extfuse_v3_xattr_value) == 296,
+	       "V3 xattr value ABI");
+_Static_assert(offsetof(struct extfuse_v3_xattr_value, data) == 40,
+	       "V3 xattr value alignment");
+_Static_assert(sizeof(struct extfuse_v3_mutation_payload) == 488,
+	       "V3 mutation payload ABI");
+_Static_assert(offsetof(struct extfuse_v3_mutation_payload, nodes) == 8,
+	       "V3 mutation payload alignment");
+_Static_assert(sizeof(struct extfuse_v3_scratch) == 768,
+	       "V3 scratch ABI");
+_Static_assert(offsetof(struct extfuse_v3_scratch, key) == 488,
+	       "V3 scratch partition alignment");
 
 struct perf_counters {
 	atomic_uint_fast64_t lookup;
@@ -295,6 +330,12 @@ struct perf_state {
 	int init_rc;
 	bool capable;
 	bool requested;
+	bool coherence_v3_capable;
+	bool coherence_v3_requested;
+	bool mutation_metadata_capable;
+	bool mutation_metadata_requested;
+	bool notify_inval_xattr_capable;
+	bool notify_inval_xattr_requested;
 	bool single_issuer;
 	bool passthrough_capable;
 	bool passthrough_requested;
@@ -757,6 +798,23 @@ static bool metadata_hits_enabled(void)
 	       perf_state.mode == PERF_MODE_ALLOPT;
 }
 
+static bool coherence_v3_enabled(void)
+{
+	return perf_state.requested && perf_state.coherence_v3_requested;
+}
+
+static bool mutation_metadata_enabled(void)
+{
+	return coherence_v3_enabled() &&
+	       perf_state.mutation_metadata_requested;
+}
+
+static bool notify_inval_xattr_enabled(void)
+{
+	return coherence_v3_enabled() &&
+	       perf_state.notify_inval_xattr_requested;
+}
+
 static bool native_passthrough_enabled(void)
 {
 	return perf_state.mode == PERF_MODE_ALLOPT;
@@ -764,7 +822,8 @@ static bool native_passthrough_enabled(void)
 
 static bool attr_release_barrier_enabled(void)
 {
-	return perf_state.passthrough_coherence_v2_requested &&
+	return !coherence_v3_enabled() &&
+	       perf_state.passthrough_coherence_v2_requested &&
 	       perf_state.passthrough_attr_release_barrier_requested &&
 	       (perf_state.bpf_policy_flags &
 		EXTFUSE_POLICY_ATTR_RELEASE_BARRIER);
@@ -934,13 +993,29 @@ static bool has_passthrough_mmap_marker_locked(fuse_ino_t ino)
 	return true;
 }
 
+static double v3_attr_timeout(fuse_ino_t ino, double timeout)
+{
+	bool marked;
+
+	pthread_mutex_lock(&perf_state.backing_mutex);
+	marked = has_passthrough_mmap_marker_locked(ino);
+	pthread_mutex_unlock(&perf_state.backing_mutex);
+	if (marked) {
+		counter_increment(
+			&perf_state.counters.passthrough_mmap_suppressions);
+		return 0;
+	}
+	return timeout;
+}
+
 static bool attr_cache_suppressed_locked(fuse_ino_t ino,
 					 bool *mmap_suppressed)
 {
 	struct perf_backing *backing = find_backing_locked(ino, NULL);
 
 	*mmap_suppressed = false;
-	if (perf_state.passthrough_coherence_v2_requested) {
+	if (coherence_v3_enabled() ||
+	    perf_state.passthrough_coherence_v2_requested) {
 		*mmap_suppressed = has_passthrough_mmap_marker_locked(ino);
 		return *mmap_suppressed;
 	}
@@ -1025,6 +1100,8 @@ static bool publish_inode_generation_locked(
 	uint64_t key = ino;
 	uint64_t value;
 
+	if (coherence_v3_enabled())
+		return true;
 	if (!inode_generation_value_locked(state, &value)) {
 		errno = EOVERFLOW;
 		goto error;
@@ -1076,7 +1153,7 @@ static bool cache_snapshot_begin(fuse_ino_t ino,
 	bool result;
 
 	memset(snapshot, 0, sizeof(*snapshot));
-	if (!metadata_hits_enabled())
+	if (!metadata_hits_enabled() || coherence_v3_enabled())
 		return true;
 	pthread_mutex_lock(&perf_state.backing_mutex);
 	state = find_inode_generation_locked(ino);
@@ -1125,7 +1202,7 @@ static void advance_inode_generation_locked(fuse_ino_t ino,
 {
 	struct perf_inode_generation *state;
 
-	if (!metadata_hits_enabled() ||
+	if (!metadata_hits_enabled() || coherence_v3_enabled() ||
 	    (perf_state.cache_bypass && perf_state.xattr_cache_bypass) || !ino)
 		return;
 	state = get_inode_generation_locked(ino);
@@ -1166,7 +1243,8 @@ static bool cache_mutation_begin(struct perf_cache_mutation *mutation)
 	struct perf_inode_generation *states[PERF_CACHE_MUTATION_MAX_INODES];
 	size_t index;
 
-	if (!metadata_hits_enabled() || !mutation->count)
+	if (!metadata_hits_enabled() || coherence_v3_enabled() ||
+	    !mutation->count)
 		return true;
 	pthread_mutex_lock(&perf_state.backing_mutex);
 	if (perf_state.cache_bypass && perf_state.xattr_cache_bypass)
@@ -1401,7 +1479,7 @@ cache_attr(fuse_ino_t nodeid, const struct stat *st, double timeout,
 	enum perf_cache_attr_outcome outcome = PERF_CACHE_ATTR_DISABLED;
 
 	*reply_timeout = timeout;
-	if (!metadata_hits_enabled())
+	if (!metadata_hits_enabled() || coherence_v3_enabled())
 		return outcome;
 	pthread_mutex_lock(&perf_state.backing_mutex);
 	if (perf_state.cache_bypass) {
@@ -1464,7 +1542,7 @@ static int cache_entry(fuse_ino_t parent, const char *name,
 	bool stable;
 	int result = 0;
 
-	if (!metadata_hits_enabled())
+	if (!metadata_hits_enabled() || coherence_v3_enabled())
 		return 0;
 	if (strlen(name) >= sizeof(key.name)) {
 		errno = ENAMETOOLONG;
@@ -1556,7 +1634,7 @@ static int cache_negative_entry(fuse_ino_t parent, const char *name,
 	};
 	int result = 0;
 
-	if (!metadata_hits_enabled())
+	if (!metadata_hits_enabled() || coherence_v3_enabled())
 		return 0;
 	if (strlen(name) >= sizeof(key.name)) {
 		errno = ENAMETOOLONG;
@@ -1621,7 +1699,8 @@ static int cache_xattr_reply_serialized(fuse_ino_t nodeid, const char *name,
 	};
 	int result = 0;
 
-	if (!metadata_hits_enabled() || size > PERF_XATTR_VALUE_MAX)
+	if (!metadata_hits_enabled() || coherence_v3_enabled() ||
+	    size > PERF_XATTR_VALUE_MAX)
 		return 0;
 	if ((error != 0 && error != ENODATA) ||
 	    (error == ENODATA && (size || data)) || (size && !data))
@@ -1662,7 +1741,7 @@ static bool negative_capability_cache_current_serialized(fuse_ino_t nodeid,
 	bool current = false;
 
 	*daemon_state = 0;
-	if (!metadata_hits_enabled() ||
+	if (!metadata_hits_enabled() || coherence_v3_enabled() ||
 	    fill_xattr_key(&key, nodeid, PERF_CAPABILITY_XATTR))
 		return false;
 
@@ -1708,7 +1787,7 @@ refresh_negative_capability_serialized(fuse_ino_t nodeid,
 		.error = ENODATA,
 	};
 
-	if (!metadata_hits_enabled() ||
+	if (!metadata_hits_enabled() || coherence_v3_enabled() ||
 	    fill_xattr_key(&key, nodeid, PERF_CAPABILITY_XATTR))
 		return;
 
@@ -1760,7 +1839,8 @@ static int invalidate_xattr_locked(fuse_ino_t nodeid, const char *name,
 	struct xattr_key key;
 	struct xattr_value value;
 
-	if (!metadata_hits_enabled() || perf_state.xattr_cache_bypass)
+	if (!metadata_hits_enabled() || coherence_v3_enabled() ||
+	    perf_state.xattr_cache_bypass)
 		return 0;
 	if (fill_xattr_key(&key, nodeid, name))
 		return 0;
@@ -1820,7 +1900,7 @@ static int invalidate_attr_locked(fuse_ino_t nodeid)
 {
 	struct attr_key key = { .nodeid = nodeid };
 
-	if (!metadata_hits_enabled())
+	if (!metadata_hits_enabled() || coherence_v3_enabled())
 		return 0;
 	if (perf_state.cache_bypass && perf_state.xattr_cache_bypass)
 		return 0;
@@ -1867,7 +1947,7 @@ static int invalidate_entry_locked(fuse_ino_t parent, const char *name)
 	int lookup_error;
 	int result = 0;
 
-	if (!metadata_hits_enabled())
+	if (!metadata_hits_enabled() || coherence_v3_enabled())
 		return 0;
 	if (perf_state.cache_bypass)
 		return 0;
@@ -2080,7 +2160,8 @@ static void attach_native_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 	if (backing_id > 0) {
 		backing->backing_id = backing_id;
 		backing->mode = PERF_BACKING_NATIVE;
-		if (perf_state.passthrough_coherence_v2_requested)
+		if (perf_state.passthrough_coherence_v2_requested ||
+		    coherence_v3_enabled())
 			free(tombstone_candidate);
 		else
 			add_tombstone_locked(ino, tombstone_candidate);
@@ -2191,6 +2272,7 @@ static bool release_native_passthrough(fuse_req_t req, fuse_ino_t ino)
 		 * perf_release()가 lower fd의 최종 snapshot을 다시 캐시한다.
 		 */
 		if (!perf_state.passthrough_coherence_v2_requested &&
+		    !coherence_v3_enabled() &&
 		    invalidate_attr_locked(ino)) {
 			backing->mode = PERF_BACKING_QUARANTINED;
 			counter_increment(
@@ -2351,6 +2433,30 @@ static int check_maps(void)
 			       BPF_MAP_TYPE_ARRAY, sizeof(uint32_t),
 			       sizeof(uint32_t), 1, 0, "policy") ||
 		       check_map_layout(
+			       perf_state.bpf->data_fd[EXTFUSE_V3_ENTRY_MAP],
+			       BPF_MAP_TYPE_HASH,
+			       sizeof(struct extfuse_v3_entry_key),
+			       sizeof(struct extfuse_v3_entry_value),
+			       PERF_METADATA_MAX_ENTRIES, BPF_F_NO_PREALLOC,
+			       "entry_v3") ||
+		       check_map_layout(
+			       perf_state.bpf->data_fd[EXTFUSE_V3_ATTR_MAP],
+			       BPF_MAP_TYPE_HASH, sizeof(uint64_t),
+			       sizeof(struct extfuse_v3_attr_value),
+			       PERF_METADATA_MAX_ENTRIES, BPF_F_NO_PREALLOC,
+			       "attr_v3") ||
+		       check_map_layout(
+			       perf_state.bpf->data_fd[EXTFUSE_V3_XATTR_MAP],
+			       BPF_MAP_TYPE_LRU_HASH,
+			       sizeof(struct extfuse_v3_xattr_key),
+			       sizeof(struct extfuse_v3_xattr_value),
+			       PERF_XATTR_MAX_ENTRIES, 0, "xattr_v3") ||
+		       check_map_layout(
+			       perf_state.bpf->data_fd[EXTFUSE_V3_SCRATCH_MAP],
+			       BPF_MAP_TYPE_PERCPU_ARRAY, sizeof(uint32_t),
+			       sizeof(struct extfuse_v3_scratch), 1, 0,
+			       "v3_scratch") ||
+		       check_map_layout(
 		       perf_state.bpf->data_fd[EXTFUSE_HANDLERS_MAP],
 		       BPF_MAP_TYPE_PROG_ARRAY, sizeof(uint32_t),
 		       sizeof(uint32_t), EXTFUSE_HANDLER_SLOTS, 0,
@@ -2364,11 +2470,15 @@ static int configure_bpf_policy(void)
 	uint32_t observed = 0;
 
 	if (perf_state.mode == PERF_MODE_ALLOPT &&
-	    perf_state.profile == PERF_PROFILE_PAPER_LIKE)
-		flags = EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA |
-			EXTFUSE_POLICY_RELAX_NATIVE_MMAP_METADATA;
+	    perf_state.profile == PERF_PROFILE_PAPER_LIKE) {
+		flags = EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA;
+		if (!coherence_v3_enabled())
+			flags |= EXTFUSE_POLICY_RELAX_NATIVE_MMAP_METADATA;
+	}
 	if (perf_state.passthrough_attr_release_barrier_requested)
 		flags |= EXTFUSE_POLICY_ATTR_RELEASE_BARRIER;
+	if (coherence_v3_enabled())
+		flags |= EXTFUSE_POLICY_COHERENCE_V3;
 	if (flags & ~EXTFUSE_POLICY_KNOWN_MASK) {
 		errno = EINVAL;
 		return -1;
@@ -2392,7 +2502,7 @@ static int configure_bpf_policy(void)
 	}
 	perf_state.bpf_policy_flags = flags;
 	fprintf(stderr,
-		"BPF_POLICY flags=0x%08x %s=%s %s=%s %s=%s\n",
+		"BPF_POLICY flags=0x%08x %s=%s %s=%s %s=%s %s=%s\n",
 		flags,
 		"paper_native_read_metadata",
 		(flags & EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA) ?
@@ -2402,6 +2512,9 @@ static int configure_bpf_policy(void)
 			"relaxed" : "strict",
 		"attr_release_barrier",
 		(flags & EXTFUSE_POLICY_ATTR_RELEASE_BARRIER) ?
+			"enabled" : "disabled",
+		"coherence_v3",
+		(flags & EXTFUSE_POLICY_COHERENCE_V3) ?
 			"enabled" : "disabled");
 	return 0;
 }
@@ -2507,7 +2620,7 @@ static void audit_coherence_state(void)
 	uint64_t native_active = 0;
 	uint64_t native_errors = 0;
 
-	if (!metadata_hits_enabled())
+	if (!metadata_hits_enabled() || coherence_v3_enabled())
 		return;
 	audit_packed_state_map(EXTFUSE_DAEMON_IO_MAP, &daemon_records,
 			       &daemon_active, &daemon_errors);
@@ -2719,6 +2832,12 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 	perf_state.passthrough_attr_release_barrier_capable =
 		(conn->capable_ext &
 		 FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER) != 0;
+	perf_state.coherence_v3_capable =
+		(conn->capable_ext & FUSE_CAP_EXTFUSE_COHERENCE_V3) != 0;
+	perf_state.mutation_metadata_capable =
+		(conn->capable_ext & FUSE_CAP_MUTATION_METADATA) != 0;
+	perf_state.notify_inval_xattr_capable =
+		(conn->capable_ext & FUSE_CAP_NOTIFY_INVAL_XATTR) != 0;
 	if (native_passthrough_enabled()) {
 		fuse_unset_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
 		lo->writeback = 0;
@@ -2733,7 +2852,8 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 			 */
 			conn->want_ext |= FUSE_CAP_PASSTHROUGH;
 		}
-		if (perf_state.passthrough_requested &&
+		if (!perf_state.coherence_v3_capable &&
+		    perf_state.passthrough_requested &&
 		    perf_state.passthrough_coherence_capable)
 			perf_state.passthrough_coherence_requested =
 				fuse_set_feature_flag(
@@ -2757,7 +2877,8 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 				fuse_set_feature_flag(
 					conn,
 					FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
-		if (perf_state.require_passthrough_coherence &&
+		if (!perf_state.coherence_v3_capable &&
+		    perf_state.require_passthrough_coherence &&
 		    !perf_state.passthrough_coherence_v2_requested) {
 			if (!perf_state.init_rc)
 				perf_state.init_rc = -EOPNOTSUPP;
@@ -2770,9 +2891,10 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		 * AllOpt relies on the typed 68/69 refresh handshake.  Never mount a
 		 * C3/C4 session with only one side of that negotiated contract.
 		 */
-		if (!perf_state.passthrough_attr_refresh_capable ||
+		if (!perf_state.coherence_v3_capable &&
+		    (!perf_state.passthrough_attr_refresh_capable ||
 		    perf_state.passthrough_attr_refresh_capable !=
-			perf_state.passthrough_attr_refresh_requested) {
+			perf_state.passthrough_attr_refresh_requested)) {
 			if (!perf_state.init_rc)
 				perf_state.init_rc = -EOPNOTSUPP;
 			conn->want_ext |=
@@ -2785,9 +2907,10 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		 * both sides negotiated the release barrier.  Fail closed instead of
 		 * silently running the new userspace policy against an older kernel.
 		 */
-		if (!perf_state.passthrough_attr_release_barrier_capable ||
+		if (!perf_state.coherence_v3_capable &&
+		    (!perf_state.passthrough_attr_release_barrier_capable ||
 		    perf_state.passthrough_attr_release_barrier_capable !=
-			perf_state.passthrough_attr_release_barrier_requested) {
+			perf_state.passthrough_attr_release_barrier_requested)) {
 			if (!perf_state.init_rc)
 				perf_state.init_rc = -EOPNOTSUPP;
 			conn->want_ext |=
@@ -2811,7 +2934,36 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 				perf_state.init_rc = extfuse_rc;
 		}
 	}
-	if (perf_state.passthrough_attr_release_barrier_requested &&
+	if (perf_state.requested && perf_state.coherence_v3_capable) {
+		perf_state.coherence_v3_requested = fuse_set_feature_flag(
+			conn, FUSE_CAP_EXTFUSE_COHERENCE_V3);
+		if (perf_state.coherence_v3_requested &&
+		    perf_state.mutation_metadata_capable)
+			perf_state.mutation_metadata_requested =
+			fuse_set_feature_flag(conn, FUSE_CAP_MUTATION_METADATA);
+		if (perf_state.coherence_v3_requested &&
+		    perf_state.notify_inval_xattr_capable)
+			perf_state.notify_inval_xattr_requested =
+			fuse_set_feature_flag(conn, FUSE_CAP_NOTIFY_INVAL_XATTR);
+	}
+	if (perf_state.requested && perf_state.coherence_v3_capable &&
+	    !perf_state.coherence_v3_requested) {
+		if (!perf_state.init_rc)
+			perf_state.init_rc = -EOPNOTSUPP;
+		conn->want_ext |= FUSE_CAP_EXTFUSE_COHERENCE_V3;
+	}
+	if (coherence_v3_enabled()) {
+		/* Driver-owned V3 state supersedes every legacy generation hook. */
+		fuse_unset_feature_flag(
+			conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH);
+		fuse_unset_feature_flag(
+			conn,
+			FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
+		perf_state.passthrough_attr_refresh_requested = false;
+		perf_state.passthrough_attr_release_barrier_requested = false;
+	}
+	if ((perf_state.passthrough_attr_release_barrier_requested ||
+	     coherence_v3_enabled()) &&
 	    perf_state.requested && configure_bpf_policy()) {
 		if (!perf_state.init_rc)
 			perf_state.init_rc = -EIO;
@@ -2819,6 +2971,9 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 	}
 	fprintf(stderr,
 		"INIT mode=%s transport=%s capable=%u requested=%u "
+		PERF_COHERENCE_V3_INIT_FMT
+		PERF_MUTATION_METADATA_INIT_FMT
+		PERF_NOTIFY_INVAL_XATTR_INIT_FMT
 		"passthrough_capable=%u passthrough_requested=%u "
 		"passthrough_coherence_capable=%u "
 		"passthrough_coherence_requested=%u "
@@ -2838,6 +2993,12 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		" want_ext=0x%016" PRIx64 " max_write=%u\n",
 		perf_state.mode_name, perf_state.transport,
 		perf_state.capable, perf_state.requested,
+		perf_state.coherence_v3_capable,
+		perf_state.coherence_v3_requested,
+		perf_state.mutation_metadata_capable,
+		mutation_metadata_enabled(),
+		perf_state.notify_inval_xattr_capable,
+		notify_inval_xattr_enabled(),
 		perf_state.passthrough_capable,
 		perf_state.passthrough_requested,
 		perf_state.passthrough_coherence_capable,
@@ -2894,6 +3055,29 @@ void perf_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 	int error;
 
 	callback_increment(&perf_state.counters.lookup);
+	if (metadata_hits_enabled() && coherence_v3_enabled()) {
+		error = lo_do_lookup(req, parent, name, &entry);
+		if (error == ENOENT) {
+			struct fuse_entry_param negative = {
+				.entry_timeout = lo->timeout,
+			};
+
+			callback_increment(&perf_state.counters.lookup_enoent);
+			fuse_reply_entry(req, &negative);
+			return;
+		}
+		if (error) {
+			callback_increment(
+				&perf_state.counters.lookup_other_errors);
+			fuse_reply_err(req, error);
+			return;
+		}
+		callback_increment(&perf_state.counters.lookup_positive);
+		entry.attr_timeout = v3_attr_timeout(entry.ino,
+						     entry.attr_timeout);
+		fuse_reply_entry(req, &entry);
+		return;
+	}
 	if (!metadata_hits_enabled()) {
 		error = lo_do_lookup(req, parent, name, &entry);
 	} else {
@@ -2970,6 +3154,22 @@ void perf_getattr(fuse_req_t req, fuse_ino_t ino,
 		return;
 	}
 	lo = lo_data(req);
+	if (coherence_v3_enabled()) {
+		result = fstatat(fd, "", &st,
+				 AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+		if (result < 0) {
+			saved_error = errno;
+			if (perf_state.trace_metadata_upcalls)
+				perf_metadata_upcall_end(&upcall, result,
+						   saved_error);
+			fuse_reply_err(req, saved_error);
+			return;
+		}
+		if (perf_state.trace_metadata_upcalls)
+			perf_metadata_upcall_end(&upcall, result, 0);
+		fuse_reply_attr(req, &st, v3_attr_timeout(ino, lo->timeout));
+		return;
+	}
 	cache_snapshot_begin(ino, &snapshot);
 	result = fstatat(fd, "", &st, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
 	if (result < 0) {
@@ -3041,6 +3241,8 @@ static void prefetch_xattr(fuse_req_t req, fuse_ino_t ino, const char *name)
 {
 	pthread_mutex_t *xattr_lock = xattr_lock_for_inode(ino);
 
+	if (coherence_v3_enabled())
+		return;
 	pthread_mutex_lock(xattr_lock);
 	prefetch_xattr_serialized(req, ino, name);
 	pthread_mutex_unlock(xattr_lock);
@@ -3071,6 +3273,38 @@ void perf_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 	callback_increment(&perf_state.counters.getxattr);
 	if (!metadata_hits_enabled()) {
 		lo_getxattr(req, ino, name, size);
+		return;
+	}
+	if (coherence_v3_enabled()) {
+		if (size) {
+			value = malloc(size);
+			if (!value) {
+				if (perf_state.trace_metadata_upcalls)
+					perf_metadata_upcall_end(
+						&upcall, -1, ENOMEM);
+				fuse_reply_err(req, ENOMEM);
+				return;
+			}
+		}
+		result = lo_do_getxattr(req, ino, name, value, size);
+		if (result < 0) {
+			saved_error = errno;
+			if (perf_state.trace_metadata_upcalls)
+				perf_metadata_upcall_end(&upcall, result,
+						   saved_error);
+			free(value);
+			fuse_reply_err(req, saved_error);
+			return;
+		}
+		if (perf_state.trace_metadata_upcalls)
+			perf_metadata_upcall_end(&upcall, result, 0);
+		if (!size)
+			fuse_reply_xattr(req, (size_t)result);
+		else if (result)
+			fuse_reply_buf(req, value, (size_t)result);
+		else
+			fuse_reply_err(req, 0);
+		free(value);
 		return;
 	}
 
@@ -3230,6 +3464,8 @@ static double cache_inode_attr_snapshot(fuse_req_t req, fuse_ino_t ino,
 		if (reply_attr)
 			*reply_attr = st;
 	}
+	if (coherence_v3_enabled())
+		reply_timeout = v3_attr_timeout(ino, reply_timeout);
 	return reply_timeout;
 }
 
@@ -3319,7 +3555,8 @@ static void perf_tmpfile(fuse_req_t req, fuse_ino_t parent, mode_t mode,
 	if (native_passthrough_enabled())
 		attach_native_passthrough(req, entry.ino, fd, fi, candidate,
 					  tombstone_candidate);
-	cache_inode_attr_before_reply(req, entry.ino, &entry.attr);
+	entry.attr_timeout = cache_inode_attr_before_reply(
+		req, entry.ino, &entry.attr);
 	fuse_reply_create(req, &entry, fi);
 }
 
@@ -3442,6 +3679,9 @@ void perf_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		cache_entry(parent, name, &entry, &snapshot);
 	pthread_rwlock_unlock(&perf_state.namespace_lock);
 	/* CREATE의 정상 lo->timeout을 보존해 C0와 같은 VFS 캐시를 사용한다. */
+	if (coherence_v3_enabled())
+		entry.attr_timeout = v3_attr_timeout(entry.ino,
+						     entry.attr_timeout);
 	fuse_reply_create(req, &entry, fi);
 }
 
@@ -3584,14 +3824,62 @@ static void perf_copy_file_range(fuse_req_t req, fuse_ino_t ino_in,
 				 struct fuse_file_info *fi_out, size_t length,
 				 int flags)
 {
+	struct lo_data *lo;
 	struct perf_cache_mutation mutation = {};
+	struct perf_cache_snapshot snapshot_in;
+	struct perf_cache_snapshot snapshot_out;
+	struct fuse_mutation_attr attrs[2];
+	struct stat attr_in;
+	struct stat attr_out;
 	pthread_mutex_t *xattr_lock;
+	size_t attr_count;
 	ssize_t result;
 	int saved_error;
 
 	if (!metadata_hits_enabled()) {
 		lo_copy_file_range(req, ino_in, offset_in, fi_in, ino_out,
 				   offset_out, fi_out, length, flags);
+		return;
+	}
+	lo = lo_data(req);
+	if (coherence_v3_enabled()) {
+		result = copy_file_range(fi_in->fh, &offset_in, fi_out->fh,
+					 &offset_out, length, flags);
+		if (result < 0) {
+			fuse_reply_err(req, errno);
+			return;
+		}
+		if (!snapshot_inode_attr(
+			    req, ino_in, &attr_in, &snapshot_in)) {
+			fuse_reply_write(req, (size_t)result);
+			return;
+		}
+		attrs[0] = (struct fuse_mutation_attr) {
+			.ino = ino_in,
+			.attr = &attr_in,
+			.attr_timeout = v3_attr_timeout(ino_in, lo->timeout),
+			.flags = FUSE_MUTATION_NODE_ATTR_VALID,
+		};
+		attr_count = 1;
+		if (ino_out != ino_in) {
+			if (!snapshot_inode_attr(
+				    req, ino_out, &attr_out, &snapshot_out)) {
+				fuse_reply_write(req, (size_t)result);
+				return;
+			}
+			attrs[1] = (struct fuse_mutation_attr) {
+				.ino = ino_out,
+				.attr = &attr_out,
+				.attr_timeout = v3_attr_timeout(ino_out, lo->timeout),
+				.flags = FUSE_MUTATION_NODE_ATTR_VALID,
+			};
+			attr_count++;
+		}
+		if (mutation_metadata_enabled())
+			fuse_reply_copy_file_range_attrs(
+				req, (size_t)result, attrs, attr_count);
+		else
+			fuse_reply_write(req, (size_t)result);
 		return;
 	}
 	xattr_lock = xattr_lock_for_inode(ino_out);
@@ -3963,6 +4251,33 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 	lo = lo_data(req);
 	inode = lo_inode(req, ino);
 	inode_fd = inode->fd;
+	if (coherence_v3_enabled()) {
+		struct fuse_mutation_attr mutation_attr;
+
+		result = lo_do_write_buf(req, ino, buffer, offset, fi);
+		if (result < 0) {
+			fuse_reply_err(req, (int)-result);
+			return;
+		}
+		if (extfuse_snapshot_pinned_inode(
+			    inode_fd, inode->dev, inode->ino, &st)) {
+			/* A completed mutation is never failed by snapshot loss. */
+			fuse_reply_write(req, (size_t)result);
+			return;
+		}
+		mutation_attr = (struct fuse_mutation_attr) {
+			.ino = ino,
+			.attr = &st,
+			.attr_timeout = v3_attr_timeout(ino, lo->timeout),
+			.flags = FUSE_MUTATION_NODE_ATTR_VALID,
+		};
+		if (mutation_metadata_enabled())
+			fuse_reply_write_attr(
+				req, (size_t)result, &mutation_attr);
+		else
+			fuse_reply_write(req, (size_t)result);
+		return;
+	}
 	xattr_lock = xattr_lock_for_inode(ino);
 	pthread_mutex_lock(xattr_lock);
 	carry_negative_capability =
@@ -4369,6 +4684,9 @@ static void perf_mknod_symlink(fuse_req_t req, fuse_ino_t parent,
 		return;
 	}
 	/* 생성 응답의 TTL은 libfuse passthrough_ll과 동일하게 유지한다. */
+	if (coherence_v3_enabled())
+		entry.attr_timeout = v3_attr_timeout(entry.ino,
+						     entry.attr_timeout);
 	fuse_reply_entry(req, &entry);
 }
 
@@ -4465,6 +4783,9 @@ static void perf_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t parent,
 		return;
 	}
 	/* LINK 응답의 TTL도 baseline passthrough_ll과 동일하게 유지한다. */
+	if (coherence_v3_enabled())
+		entry.attr_timeout = v3_attr_timeout(entry.ino,
+						     entry.attr_timeout);
 	fuse_reply_entry(req, &entry);
 }
 

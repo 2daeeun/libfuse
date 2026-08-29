@@ -28,6 +28,12 @@ td += executable('test_abi', 'test_abi.c',
 td += executable('test_extfuse_init', 'test_extfuse_init.c',
                  dependencies: [ libfuse_dep ],
                  install: false)
+extfuse_v3_test = executable(
+    'test_extfuse_v3', 'test_extfuse_v3.c',
+    dependencies: [ libfuse_dep ],
+    install: false)
+td += extfuse_v3_test
+test('ExtFUSE coherence V3', extfuse_v3_test)
 native_request_counter_test = executable(
     'test_native_request_counter', 'test_native_request_counter.c',
     dependencies: [ libfuse_dep ],

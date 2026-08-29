@@ -167,6 +167,10 @@ ebpf_context_t *ebpf_init(const char *filename)
 		[EXTFUSE_NATIVE_IO_MAP] = "native_io_map",
 		[EXTFUSE_MMAP_MAP] = "mmap_map",
 		[EXTFUSE_POLICY_MAP] = "policy_map",
+		[EXTFUSE_V3_ENTRY_MAP] = "entry_v3_map",
+		[EXTFUSE_V3_ATTR_MAP] = "attr_v3_map",
+		[EXTFUSE_V3_XATTR_MAP] = "xattr_v3_map",
+		[EXTFUSE_V3_SCRATCH_MAP] = "v3_scratch_map",
 		[EXTFUSE_HANDLERS_MAP] = "handlers",
 	};
 	struct bpf_program *main_program;

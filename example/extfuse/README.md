@@ -31,3 +31,32 @@ The hand runner consumes only these libfuse-tree artifacts:
 
 No file under `fuse_exp/fig9_mo/runtime/` is a build or runtime input for the
 hand runner.
+
+With the paired protocol-7.46 kernel, metadata modes negotiate driver-owned
+ExtFUSE coherence V3. Negative LOOKUP rows are bound to the parent incarnation
+and namespace epoch plus the exact request uid/gid/pid; positive LOOKUP rows
+stay on the daemon path because their embedded child attributes require a
+separate child ATTR token. GETATTR rows are bound to the inode incarnation and
+attribute epoch, and GETXATTR rows to the inode XATTR/DATA epochs plus the exact
+request uid/gid/pid. The sole XATTR-only
+exception is an exact size-query ``security.capability=ENODATA`` result. That
+exception is a policy contract of this passthrough daemon and its lower VFS:
+a data write may remove an existing capability but does not create an absent
+one. It is not a generic guarantee for arbitrary FUSE write callbacks.
+Likewise, this example does not make GETATTR, LOOKUP, or GETXATTR authorization
+depend on supplementary groups, process capabilities, or other ``/proc``
+state. A daemon that does so must add a matching credential token to its cache
+policy or leave those handlers on the daemon path; uid/gid/pid alone is not a
+generic process credential fingerprint.
+Daemon replies are published only from the race-validated POST_DAEMON phase.
+WRITE and COPY_FILE_RANGE return exact lower-inode attribute snapshots in the
+optional mutation trailer when that independent capability is available.
+Node-wide xattr notification support is negotiated independently as well; both
+optional features require the V3 core bit but do not require one another.
+
+Xattr payloads through 256 bytes are eligible for V3 caching. Larger values,
+malformed state, persistent writable-mmap markers, and token mismatches always
+use the daemon path. A marked inode also receives zero attribute TTL in daemon
+and mutation-trailer replies so later page-fault metadata cannot hide behind
+the upper VFS cache. Kernels without V3 retain the existing V1/V2 maps and
+manual generation protocol.

@@ -224,6 +224,9 @@ FUSE_3.18 {
 
 		fuse_reply_statx;
 		fuse_fs_statx;
+		fuse_reply_write_attr;
+		fuse_reply_copy_file_range_attrs;
+		fuse_lowlevel_notify_inval_xattr;
 } FUSE_3.17;
 
 # Local Variables:

@@ -1,3 +1,10 @@
+Unreleased
+==========
+
+* Add FUSE protocol 7.46 ExtFUSE coherence V3 negotiation.
+* Add optional exact-metadata WRITE/COPY_FILE_RANGE replies and
+  ``fuse_lowlevel_notify_inval_xattr()``.
+
 libfuse 3.18.2 (2026-03-18)
 ===========================
 * Fix two io-uring issues that might be security critical

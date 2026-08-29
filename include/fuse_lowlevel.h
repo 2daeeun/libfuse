@@ -1483,6 +1483,77 @@ int fuse_reply_open(fuse_req_t req, const struct fuse_file_info *fi);
  */
 int fuse_reply_write(fuse_req_t req, size_t count);
 
+/* Public aliases of the protocol trailer bounds and record flags. */
+#ifndef FUSE_MUTATION_MAX_NODES
+#define FUSE_MUTATION_MAX_NODES 4
+#endif
+#ifndef FUSE_MUTATION_NODE_ATTR_VALID
+#define FUSE_MUTATION_NODE_ATTR_VALID (1 << 0)
+#endif
+#ifndef FUSE_MUTATION_NODE_XATTR_UNCHANGED
+#define FUSE_MUTATION_NODE_XATTR_UNCHANGED (1 << 1)
+#endif
+#ifndef FUSE_MUTATION_NODE_XATTR_CHANGED
+#define FUSE_MUTATION_NODE_XATTR_CHANGED (1 << 2)
+#endif
+
+/**
+ * Final metadata for one inode affected by a mutation.
+ *
+ * `flags` is a combination of FUSE_MUTATION_NODE_* values. `attr` must be
+ * non-NULL when FUSE_MUTATION_NODE_ATTR_VALID is set and may be NULL
+ * otherwise. `attr_timeout` is used only with FUSE_MUTATION_NODE_ATTR_VALID.
+ * XATTR_CHANGED makes the driver invalidate the node's XATTR epoch after the
+ * mutation. XATTR_UNCHANGED is an informational assertion in version 1; it
+ * does not retokenize DATA-dependent cached xattrs.
+ */
+struct fuse_mutation_attr {
+	fuse_ino_t ino;
+	const struct stat *attr;
+	double attr_timeout;
+	uint32_t flags;
+};
+
+/**
+ * Reply with the number of bytes written and optional exact final metadata.
+ *
+ * If mutation-metadata trailers were not negotiated, or `attr` cannot form a
+ * valid trailer, this function sends the ordinary successful WRITE reply.
+ * Trailer construction therefore never turns a completed mutation into an
+ * error reply.
+ *
+ * Possible requests:
+ *   write
+ *
+ * @param req request handle
+ * @param count the number of bytes written
+ * @param attr final metadata for the request inode, or NULL for legacy reply
+ * @return zero for success, -errno for failure to send reply
+ */
+int fuse_reply_write_attr(fuse_req_t req, size_t count,
+			  const struct fuse_mutation_attr *attr);
+
+/**
+ * Reply to copy_file_range with optional exact final metadata.
+ *
+ * `attrs` may contain from one through FUSE_MUTATION_MAX_NODES records. If
+ * mutation-metadata trailers were not negotiated, or the records cannot form
+ * a valid trailer, this function sends the ordinary successful
+ * copy_file_range reply.
+ *
+ * Possible requests:
+ *   copy_file_range
+ *
+ * @param req request handle
+ * @param count the number of bytes copied
+ * @param attrs final metadata records
+ * @param attr_count number of records in attrs
+ * @return zero for success, -errno for failure to send reply
+ */
+int fuse_reply_copy_file_range_attrs(
+	fuse_req_t req, size_t count, const struct fuse_mutation_attr *attrs,
+	size_t attr_count);
+
 /**
  * Reply with data
  *
@@ -1773,6 +1844,19 @@ int fuse_lowlevel_notify_poll(struct fuse_pollhandle *ph);
  */
 int fuse_lowlevel_notify_inval_inode(struct fuse_session *se, fuse_ino_t ino,
 				     off_t off, off_t len);
+
+/**
+ * Notify the kernel to invalidate every cached extended attribute of an inode.
+ *
+ * Added in FUSE protocol version 7.46. If the kernel or filesystem did not
+ * negotiate FUSE_CAP_NOTIFY_INVAL_XATTR, the function returns -ENOSYS and
+ * does nothing.
+ *
+ * @param se the session object
+ * @param ino the inode number
+ * @return zero for success, -errno for failure
+ */
+int fuse_lowlevel_notify_inval_xattr(struct fuse_session *se, fuse_ino_t ino);
 
 /**
  * Notify to increment the epoch for the current

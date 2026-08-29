@@ -700,6 +700,89 @@ static int do_fuse_reply_copy(fuse_req_t req, size_t count)
 	return send_reply_ok(req, &arg, sizeof(arg));
 }
 
+static void fill_attr_out(struct fuse_attr_out *out, const struct stat *attr,
+			  double attr_timeout)
+{
+	memset(out, 0, sizeof(*out));
+	out->attr_valid = calc_timeout_sec(attr_timeout);
+	out->attr_valid_nsec = calc_timeout_nsec(attr_timeout);
+	convert_stat(attr, &out->attr);
+}
+
+static bool fill_mutation_nodes(
+	struct fuse_mutation_node_out nodes[FUSE_MUTATION_MAX_NODES],
+	const struct fuse_mutation_attr *attrs, size_t attr_count)
+{
+	const uint32_t known_flags = FUSE_MUTATION_NODE_ATTR_VALID |
+		FUSE_MUTATION_NODE_XATTR_UNCHANGED |
+		FUSE_MUTATION_NODE_XATTR_CHANGED;
+	size_t i;
+	size_t j;
+
+	if (!attrs || !attr_count || attr_count > FUSE_MUTATION_MAX_NODES)
+		return false;
+
+	memset(nodes, 0, sizeof(*nodes) * attr_count);
+	for (i = 0; i < attr_count; i++) {
+		if (!attrs[i].ino || !attrs[i].flags ||
+		    (attrs[i].flags & ~known_flags) ||
+		    ((attrs[i].flags & FUSE_MUTATION_NODE_XATTR_UNCHANGED) &&
+		     (attrs[i].flags & FUSE_MUTATION_NODE_XATTR_CHANGED)) ||
+		    ((attrs[i].flags & FUSE_MUTATION_NODE_ATTR_VALID) &&
+		     !attrs[i].attr))
+			return false;
+		for (j = 0; j < i; j++) {
+			if (attrs[j].ino == attrs[i].ino)
+				return false;
+		}
+
+		nodes[i].nodeid = attrs[i].ino;
+		nodes[i].flags = attrs[i].flags;
+		if (attrs[i].flags & FUSE_MUTATION_NODE_ATTR_VALID)
+			fill_attr_out(&nodes[i].attr, attrs[i].attr,
+				      attrs[i].attr_timeout);
+	}
+	return true;
+}
+
+static int fuse_reply_mutation_attrs(
+	fuse_req_t req, size_t count, const struct fuse_mutation_attr *attrs,
+	size_t attr_count, bool copy_file_range)
+{
+	struct fuse_mutation_node_out nodes[FUSE_MUTATION_MAX_NODES];
+	struct fuse_mutation_out trailer = {
+		.version = FUSE_MUTATION_OUT_VERSION,
+	};
+	struct fuse_copy_file_range_out copy_out = {
+		.bytes_copied = count,
+	};
+	struct fuse_write_out write_out = {
+		.size = count,
+	};
+	struct iovec iov[4];
+
+	if (req->se->conn.proto_minor < 46 ||
+	    !(req->se->conn.want_ext & FUSE_CAP_EXTFUSE_COHERENCE_V3) ||
+	    !(req->se->conn.want_ext & FUSE_CAP_MUTATION_METADATA) ||
+	    !fill_mutation_nodes(nodes, attrs, attr_count))
+		return fuse_reply_write(req, count);
+	trailer.count = (uint16_t)attr_count;
+
+	if (copy_file_range && req->flags.is_copy_file_range_64) {
+		iov[1].iov_base = &copy_out;
+		iov[1].iov_len = sizeof(copy_out);
+	} else {
+		iov[1].iov_base = &write_out;
+		iov[1].iov_len = sizeof(write_out);
+	}
+	iov[2].iov_base = &trailer;
+	iov[2].iov_len = sizeof(trailer);
+	iov[3].iov_base = nodes;
+	iov[3].iov_len = sizeof(*nodes) * attr_count;
+
+	return send_reply_iov(req, 0, iov, 4);
+}
+
 int fuse_reply_write(fuse_req_t req, size_t count)
 {
 	/*
@@ -710,6 +793,19 @@ int fuse_reply_write(fuse_req_t req, size_t count)
 		return do_fuse_reply_copy(req, count);
 	else
 		return do_fuse_reply_write(req, count);
+}
+
+int fuse_reply_write_attr(fuse_req_t req, size_t count,
+			  const struct fuse_mutation_attr *attr)
+{
+	return fuse_reply_mutation_attrs(req, count, attr, attr ? 1 : 0, false);
+}
+
+int fuse_reply_copy_file_range_attrs(
+	fuse_req_t req, size_t count, const struct fuse_mutation_attr *attrs,
+	size_t attr_count)
+{
+	return fuse_reply_mutation_attrs(req, count, attrs, attr_count, true);
 }
 
 int fuse_reply_buf(fuse_req_t req, const char *buf, size_t size)
@@ -2663,6 +2759,7 @@ static bool want_flag_dependencies_valid(uint64_t want)
 	const uint64_t attr_release_barrier_dependencies =
 		attr_refresh_dependencies |
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
+	const uint64_t coherence_v3_dependencies = FUSE_CAP_EXTFUSE;
 
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE) &&
 	    (want & coherence_dependencies) != coherence_dependencies) {
@@ -2689,6 +2786,24 @@ static bool want_flag_dependencies_valid(uint64_t want)
 		fuse_log(FUSE_LOG_ERR,
 			 "fuse: ExtFUSE %s requires attr refresh and its prerequisites\n",
 			 "attr release barrier");
+		return false;
+	}
+	if ((want & FUSE_CAP_EXTFUSE_COHERENCE_V3) &&
+	    (want & coherence_v3_dependencies) != coherence_v3_dependencies) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: ExtFUSE coherence V3 requires ExtFUSE\n");
+		return false;
+	}
+	if ((want & FUSE_CAP_MUTATION_METADATA) &&
+	    !(want & FUSE_CAP_EXTFUSE_COHERENCE_V3)) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: mutation metadata requires ExtFUSE coherence V3\n");
+		return false;
+	}
+	if ((want & FUSE_CAP_NOTIFY_INVAL_XATTR) &&
+	    !(want & FUSE_CAP_EXTFUSE_COHERENCE_V3)) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: xattr invalidation notification requires ExtFUSE coherence V3\n");
 		return false;
 	}
 	return true;
@@ -2905,6 +3020,12 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		    FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER)
 			se->conn.capable_ext |=
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
+		if (inargflags & FUSE_EXTFUSE_COHERENCE_V3)
+			se->conn.capable_ext |= FUSE_CAP_EXTFUSE_COHERENCE_V3;
+		if (inargflags & FUSE_MUTATION_METADATA)
+			se->conn.capable_ext |= FUSE_CAP_MUTATION_METADATA;
+		if (inargflags & FUSE_HAS_NOTIFY_INVAL_XATTR)
+			se->conn.capable_ext |= FUSE_CAP_NOTIFY_INVAL_XATTR;
 
 	} else {
 		se->conn.max_readahead = 0;
@@ -3077,6 +3198,12 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	if (se->conn.want_ext &
 	    FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER)
 		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_COHERENCE_V3)
+		outargflags |= FUSE_EXTFUSE_COHERENCE_V3;
+	if (se->conn.want_ext & FUSE_CAP_MUTATION_METADATA)
+		outargflags |= FUSE_MUTATION_METADATA;
+	if (se->conn.want_ext & FUSE_CAP_NOTIFY_INVAL_XATTR)
+		outargflags |= FUSE_HAS_NOTIFY_INVAL_XATTR;
 
 	if ((inargflags & FUSE_REQUEST_TIMEOUT) && se->conn.request_timeout) {
 		outargflags |= FUSE_REQUEST_TIMEOUT;
@@ -3287,6 +3414,27 @@ int fuse_lowlevel_notify_inval_inode(struct fuse_session *se, fuse_ino_t ino,
 	iov[1].iov_len = sizeof(outarg);
 
 	return send_notify_iov(se, FUSE_NOTIFY_INVAL_INODE, iov, 2);
+}
+
+int fuse_lowlevel_notify_inval_xattr(struct fuse_session *se, fuse_ino_t ino)
+{
+	struct fuse_notify_inval_xattr_out outarg = {
+		.ino = ino,
+	};
+	struct iovec iov[2];
+
+	if (!se || !ino)
+		return -EINVAL;
+
+	if (se->conn.proto_minor < 46 ||
+	    !(se->conn.want_ext & FUSE_CAP_EXTFUSE_COHERENCE_V3) ||
+	    !(se->conn.want_ext & FUSE_CAP_NOTIFY_INVAL_XATTR))
+		return -ENOSYS;
+
+	iov[1].iov_base = &outarg;
+	iov[1].iov_len = sizeof(outarg);
+
+	return send_notify_iov(se, FUSE_NOTIFY_INVAL_XATTR, iov, 2);
 }
 
 int fuse_lowlevel_notify_increment_epoch(struct fuse_session *se)

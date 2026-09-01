@@ -96,8 +96,15 @@ struct fuse_file_info {
 	    file */
 	uint32_t parallel_direct_writes : 1;
 
+	/**
+	 * Keep the FUSE page cache and let an ExtFUSE policy forward ordinary
+	 * page-backed READ/WRITE requests to backing_id.  This is distinct from
+	 * native FOPEN_PASSTHROUGH, which bypasses the upper page cache.
+	 */
+	uint32_t extfuse_wbcache_passthrough : 1;
+
 	/** Padding.  Reserved for future use*/
-	uint32_t padding : 23;
+	uint32_t padding : 22;
 	uint32_t padding2 : 32;
 	uint32_t padding3 : 32;
 
@@ -114,8 +121,10 @@ struct fuse_file_info {
 	uint32_t poll_events;
 
 	/** Passthrough backing file id.  May be filled in by filesystem in
-	 * create and open.  It is used to create a passthrough connection
-	 * between FUSE file and backing file. */
+	 * create and open.  With extfuse_wbcache_passthrough set, it identifies
+	 * the lower file used below the ordinary FUSE cache; otherwise it uses
+	 * native FOPEN_PASSTHROUGH semantics.
+	 */
 	int32_t backing_id;
 
 	/** struct fuse_file_info api and abi flags  */
@@ -609,6 +618,14 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_NOTIFY_INVAL_XATTR (1ULL << 41)
 
 /**
+ * Indicates support for ExtFUSE policy forwarding below the ordinary FUSE
+ * writeback cache.  This capability requires FUSE_CAP_EXTFUSE,
+ * FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS and FUSE_CAP_WRITEBACK_CACHE.  It is
+ * mutually exclusive with native FUSE_CAP_PASSTHROUGH.
+ */
+#define FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH (1ULL << 42)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine
@@ -748,8 +765,9 @@ struct fuse_conn_info {
 	uint32_t time_gran;
 
 	/**
-	 * When FUSE_CAP_PASSTHROUGH is enabled, this is the maximum allowed
-	 * stacking depth of the backing files.  In current kernel, the maximum
+	 * When FUSE_CAP_PASSTHROUGH or
+	 * FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH is enabled, this is the maximum
+	 * allowed stacking depth of the backing files.  In current kernel, the maximum
 	 * allowed stack depth if FILESYSTEM_MAX_STACK_DEPTH (2), which includes
 	 * the FUSE passthrough layer, so the maximum stacking depth for backing
 	 * files is 1.

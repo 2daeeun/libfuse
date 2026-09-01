@@ -169,7 +169,8 @@ int SEC("extfuse") fuse_xdp_main_handler(void *ctx)
 
 		/* Only audited epoch handlers inspect the shared context. */
 		if (opcode != FUSE_LOOKUP && opcode != FUSE_GETATTR &&
-		    opcode != FUSE_GETXATTR && opcode != FUSE_WRITE &&
+		    opcode != FUSE_GETXATTR && opcode != FUSE_READ &&
+		    opcode != FUSE_WRITE &&
 		    opcode != FUSE_COPY_FILE_RANGE &&
 		    opcode != FUSE_COPY_FILE_RANGE_64 &&
 		    opcode != EXTFUSE_PASSTHROUGH_READ &&
@@ -1026,8 +1027,24 @@ HANDLER(EXTFUSE_PASSTHROUGH_ATTR_COMMIT,
 
 HANDLER(FUSE_READ, 15)(void *ctx)
 {
+	struct extfuse_req *args = (struct extfuse_req *)ctx;
 	lookup_attr_key_t key = {0};
-	int ret = gen_attr_key(ctx, IN_PARAM_0_VALUE, "READ", &key);
+	__u64 nodeid;
+	int ret;
+
+	if (args->coherence.version == EXTFUSE_COHERENCE_VERSION) {
+		if (epoch_post_daemon(args))
+			return RETURN;
+		if (!policy_enabled(EXTFUSE_POLICY_WBCACHE_PASSTHROUGH))
+			return UPCALL;
+
+		/* The lower read may update atime; never retain an old ATTR row. */
+		nodeid = args->in.h.nodeid;
+		bpf_map_delete_elem(&epoch_attr_map, &nodeid);
+		return PASSTHRU;
+	}
+
+	ret = gen_attr_key(ctx, IN_PARAM_0_VALUE, "READ", &key);
 	if (ret < 0)
 		return UPCALL;
 
@@ -1127,9 +1144,21 @@ HANDLER(FUSE_WRITE, 16)(void *ctx)
 {
 	struct extfuse_req *args = (struct extfuse_req *)ctx;
 	lookup_attr_key_t key = {0};
+	__u64 nodeid;
 
-	if (args->coherence.version == EXTFUSE_COHERENCE_VERSION)
+	if (args->coherence.version == EXTFUSE_COHERENCE_VERSION) {
+		if (!epoch_post_daemon(args)) {
+			if (!policy_enabled(
+				    EXTFUSE_POLICY_WBCACHE_PASSTHROUGH))
+				return UPCALL;
+
+			/* Size and timestamps must be refreshed after lower writeback. */
+			nodeid = args->in.h.nodeid;
+			bpf_map_delete_elem(&epoch_attr_map, &nodeid);
+			return PASSTHRU;
+		}
 		return epoch_publish_mutation_attrs(ctx);
+	}
 
 	int ret = gen_attr_key(ctx, IN_PARAM_0_VALUE, "WRITE", &key);
 	if (ret < 0)

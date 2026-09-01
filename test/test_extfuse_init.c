@@ -36,8 +36,16 @@ _Static_assert(FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER ==
 	       "unexpected passthrough-attr-release-barrier capability bit");
 _Static_assert(FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER == (1ULL << 47),
 	       "unexpected passthrough-attr-release-barrier wire bit");
+_Static_assert(FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH == (1ULL << 42),
+	       "unexpected writeback-cache passthrough capability bit");
+_Static_assert(FUSE_EXTFUSE_WBCACHE_PASSTHROUGH == (1ULL << 51),
+	       "unexpected writeback-cache passthrough wire bit");
+_Static_assert(FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH == (1U << 8),
+	       "unexpected writeback-cache passthrough open bit");
 _Static_assert(FUSE_OVER_IO_URING == (1ULL << 41),
 	       "unexpected FUSE-over-io_uring wire capability bit");
+_Static_assert(sizeof(struct fuse_file_info) == 64,
+	       "fuse_file_info ABI size changed");
 _Static_assert(sizeof(struct fuse_conn_info) == 128,
 	       "fuse_conn_info ABI size changed");
 _Static_assert(offsetof(struct fuse_conn_info, extfuse_prog_fd) == 68,

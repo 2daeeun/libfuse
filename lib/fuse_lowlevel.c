@@ -578,7 +578,11 @@ static void fill_open(struct fuse_open_out *arg,
 	arg->fh = f->fh;
 	if (f->backing_id > 0) {
 		arg->backing_id = f->backing_id;
-		arg->open_flags |= FOPEN_PASSTHROUGH;
+		if (f->extfuse_wbcache_passthrough)
+			arg->open_flags |=
+				FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH;
+		else
+			arg->open_flags |= FOPEN_PASSTHROUGH;
 	}
 	if (f->direct_io)
 		arg->open_flags |= FOPEN_DIRECT_IO;
@@ -2760,6 +2764,9 @@ static bool want_flag_dependencies_valid(uint64_t want)
 		attr_refresh_dependencies |
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
 	const uint64_t coherence_epochs_dependencies = FUSE_CAP_EXTFUSE;
+	const uint64_t wbcache_passthrough_dependencies =
+		FUSE_CAP_EXTFUSE | FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS |
+		FUSE_CAP_WRITEBACK_CACHE;
 
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE) &&
 	    (want & coherence_dependencies) != coherence_dependencies) {
@@ -2804,6 +2811,14 @@ static bool want_flag_dependencies_valid(uint64_t want)
 	    !(want & FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS)) {
 		fuse_log(FUSE_LOG_ERR,
 			 "fuse: xattr invalidation notification requires ExtFUSE coherence epochs\n");
+		return false;
+	}
+	if ((want & FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH) &&
+	    ((want & wbcache_passthrough_dependencies) !=
+		     wbcache_passthrough_dependencies ||
+	     (want & FUSE_CAP_PASSTHROUGH))) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: ExtFUSE writeback-cache passthrough requires ExtFUSE, coherence epochs and writeback cache, and excludes native passthrough\n");
 		return false;
 	}
 	return true;
@@ -3026,6 +3041,9 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			se->conn.capable_ext |= FUSE_CAP_MUTATION_METADATA;
 		if (inargflags & FUSE_HAS_NOTIFY_INVAL_XATTR)
 			se->conn.capable_ext |= FUSE_CAP_NOTIFY_INVAL_XATTR;
+		if (inargflags & FUSE_EXTFUSE_WBCACHE_PASSTHROUGH)
+			se->conn.capable_ext |=
+				FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH;
 
 	} else {
 		se->conn.max_readahead = 0;
@@ -3171,8 +3189,11 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_SETXATTR_EXT;
 	if (se->conn.want_ext & FUSE_CAP_DIRECT_IO_ALLOW_MMAP)
 		outargflags |= FUSE_DIRECT_IO_ALLOW_MMAP;
-	if (se->conn.want_ext & FUSE_CAP_PASSTHROUGH) {
-		outargflags |= FUSE_PASSTHROUGH;
+	if (se->conn.want_ext &
+	    (FUSE_CAP_PASSTHROUGH |
+	     FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH)) {
+		if (se->conn.want_ext & FUSE_CAP_PASSTHROUGH)
+			outargflags |= FUSE_PASSTHROUGH;
 		/*
 		 * outarg.max_stack_depth includes the fuse stack layer,
 		 * so it is one more than max_backing_stack_depth.
@@ -3204,6 +3225,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_MUTATION_METADATA;
 	if (se->conn.want_ext & FUSE_CAP_NOTIFY_INVAL_XATTR)
 		outargflags |= FUSE_HAS_NOTIFY_INVAL_XATTR;
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH)
+		outargflags |= FUSE_EXTFUSE_WBCACHE_PASSTHROUGH;
 
 	if ((inargflags & FUSE_REQUEST_TIMEOUT) && se->conn.request_timeout) {
 		outargflags |= FUSE_REQUEST_TIMEOUT;
@@ -3240,7 +3263,9 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			outarg.congestion_threshold);
 		fuse_log(FUSE_LOG_DEBUG, "   time_gran=%u\n",
 			outarg.time_gran);
-		if (se->conn.want_ext & FUSE_CAP_PASSTHROUGH)
+		if (se->conn.want_ext &
+		    (FUSE_CAP_PASSTHROUGH |
+		     FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH))
 			fuse_log(FUSE_LOG_DEBUG, "   max_stack_depth=%u\n",
 				outarg.max_stack_depth);
 		if (se->conn.want_ext & FUSE_CAP_EXTFUSE)

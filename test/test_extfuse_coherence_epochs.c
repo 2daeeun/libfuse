@@ -17,13 +17,15 @@
 #define TEST_COPY_NODEID UINT64_C(84)
 #define TEST_PROG_FD UINT32_C(0x12345678)
 
-_Static_assert(FUSE_KERNEL_MINOR_VERSION == 46, "unexpected protocol minor");
+_Static_assert(FUSE_KERNEL_MINOR_VERSION == 47, "unexpected protocol minor");
 _Static_assert(FUSE_EXTFUSE_COHERENCE_EPOCHS == (1ULL << 48),
 	       "unexpected coherence epochs wire bit");
 _Static_assert(FUSE_MUTATION_METADATA == (1ULL << 49),
 	       "unexpected mutation-metadata wire bit");
 _Static_assert(FUSE_HAS_NOTIFY_INVAL_XATTR == (1ULL << 50),
 	       "unexpected xattr-notify wire bit");
+_Static_assert(FUSE_EXTFUSE_WBCACHE_PASSTHROUGH == (1ULL << 51),
+	       "unexpected writeback-cache passthrough wire bit");
 _Static_assert(FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS == (1ULL << 39),
 	       "unexpected coherence epochs capability bit");
 _Static_assert(FUSE_CAP_MUTATION_METADATA == (1ULL << 40),
@@ -49,6 +51,8 @@ enum negotiation_mode {
 	NEGOTIATE_CORE_ONLY,
 	NEGOTIATE_ALL,
 	NEGOTIATE_INVALID_MUTATION,
+	NEGOTIATE_WBCACHE_PASSTHROUGH,
+	NEGOTIATE_INVALID_WBCACHE_PASSTHROUGH,
 };
 
 struct test_state {
@@ -89,6 +93,21 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 	    !fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS)) {
 		fprintf(stderr, "failed to opt in to advertised coherence epochs capabilities\n");
 		return;
+	}
+	if (state->negotiation == NEGOTIATE_WBCACHE_PASSTHROUGH ||
+	    state->negotiation == NEGOTIATE_INVALID_WBCACHE_PASSTHROUGH) {
+		if (state->negotiation == NEGOTIATE_WBCACHE_PASSTHROUGH &&
+		    !fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE)) {
+			fprintf(stderr, "failed to opt in to writeback cache\n");
+			return;
+		}
+		if (!fuse_set_feature_flag(
+			    conn, FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH)) {
+			fprintf(stderr,
+				"failed to opt in to writeback-cache passthrough\n");
+			return;
+		}
+		conn->max_backing_stack_depth = FUSE_BACKING_STACKED_UNDER;
 	}
 	if (state->negotiation == NEGOTIATE_ALL &&
 	    (!fuse_set_feature_flag(conn, FUSE_CAP_MUTATION_METADATA) ||
@@ -208,12 +227,17 @@ static void send_init(struct fuse_session *session,
 		flags |= FUSE_EXTFUSE_COHERENCE_EPOCHS;
 	if (negotiation == NEGOTIATE_ALL)
 		flags |= FUSE_MUTATION_METADATA | FUSE_HAS_NOTIFY_INVAL_XATTR;
+	if (negotiation == NEGOTIATE_WBCACHE_PASSTHROUGH ||
+	    negotiation == NEGOTIATE_INVALID_WBCACHE_PASSTHROUGH)
+		flags |= FUSE_EXTFUSE_WBCACHE_PASSTHROUGH;
+	if (negotiation == NEGOTIATE_WBCACHE_PASSTHROUGH)
+		flags |= FUSE_WRITEBACK_CACHE;
 	request.header.len = sizeof(request);
 	request.header.opcode = FUSE_INIT;
 	request.header.unique = 1;
 	request.init.major = FUSE_KERNEL_VERSION;
 	request.init.minor = FUSE_KERNEL_MINOR_VERSION;
-	request.init.flags = FUSE_INIT_EXT;
+	request.init.flags = FUSE_INIT_EXT | (uint32_t)flags;
 	request.init.flags2 = (uint32_t)(flags >> 32);
 	buf = (struct fuse_buf) {
 		.size = sizeof(request),
@@ -277,7 +301,8 @@ static int check_init_reply(const struct test_state *state,
 	uint64_t all_epoch_flags = FUSE_EXTFUSE_COHERENCE_EPOCHS |
 		FUSE_MUTATION_METADATA | FUSE_HAS_NOTIFY_INVAL_XATTR;
 
-	if (negotiation == NEGOTIATE_INVALID_MUTATION) {
+	if (negotiation == NEGOTIATE_INVALID_MUTATION ||
+	    negotiation == NEGOTIATE_INVALID_WBCACHE_PASSTHROUGH) {
 		if (state->reply_len != sizeof(*header) ||
 		    header->error != -EPROTO) {
 			fprintf(stderr, "invalid coherence epochs dependency did not fail INIT\n");
@@ -305,6 +330,19 @@ static int check_init_reply(const struct test_state *state,
 		}
 	} else if (flags & all_epoch_flags) {
 		fprintf(stderr, "coherence epochs INIT bits enabled without opt-in\n");
+		return 1;
+	}
+	if (negotiation == NEGOTIATE_WBCACHE_PASSTHROUGH) {
+		if (!(flags & FUSE_WRITEBACK_CACHE) ||
+		    !(flags & FUSE_EXTFUSE_WBCACHE_PASSTHROUGH) ||
+		    (flags & FUSE_PASSTHROUGH) || init->max_stack_depth != 1) {
+			fprintf(stderr,
+				"writeback-cache passthrough INIT opt-in was not serialized\n");
+			return 1;
+		}
+	} else if (flags & FUSE_EXTFUSE_WBCACHE_PASSTHROUGH) {
+		fprintf(stderr,
+			"writeback-cache passthrough enabled without opt-in\n");
 		return 1;
 	}
 	return 0;
@@ -426,7 +464,8 @@ static int run_session(enum negotiation_mode negotiation)
 	send_init(session, negotiation);
 	if (check_init_reply(&state, negotiation))
 		goto out_session;
-	if (negotiation == NEGOTIATE_INVALID_MUTATION) {
+	if (negotiation == NEGOTIATE_INVALID_MUTATION ||
+	    negotiation == NEGOTIATE_INVALID_WBCACHE_PASSTHROUGH) {
 		failed = 0;
 		goto out_session;
 	}
@@ -496,6 +535,8 @@ int main(void)
 	failed |= run_session(NEGOTIATE_CORE_ONLY);
 	failed |= run_session(NEGOTIATE_ALL);
 	failed |= run_session(NEGOTIATE_INVALID_MUTATION);
+	failed |= run_session(NEGOTIATE_WBCACHE_PASSTHROUGH);
+	failed |= run_session(NEGOTIATE_INVALID_WBCACHE_PASSTHROUGH);
 	if (!failed)
 		puts("PASS ExtFUSE coherence epochs replies and notification");
 	return failed ? EXIT_FAILURE : EXIT_SUCCESS;

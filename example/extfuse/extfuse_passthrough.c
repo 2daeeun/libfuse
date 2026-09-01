@@ -148,11 +148,17 @@ struct xattr_value {
 	"mutation_metadata_capable=%u mutation_metadata_requested=%u "
 #define PERF_NOTIFY_INVAL_XATTR_INIT_FMT \
 	"notify_inval_xattr_capable=%u notify_inval_xattr_requested=%u "
+#define PERF_WBCACHE_PASSTHROUGH_INIT_FMT \
+	"wbcache_passthrough_capable=%u wbcache_passthrough_requested=%u "
+#define PERF_START_MOUNT_FMT \
+	"mountpoint=%s debug=%u callback_counting=%u "
+#define PERF_START_WBCACHE_FMT \
+	"wbcache_passthrough=%u native_passthrough=0 "
 #define PERF_POSIX_ACL_ACCESS_XATTR "system.posix_acl_access"
 
 enum perf_backing_mode {
 	PERF_BACKING_DAEMON,
-	PERF_BACKING_NATIVE,
+	PERF_BACKING_WBCACHE,
 	PERF_BACKING_QUARANTINED,
 };
 
@@ -339,6 +345,8 @@ struct perf_state {
 	bool single_issuer;
 	bool passthrough_capable;
 	bool passthrough_requested;
+	bool wbcache_passthrough_capable;
+	bool wbcache_passthrough_requested;
 	bool passthrough_coherence_capable;
 	bool passthrough_coherence_requested;
 	bool passthrough_coherence_v2_capable;
@@ -815,7 +823,7 @@ static bool notify_inval_xattr_enabled(void)
 	       perf_state.notify_inval_xattr_requested;
 }
 
-static bool native_passthrough_enabled(void)
+static bool wbcache_passthrough_enabled(void)
 {
 	return perf_state.mode == PERF_MODE_ALLOPT;
 }
@@ -1747,7 +1755,7 @@ static bool negative_capability_cache_current_serialized(fuse_ino_t nodeid,
 
 	pthread_mutex_lock(&perf_state.backing_mutex);
 	if (perf_state.xattr_cache_bypass ||
-	    (native_passthrough_enabled() &&
+	    (wbcache_passthrough_enabled() &&
 	     has_passthrough_mmap_marker_locked(nodeid)))
 		goto out;
 	if (ebpf_data_lookup(perf_state.bpf, &key, &value, EXTFUSE_XATTR_MAP)) {
@@ -1793,7 +1801,7 @@ refresh_negative_capability_serialized(fuse_ino_t nodeid,
 
 	pthread_mutex_lock(&perf_state.backing_mutex);
 	if (perf_state.xattr_cache_bypass ||
-	    (native_passthrough_enabled() &&
+	    (wbcache_passthrough_enabled() &&
 	     has_passthrough_mmap_marker_locked(nodeid)))
 		goto out;
 	state = find_inode_generation_locked(nodeid);
@@ -2008,16 +2016,16 @@ static int invalidate_entry(fuse_ino_t parent, const char *name)
 	return result;
 }
 
-static void apply_native_passthrough_flags(struct fuse_file_info *fi,
-					   int backing_id)
+static void apply_wbcache_passthrough_flags(struct fuse_file_info *fi,
+					    int backing_id)
 {
 	fi->backing_id = backing_id;
 	/*
-	 * FOPEN_DIRECT_IO overrides passthrough read/write, while KEEP_CACHE is
-	 * rejected by the kernel's passthrough open-flag mask.
+	 * Keep the ordinary FUSE page cache.  Only page-backed READ/WRITE
+	 * requests selected by the ExtFUSE policy use the registered lower file.
 	 */
+	fi->extfuse_wbcache_passthrough = 1;
 	fi->direct_io = 0;
-	fi->keep_cache = 0;
 	fi->parallel_direct_writes = 0;
 }
 
@@ -2026,7 +2034,7 @@ static void apply_native_passthrough_flags(struct fuse_file_info *fi,
  * the callback that discovered the failure so its side effects and reply stay
  * consistent, but request loop shutdown immediately.  The validation harness
  * then rejects the fallback counters instead of measuring daemon I/O as
- * native passthrough.
+ * WBCache passthrough.
  */
 static void request_allopt_session_exit(void)
 {
@@ -2039,10 +2047,10 @@ static void request_allopt_session_exit(void)
  * tombstone_candidate is preallocated for the same reason.  This function
  * always consumes both objects, whether new records are needed or not.
  */
-static void attach_native_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
-				      struct fuse_file_info *fi,
-				      struct perf_backing *candidate,
-				      struct perf_tombstone *tombstone_candidate)
+static void attach_wbcache_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
+				       struct fuse_file_info *fi,
+				       struct perf_backing *candidate,
+				       struct perf_tombstone *tombstone_candidate)
 {
 	struct perf_backing **link;
 	struct perf_backing *backing;
@@ -2051,6 +2059,7 @@ static void attach_native_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 	int saved_error;
 
 	fi->backing_id = 0;
+	fi->extfuse_wbcache_passthrough = 0;
 	pthread_mutex_lock(&perf_state.backing_mutex);
 	backing = find_backing_locked(ino, &link);
 	if (backing && backing->mode == PERF_BACKING_QUARANTINED &&
@@ -2108,9 +2117,10 @@ static void attach_native_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 		free(candidate);
 		free(tombstone_candidate);
 		backing->open_count++;
-		if (backing->mode == PERF_BACKING_NATIVE) {
+		if (backing->mode == PERF_BACKING_WBCACHE) {
 			counter_increment(&perf_state.counters.passthrough_reuses);
-			apply_native_passthrough_flags(fi, backing->backing_id);
+			apply_wbcache_passthrough_flags(fi,
+						  backing->backing_id);
 			counter_increment(&perf_state.counters.passthrough_opens);
 		} else {
 			counter_increment(
@@ -2159,7 +2169,7 @@ static void attach_native_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 	saved_error = errno ? errno : EIO;
 	if (backing_id > 0) {
 		backing->backing_id = backing_id;
-		backing->mode = PERF_BACKING_NATIVE;
+		backing->mode = PERF_BACKING_WBCACHE;
 		if (perf_state.passthrough_coherence_v2_requested ||
 		    coherence_epochs_enabled())
 			free(tombstone_candidate);
@@ -2168,7 +2178,7 @@ static void attach_native_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 		counter_increment(
 			&perf_state.counters.passthrough_registrations);
 		advance_inode_generation_locked(ino, "backing-registration");
-		apply_native_passthrough_flags(fi, backing_id);
+		apply_wbcache_passthrough_flags(fi, backing_id);
 		counter_increment(&perf_state.counters.passthrough_opens);
 		count = counter_value(
 			&perf_state.counters.passthrough_registrations);
@@ -2196,10 +2206,10 @@ static void attach_native_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 	pthread_mutex_unlock(&perf_state.backing_mutex);
 }
 
-static bool classify_native_passthrough_release(fuse_ino_t ino,
-						bool handle_may_modify,
-						bool *may_modify,
-						bool *registration_refresh)
+static bool classify_wbcache_passthrough_release(fuse_ino_t ino,
+						 bool handle_may_modify,
+						 bool *may_modify,
+						 bool *registration_refresh)
 {
 	struct perf_backing *backing;
 	uint64_t errors;
@@ -2236,7 +2246,7 @@ static bool classify_native_passthrough_release(fuse_ino_t ino,
 	return true;
 }
 
-static bool release_native_passthrough(fuse_req_t req, fuse_ino_t ino)
+static bool release_wbcache_passthrough(fuse_req_t req, fuse_ino_t ino)
 {
 	struct perf_backing **link;
 	struct perf_backing *backing;
@@ -2267,8 +2277,8 @@ static bool release_native_passthrough(fuse_req_t req, fuse_ino_t ino)
 
 	if (backing->mode != PERF_BACKING_DAEMON) {
 		/*
-		 * 구형 fallback은 native I/O 완료 알림이 없으므로 마지막 close에서도
-		 * attr를 지운다. 협상된 커널은 pre/post 알림이 race를 막고,
+		 * 구형 fallback에는 lower I/O 완료 알림이 없다. 따라서 마지막
+		 * close에서도 attr를 지운다. 협상된 커널은 epoch가 race를 막고,
 		 * perf_release()가 lower fd의 최종 snapshot을 다시 캐시한다.
 		 */
 		if (!perf_state.passthrough_coherence_v2_requested &&
@@ -2311,7 +2321,7 @@ static bool release_native_passthrough(fuse_req_t req, fuse_ino_t ino)
 	return true;
 }
 
-static void cleanup_native_passthrough_state(void)
+static void cleanup_wbcache_passthrough_state(void)
 {
 	struct perf_backing *backing;
 	struct perf_tombstone *tombstone;
@@ -2469,12 +2479,8 @@ static int configure_bpf_policy(void)
 	uint32_t flags = 0;
 	uint32_t observed = 0;
 
-	if (perf_state.mode == PERF_MODE_ALLOPT &&
-	    perf_state.profile == PERF_PROFILE_PAPER_LIKE) {
-		flags = EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA;
-		if (!coherence_epochs_enabled())
-			flags |= EXTFUSE_POLICY_RELAX_NATIVE_MMAP_METADATA;
-	}
+	if (wbcache_passthrough_enabled())
+		flags |= EXTFUSE_POLICY_WBCACHE_PASSTHROUGH;
 	if (perf_state.passthrough_attr_release_barrier_requested)
 		flags |= EXTFUSE_POLICY_ATTR_RELEASE_BARRIER;
 	if (coherence_epochs_enabled())
@@ -2502,7 +2508,7 @@ static int configure_bpf_policy(void)
 	}
 	perf_state.bpf_policy_flags = flags;
 	fprintf(stderr,
-		"BPF_POLICY flags=0x%08x %s=%s %s=%s %s=%s %s=%s\n",
+		"BPF_POLICY flags=0x%08x %s=%s %s=%s %s=%s %s=%s %s=%s\n",
 		flags,
 		"paper_native_read_metadata",
 		(flags & EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA) ?
@@ -2515,6 +2521,9 @@ static int configure_bpf_policy(void)
 			"enabled" : "disabled",
 		"coherence_epochs",
 		(flags & EXTFUSE_POLICY_COHERENCE_EPOCHS) ?
+			"enabled" : "disabled",
+		"wbcache_passthrough",
+		(flags & EXTFUSE_POLICY_WBCACHE_PASSTHROUGH) ?
 			"enabled" : "disabled");
 	return 0;
 }
@@ -2805,8 +2814,6 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 	int extfuse_rc = 0;
 
 	perf_state.init_rc = 0;
-	if (native_passthrough_enabled())
-		lo->writeback = 0;
 	fuse_apply_conn_info_opts(perf_state.conn_opts, conn);
 	lo_init(userdata, conn);
 	/*
@@ -2838,87 +2845,18 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		(conn->capable_ext & FUSE_CAP_MUTATION_METADATA) != 0;
 	perf_state.notify_inval_xattr_capable =
 		(conn->capable_ext & FUSE_CAP_NOTIFY_INVAL_XATTR) != 0;
-	if (native_passthrough_enabled()) {
-		fuse_unset_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
-		lo->writeback = 0;
-		conn->max_backing_stack_depth = FUSE_BACKING_STACKED_UNDER;
-		perf_state.passthrough_requested =
-			fuse_set_feature_flag(conn, FUSE_CAP_PASSTHROUGH);
-		if (!perf_state.passthrough_requested) {
+	perf_state.wbcache_passthrough_capable =
+		(conn->capable_ext &
+		 FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH) != 0;
+	if (wbcache_passthrough_enabled()) {
+		/* C3/C4 retain the upper FUSE cache; native passthrough stays off. */
+		lo->writeback = 1;
+		if (!fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE)) {
 			perf_state.init_rc = -EOPNOTSUPP;
-			/*
-			 * Fail INIT closed: an "allopt" mount must never run
-			 * while silently lacking the kernel capability.
-			 */
-			conn->want_ext |= FUSE_CAP_PASSTHROUGH;
+			conn->want_ext |= FUSE_CAP_WRITEBACK_CACHE;
 		}
-		if (!perf_state.coherence_epochs_capable &&
-		    perf_state.passthrough_requested &&
-		    perf_state.passthrough_coherence_capable)
-			perf_state.passthrough_coherence_requested =
-				fuse_set_feature_flag(
-					conn,
-					FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE);
-		if (perf_state.passthrough_coherence_requested &&
-		    perf_state.passthrough_coherence_v2_capable)
-			perf_state.passthrough_coherence_v2_requested =
-				fuse_set_feature_flag(
-					conn,
-					FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2);
-		if (perf_state.passthrough_coherence_v2_requested &&
-		    perf_state.passthrough_attr_refresh_capable)
-			perf_state.passthrough_attr_refresh_requested =
-				fuse_set_feature_flag(
-					conn,
-					FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH);
-		if (perf_state.passthrough_attr_refresh_requested &&
-		    perf_state.passthrough_attr_release_barrier_capable)
-			perf_state.passthrough_attr_release_barrier_requested =
-				fuse_set_feature_flag(
-					conn,
-					FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
-		if (!perf_state.coherence_epochs_capable &&
-		    perf_state.require_passthrough_coherence &&
-		    !perf_state.passthrough_coherence_v2_requested) {
-			if (!perf_state.init_rc)
-				perf_state.init_rc = -EOPNOTSUPP;
-			/* Fail INIT instead of silently collecting legacy AllOpt data. */
-			conn->want_ext |=
-				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE |
-				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2;
-		}
-		/*
-		 * AllOpt relies on the typed 68/69 refresh handshake.  Never mount a
-		 * C3/C4 session with only one side of that negotiated contract.
-		 */
-		if (!perf_state.coherence_epochs_capable &&
-		    (!perf_state.passthrough_attr_refresh_capable ||
-		    perf_state.passthrough_attr_refresh_capable !=
-			perf_state.passthrough_attr_refresh_requested)) {
-			if (!perf_state.init_rc)
-				perf_state.init_rc = -EOPNOTSUPP;
-			conn->want_ext |=
-				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE |
-				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2 |
-				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
-		}
-		/*
-		 * Retaining an old-token attr row across RELEASE is safe only when
-		 * both sides negotiated the release barrier.  Fail closed instead of
-		 * silently running the new userspace policy against an older kernel.
-		 */
-		if (!perf_state.coherence_epochs_capable &&
-		    (!perf_state.passthrough_attr_release_barrier_capable ||
-		    perf_state.passthrough_attr_release_barrier_capable !=
-			perf_state.passthrough_attr_release_barrier_requested)) {
-			if (!perf_state.init_rc)
-				perf_state.init_rc = -EOPNOTSUPP;
-			conn->want_ext |=
-				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE |
-				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2 |
-				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH |
-				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
-		}
+		fuse_unset_feature_flag(conn, FUSE_CAP_PASSTHROUGH);
+		conn->max_backing_stack_depth = FUSE_BACKING_STACKED_UNDER;
 	}
 	if (!strcmp(perf_state.transport, "uring"))
 		perf_state.single_issuer = fuse_set_conn_flag(
@@ -2952,6 +2890,38 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 			perf_state.init_rc = -EOPNOTSUPP;
 		conn->want_ext |= FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS;
 	}
+	if (wbcache_passthrough_enabled()) {
+		/* Do not mix this cached route with the native passthrough ABI. */
+		fuse_unset_feature_flag(conn, FUSE_CAP_PASSTHROUGH);
+		fuse_unset_feature_flag(
+			conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE);
+		fuse_unset_feature_flag(
+			conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2);
+		fuse_unset_feature_flag(
+			conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH);
+		fuse_unset_feature_flag(
+			conn,
+			FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
+		perf_state.passthrough_requested = false;
+		perf_state.passthrough_coherence_requested = false;
+		perf_state.passthrough_coherence_v2_requested = false;
+		perf_state.passthrough_attr_refresh_requested = false;
+		perf_state.passthrough_attr_release_barrier_requested = false;
+
+		if (perf_state.requested && coherence_epochs_enabled() &&
+		    (conn->want_ext & FUSE_CAP_WRITEBACK_CACHE))
+			perf_state.wbcache_passthrough_requested =
+				fuse_set_feature_flag(
+					conn,
+					FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH);
+		if (!perf_state.wbcache_passthrough_requested) {
+			if (!perf_state.init_rc)
+				perf_state.init_rc = -EOPNOTSUPP;
+			/* Fail INIT instead of measuring a daemon-I/O fallback. */
+			conn->want_ext |=
+				FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH;
+		}
+	}
 	if (coherence_epochs_enabled()) {
 		/* Driver-owned epoch-coherent state supersedes every legacy generation hook. */
 		fuse_unset_feature_flag(
@@ -2975,6 +2945,7 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		PERF_MUTATION_METADATA_INIT_FMT
 		PERF_NOTIFY_INVAL_XATTR_INIT_FMT
 		"passthrough_capable=%u passthrough_requested=%u "
+		PERF_WBCACHE_PASSTHROUGH_INIT_FMT
 		"passthrough_coherence_capable=%u "
 		"passthrough_coherence_requested=%u "
 		"passthrough_coherence_v2_capable=%u "
@@ -2982,8 +2953,7 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		"passthrough_attr_refresh_capable=%u "
 		"passthrough_attr_refresh_requested=%u "
 		PERF_ATTR_RELEASE_BARRIER_INIT_FMT
-		"paper_native_read_metadata_relaxed=%u "
-		"paper_native_mmap_metadata_relaxed=%u "
+		"wbcache_policy_enabled=%u "
 		"readdirplus_policy=stackfs-compatible-disabled "
 		"readdirplus_requested=%u readdirplus_auto_requested=%u "
 		"reply_timeout=%.3f cache_mode=%d writeback_requested=%u "
@@ -3001,6 +2971,8 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		notify_inval_xattr_enabled(),
 		perf_state.passthrough_capable,
 		perf_state.passthrough_requested,
+		perf_state.wbcache_passthrough_capable,
+		perf_state.wbcache_passthrough_requested,
 		perf_state.passthrough_coherence_capable,
 		perf_state.passthrough_coherence_requested,
 		perf_state.passthrough_coherence_v2_capable,
@@ -3014,9 +2986,7 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		"passthrough_attr_release_barrier_policy",
 		attr_release_barrier_enabled(),
 		(perf_state.bpf_policy_flags &
-		 EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA) != 0,
-		(perf_state.bpf_policy_flags &
-		 EXTFUSE_POLICY_RELAX_NATIVE_MMAP_METADATA) != 0,
+		 EXTFUSE_POLICY_WBCACHE_PASSTHROUGH) != 0,
 		(conn->want_ext & FUSE_CAP_READDIRPLUS) != 0,
 		(conn->want_ext & FUSE_CAP_READDIRPLUS_AUTO) != 0,
 		lo->timeout, lo->cache,
@@ -3031,8 +3001,8 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 
 static void perf_destroy(void *userdata)
 {
-	if (native_passthrough_enabled())
-		cleanup_native_passthrough_state();
+	if (wbcache_passthrough_enabled())
+		cleanup_wbcache_passthrough_state();
 	audit_coherence_state();
 	print_counters("destroy");
 	cleanup_inode_generation_state();
@@ -3500,7 +3470,7 @@ static void perf_tmpfile(fuse_req_t req, fuse_ino_t parent, mode_t mode,
 		lo_tmpfile(req, parent, mode, fi);
 		return;
 	}
-	if (native_passthrough_enabled()) {
+	if (wbcache_passthrough_enabled()) {
 		candidate = calloc(1, sizeof(*candidate));
 		tombstone_candidate = calloc(1, sizeof(*tombstone_candidate));
 		if (!candidate || !tombstone_candidate) {
@@ -3552,9 +3522,9 @@ static void perf_tmpfile(fuse_req_t req, fuse_ino_t parent, mode_t mode,
 	else if (lo->cache == CACHE_ALWAYS)
 		fi->keep_cache = 1;
 	fi->parallel_direct_writes = 1;
-	if (native_passthrough_enabled())
-		attach_native_passthrough(req, entry.ino, fd, fi, candidate,
-					  tombstone_candidate);
+	if (wbcache_passthrough_enabled())
+		attach_wbcache_passthrough(req, entry.ino, fd, fi, candidate,
+					   tombstone_candidate);
 	entry.attr_timeout = cache_inode_attr_before_reply(
 		req, entry.ino, &entry.attr);
 	fuse_reply_create(req, &entry, fi);
@@ -3584,7 +3554,7 @@ void perf_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		return;
 	}
 	lo = lo_data(req);
-	if (native_passthrough_enabled()) {
+	if (wbcache_passthrough_enabled()) {
 		candidate = calloc(1, sizeof(*candidate));
 		tombstone_candidate = calloc(1, sizeof(*tombstone_candidate));
 		if (!candidate || !tombstone_candidate) {
@@ -3664,9 +3634,9 @@ void perf_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 	invalidate_entry(parent, name);
 	invalidate_attr(entry.ino);
 	invalidate_xattr(entry.ino, PERF_CAPABILITY_XATTR, true);
-	if (native_passthrough_enabled())
-		attach_native_passthrough(req, entry.ino, fd, fi, candidate,
-					  tombstone_candidate);
+	if (wbcache_passthrough_enabled())
+		attach_wbcache_passthrough(req, entry.ino, fd, fi, candidate,
+					   tombstone_candidate);
 	cache_mutation_end(&mutation);
 	if (existing_fd >= 0)
 		close(existing_fd);
@@ -3942,7 +3912,7 @@ void perf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 		return;
 	}
 
-	if (native_passthrough_enabled()) {
+	if (wbcache_passthrough_enabled()) {
 		candidate = calloc(1, sizeof(*candidate));
 		tombstone_candidate = calloc(1, sizeof(*tombstone_candidate));
 		if (!candidate || !tombstone_candidate) {
@@ -3992,9 +3962,9 @@ void perf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 		pthread_mutex_unlock(xattr_lock);
 	}
 
-	if (native_passthrough_enabled())
-		attach_native_passthrough(req, ino, (int)fi->fh, fi, candidate,
-					  tombstone_candidate);
+	if (wbcache_passthrough_enabled())
+		attach_wbcache_passthrough(req, ino, (int)fi->fh, fi, candidate,
+					   tombstone_candidate);
 	cache_inode_attr_before_reply(req, ino, NULL);
 	fuse_reply_open(req, fi);
 }
@@ -4020,7 +3990,7 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 	bool released;
 
 	callback_increment(&perf_state.counters.release);
-	if (!native_passthrough_enabled()) {
+	if (!wbcache_passthrough_enabled()) {
 		lo_release(req, ino, fi);
 		return;
 	}
@@ -4029,9 +3999,9 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 	barrier = attr_release_barrier_enabled();
 	handle_may_modify = file_may_modify(fi->flags);
 	if (barrier &&
-	    !classify_native_passthrough_release(ino, handle_may_modify,
-					    &may_modify,
-					    &registration_refresh)) {
+	    !classify_wbcache_passthrough_release(ino, handle_may_modify,
+					     &may_modify,
+					     &registration_refresh)) {
 		/* Fatal state loss must not leave an exact-token row serviceable. */
 		invalidate_attr(ino);
 		invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
@@ -4041,7 +4011,7 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 		return;
 	}
 	if (barrier && !may_modify) {
-		released = release_native_passthrough(req, ino);
+		released = release_wbcache_passthrough(req, ino);
 		close(fi->fh);
 		if (released)
 			counter_increment(&perf_state.counters
@@ -4073,7 +4043,7 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 	if (!barrier)
 		invalidate_attr(ino);
 	invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
-	released = release_native_passthrough(req, ino);
+	released = release_wbcache_passthrough(req, ino);
 	close(fi->fh);
 	if (!barrier)
 		invalidate_attr(ino);
@@ -5237,22 +5207,9 @@ int main(int argc, char **argv)
 	if (perf_state.profile == PERF_PROFILE_GATE) {
 		option_length = snprintf(
 			options, sizeof(options),
-			"source=%s,cache=auto,timeout=0,xattr,%sno_writeback,"
+			"source=%s,cache=auto,timeout=0,xattr,no_writeback,"
 			"max_write=131072,splice_read,splice_write,"
 			"splice_move,fsname=extfuse-perf-%s-%s%s",
-			source,
-			native_passthrough_enabled() ?
-				"default_permissions," : "",
-			perf_state.mode_name, perf_state.transport,
-			uring_options);
-	} else if (perf_state.profile == PERF_PROFILE_ZERO_TTL &&
-	    native_passthrough_enabled()) {
-		option_length = snprintf(
-			options, sizeof(options),
-			"source=%s,cache=never,timeout=0,xattr,"
-			"default_permissions,no_writeback,max_write=131072,"
-			"splice_read,splice_write,splice_move,"
-			"fsname=extfuse-perf-%s-%s%s",
 			source, perf_state.mode_name, perf_state.transport,
 			uring_options);
 	} else if (perf_state.profile == PERF_PROFILE_ZERO_TTL) {
@@ -5260,15 +5217,6 @@ int main(int argc, char **argv)
 			options, sizeof(options),
 			"source=%s,cache=never,timeout=0,xattr,"
 			"no_writeback,max_write=131072,splice_read,"
-			"splice_write,splice_move,fsname=extfuse-perf-%s-%s%s",
-			source, perf_state.mode_name, perf_state.transport,
-			uring_options);
-	} else if (native_passthrough_enabled()) {
-		option_length = snprintf(
-			options, sizeof(options),
-			"source=%s,cache=auto,timeout=1.0,xattr,allow_other,"
-			"default_permissions,no_writeback,max_write=131072,"
-			"splice_read,"
 			"splice_write,splice_move,fsname=extfuse-perf-%s-%s%s",
 			source, perf_state.mode_name, perf_state.transport,
 			uring_options);
@@ -5306,12 +5254,13 @@ int main(int argc, char **argv)
 
 	fprintf(stderr,
 		"START mode=%s transport=%s profile=%s source=%s "
-		"mountpoint=%s debug=%u callback_counting=%u native_passthrough=%u "
+		PERF_START_MOUNT_FMT
+		PERF_START_WBCACHE_FMT
 		"xattr_lock_buckets=%u passthrough_extra_args=%zu "
 		"mount_options=%s\n",
 		perf_state.mode_name, perf_state.transport, argv[3],
 		source, mountpoint, debug_enabled, perf_state.count_callbacks,
-		native_passthrough_enabled(), PERF_XATTR_LOCK_BUCKETS,
+		wbcache_passthrough_enabled(), PERF_XATTR_LOCK_BUCKETS,
 		extra_argc, options);
 	for (i = 0; i < extra_argc; i++)
 		fprintf(stderr, "PASSTHROUGH_ARG index=%zu value=%s\n", i,

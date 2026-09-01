@@ -773,10 +773,11 @@ static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
 }
 
 /*
- * The kernel selects a queue from task_cpu(current). Binding that queue's
- * userspace thread to the same CPU makes synchronous request issuers and their
- * handlers time-share one CPU. Keep the queue on the same NUMA node when
- * possible, but use a different CPU allowed by the daemon's affinity mask.
+ * The kernel selects a synchronous request queue from task_cpu(current).
+ * Binding that queue's userspace thread to the same CPU makes the request
+ * issuer and handler time-share one CPU. Background requests may be balanced
+ * independently. Keep each queue on the same NUMA node when possible, but use
+ * a different CPU allowed by the daemon's affinity mask.
  */
 static void fuse_uring_set_thread_cpu(struct fuse_ring_queue *queue)
 {

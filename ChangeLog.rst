@@ -1,7 +1,7 @@
 Unreleased
 ==========
 
-* Add FUSE protocol 7.46 ExtFUSE coherence V3 negotiation.
+* Add FUSE protocol 7.46 ExtFUSE coherence epochs negotiation.
 * Add optional exact-metadata WRITE/COPY_FILE_RANGE replies and
   ``fuse_lowlevel_notify_inval_xattr()``.
 

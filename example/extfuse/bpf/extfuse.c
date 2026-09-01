@@ -3,7 +3,7 @@
 #include <bpf/bpf_helpers.h>
 
 #include <extfuse.h>
-#include <extfuse_v3_cache.h>
+#include <extfuse_epoch_cache.h>
 
 #include "lookup.h"
 #include "attr.h"
@@ -109,37 +109,37 @@ struct {
 	__type(value, __u32);
 } policy_map SEC(".maps");
 
-/* V3 maps are tokenized exclusively by kernel-owned coherence state. */
+/* Epoch-coherent maps use only kernel-owned coherence tokens. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, EXTFUSE_METADATA_MAX_ENTRIES);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__type(key, struct extfuse_v3_entry_key);
-	__type(value, struct extfuse_v3_entry_value);
-} entry_v3_map SEC(".maps");
+	__type(key, struct extfuse_epoch_entry_key);
+	__type(value, struct extfuse_epoch_entry_value);
+} epoch_entry_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, EXTFUSE_METADATA_MAX_ENTRIES);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, __u64);
-	__type(value, struct extfuse_v3_attr_value);
-} attr_v3_map SEC(".maps");
+	__type(value, struct extfuse_epoch_attr_value);
+} epoch_attr_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, EXTFUSE_V3_XATTR_MAX_ENTRIES);
-	__type(key, struct extfuse_v3_xattr_key);
-	__type(value, struct extfuse_v3_xattr_value);
-} xattr_v3_map SEC(".maps");
+	__uint(max_entries, EXTFUSE_EPOCH_XATTR_MAX_ENTRIES);
+	__type(key, struct extfuse_epoch_xattr_key);
+	__type(value, struct extfuse_epoch_xattr_value);
+} epoch_xattr_map SEC(".maps");
 
 /* Keep the credential-sized xattr key and bounded reply off one BPF stack. */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
-	__type(value, struct extfuse_v3_scratch);
-} v3_scratch_map SEC(".maps");
+	__type(value, struct extfuse_epoch_scratch);
+} epoch_scratch_map SEC(".maps");
 
 /* BPF_MAP_TYPE_PROG_ARRAY must ALWAYS be the last one */
 struct {
@@ -167,7 +167,7 @@ int SEC("extfuse") fuse_xdp_main_handler(void *ctx)
 			EXTFUSE_COHERENCE_PHASE_POST_DAEMON)
 			return UPCALL;
 
-		/* Only audited V3 metadata handlers inspect the shared context. */
+		/* Only audited epoch handlers inspect the shared context. */
 		if (opcode != FUSE_LOOKUP && opcode != FUSE_GETATTR &&
 		    opcode != FUSE_GETXATTR && opcode != FUSE_WRITE &&
 		    opcode != FUSE_COPY_FILE_RANGE &&
@@ -187,7 +187,7 @@ int SEC("extfuse") fuse_xdp_main_handler(void *ctx)
 	return UPCALL;
 }
 
-struct v3_target_snapshot {
+struct epoch_target_snapshot {
 	__u64 incarnation;
 	__u64 attr_epoch;
 	__u64 xattr_epoch;
@@ -200,7 +200,7 @@ struct v3_target_snapshot {
  * particular, do not return a pointer into coherence.targets: clang turns
  * that into a modified context pointer which the BPF verifier must reject.
  */
-#define V3_TARGET_MATCHES(_args, _index, _nodeid, _dependencies) \
+#define EPOCH_TARGET_MATCHES(_args, _index, _nodeid, _dependencies) \
 	((_index) < (_args)->coherence.target_count && \
 	 (_args)->coherence.targets[_index].nodeid == (_nodeid) && \
 	 (_args)->coherence.targets[_index].incarnation && \
@@ -208,7 +208,7 @@ struct v3_target_snapshot {
 	  (_dependencies)) && \
 	 !((_args)->coherence.targets[_index].active & (_dependencies)))
 
-#define V3_SNAPSHOT_TARGET(_args, _snapshot, _index) \
+#define EPOCH_SNAPSHOT_TARGET(_args, _snapshot, _index) \
 	do { \
 		(_snapshot)->incarnation = \
 			(_args)->coherence.targets[_index].incarnation; \
@@ -223,52 +223,52 @@ struct v3_target_snapshot {
 	} while (0)
 
 static __attribute__((noinline)) int
-v3_read_target_0(struct extfuse_req *args,
-		 struct v3_target_snapshot *snapshot, __u64 nodeid,
+epoch_read_target_0(struct extfuse_req *args,
+		 struct epoch_target_snapshot *snapshot, __u64 nodeid,
 		 __u32 dependencies)
 {
-	if (!V3_TARGET_MATCHES(args, 0, nodeid, dependencies))
+	if (!EPOCH_TARGET_MATCHES(args, 0, nodeid, dependencies))
 		return 0;
-	V3_SNAPSHOT_TARGET(args, snapshot, 0);
+	EPOCH_SNAPSHOT_TARGET(args, snapshot, 0);
 	return 1;
 }
 
 static __attribute__((noinline)) int
-v3_read_target_1(struct extfuse_req *args,
-		 struct v3_target_snapshot *snapshot, __u64 nodeid,
+epoch_read_target_1(struct extfuse_req *args,
+		 struct epoch_target_snapshot *snapshot, __u64 nodeid,
 		 __u32 dependencies)
 {
-	if (!V3_TARGET_MATCHES(args, 1, nodeid, dependencies))
+	if (!EPOCH_TARGET_MATCHES(args, 1, nodeid, dependencies))
 		return 0;
-	V3_SNAPSHOT_TARGET(args, snapshot, 1);
+	EPOCH_SNAPSHOT_TARGET(args, snapshot, 1);
 	return 1;
 }
 
 static __attribute__((noinline)) int
-v3_read_target_2(struct extfuse_req *args,
-		 struct v3_target_snapshot *snapshot, __u64 nodeid,
+epoch_read_target_2(struct extfuse_req *args,
+		 struct epoch_target_snapshot *snapshot, __u64 nodeid,
 		 __u32 dependencies)
 {
-	if (!V3_TARGET_MATCHES(args, 2, nodeid, dependencies))
+	if (!EPOCH_TARGET_MATCHES(args, 2, nodeid, dependencies))
 		return 0;
-	V3_SNAPSHOT_TARGET(args, snapshot, 2);
+	EPOCH_SNAPSHOT_TARGET(args, snapshot, 2);
 	return 1;
 }
 
 static __attribute__((noinline)) int
-v3_read_target_3(struct extfuse_req *args,
-		 struct v3_target_snapshot *snapshot, __u64 nodeid,
+epoch_read_target_3(struct extfuse_req *args,
+		 struct epoch_target_snapshot *snapshot, __u64 nodeid,
 		 __u32 dependencies)
 {
-	if (!V3_TARGET_MATCHES(args, 3, nodeid, dependencies))
+	if (!EPOCH_TARGET_MATCHES(args, 3, nodeid, dependencies))
 		return 0;
-	V3_SNAPSHOT_TARGET(args, snapshot, 3);
+	EPOCH_SNAPSHOT_TARGET(args, snapshot, 3);
 	return 1;
 }
 
-static int v3_find_target(struct extfuse_req *args, __u64 nodeid,
+static int epoch_find_target(struct extfuse_req *args, __u64 nodeid,
 			  __u32 dependencies, int post_daemon,
-			  struct v3_target_snapshot *snapshot)
+			  struct epoch_target_snapshot *snapshot)
 {
 	if (!nodeid || !dependencies ||
 	    args->coherence.version != EXTFUSE_COHERENCE_VERSION ||
@@ -280,13 +280,13 @@ static int v3_find_target(struct extfuse_req *args, __u64 nodeid,
 		dependencies))
 		return 0;
 
-	return v3_read_target_0(args, snapshot, nodeid, dependencies) ||
-		v3_read_target_1(args, snapshot, nodeid, dependencies) ||
-		v3_read_target_2(args, snapshot, nodeid, dependencies) ||
-		v3_read_target_3(args, snapshot, nodeid, dependencies);
+	return epoch_read_target_0(args, snapshot, nodeid, dependencies) ||
+		epoch_read_target_1(args, snapshot, nodeid, dependencies) ||
+		epoch_read_target_2(args, snapshot, nodeid, dependencies) ||
+		epoch_read_target_3(args, snapshot, nodeid, dependencies);
 }
 
-static int v3_post_daemon(const struct extfuse_req *args)
+static int epoch_post_daemon(const struct extfuse_req *args)
 {
 	return args->coherence.phase ==
 		EXTFUSE_COHERENCE_PHASE_POST_DAEMON;
@@ -433,8 +433,8 @@ static int native_stable_negative_capability(const xattr_key_t *key,
 				 sizeof("security.capability"));
 }
 
-static int v3_gen_xattr_key(void *ctx, struct extfuse_req *args,
-			    struct extfuse_v3_xattr_key *key)
+static int epoch_gen_xattr_key(void *ctx, struct extfuse_req *args,
+			    struct extfuse_epoch_xattr_key *key)
 {
 	memset(key, 0, sizeof(*key));
 	key->nodeid = args->in.h.nodeid;
@@ -445,17 +445,17 @@ static int v3_gen_xattr_key(void *ctx, struct extfuse_req *args,
 				      sizeof(key->name));
 }
 
-static int v3_capability_key(const struct extfuse_v3_xattr_key *key)
+static int epoch_capability_key(const struct extfuse_epoch_xattr_key *key)
 {
 	return !__builtin_memcmp(key->name, "security.capability",
 				sizeof("security.capability"));
 }
 
-static __u32 v3_xattr_dependencies(
-	const struct extfuse_v3_xattr_key *key,
-	const struct extfuse_v3_xattr_value *value)
+static __u32 epoch_xattr_dependencies(
+	const struct extfuse_epoch_xattr_key *key,
+	const struct extfuse_epoch_xattr_value *value)
 {
-	if (v3_capability_key(key) && value->error == ENODATA && !value->size)
+	if (epoch_capability_key(key) && value->error == ENODATA && !value->size)
 		return EXTFUSE_COHERENCE_DOMAIN_XATTR;
 	if (!value->error || (value->error == ENODATA && !value->size))
 		return EXTFUSE_COHERENCE_DOMAIN_XATTR |
@@ -463,9 +463,9 @@ static __u32 v3_xattr_dependencies(
 	return 0;
 }
 
-static int v3_xattr_tokens_current(
-	const struct v3_target_snapshot *target,
-	const struct extfuse_v3_xattr_value *value, __u32 dependencies)
+static int epoch_xattr_tokens_current(
+	const struct epoch_target_snapshot *target,
+	const struct extfuse_epoch_xattr_value *value, __u32 dependencies)
 {
 	if (value->incarnation != target->incarnation ||
 	    value->xattr_epoch != target->xattr_epoch)
@@ -476,18 +476,18 @@ static int v3_xattr_tokens_current(
 	return 1;
 }
 
-static int v3_lookup(void *ctx, struct extfuse_req *args)
+static int epoch_lookup(void *ctx, struct extfuse_req *args)
 {
-	struct extfuse_v3_entry_key *key;
-	struct extfuse_v3_entry_value *value;
-	struct v3_target_snapshot target;
-	struct extfuse_v3_scratch *scratch;
+	struct extfuse_epoch_entry_key *key;
+	struct extfuse_epoch_entry_value *value;
+	struct epoch_target_snapshot target;
+	struct extfuse_epoch_scratch *scratch;
 	__u32 scratch_key = 0;
 	int ret;
 
-	scratch = bpf_map_lookup_elem(&v3_scratch_map, &scratch_key);
+	scratch = bpf_map_lookup_elem(&epoch_scratch_map, &scratch_key);
 	if (!scratch)
-		return v3_post_daemon(args) ? RETURN : UPCALL;
+		return epoch_post_daemon(args) ? RETURN : UPCALL;
 	key = &scratch->key.entry;
 	value = &scratch->value.entry;
 	memset(key, 0, sizeof(*key));
@@ -499,27 +499,27 @@ static int v3_lookup(void *ctx, struct extfuse_req *args)
 	ret = bpf_extfuse_read_args(ctx, IN_PARAM_0_VALUE, key->name,
 				     sizeof(key->name));
 	if (ret < 0)
-		return v3_post_daemon(args) ? RETURN : UPCALL;
-	if (v3_post_daemon(args) && args->coherence.daemon_error) {
-		bpf_map_delete_elem(&entry_v3_map, key);
+		return epoch_post_daemon(args) ? RETURN : UPCALL;
+	if (epoch_post_daemon(args) && args->coherence.daemon_error) {
+		bpf_map_delete_elem(&epoch_entry_map, key);
 		return RETURN;
 	}
-	if (!v3_find_target(args, key->parent,
+	if (!epoch_find_target(args, key->parent,
 			    EXTFUSE_COHERENCE_DOMAIN_NAMESPACE,
-			    v3_post_daemon(args), &target)) {
-		if (v3_post_daemon(args))
-			bpf_map_delete_elem(&entry_v3_map, key);
-		return v3_post_daemon(args) ? RETURN : UPCALL;
+			    epoch_post_daemon(args), &target)) {
+		if (epoch_post_daemon(args))
+			bpf_map_delete_elem(&epoch_entry_map, key);
+		return epoch_post_daemon(args) ? RETURN : UPCALL;
 	}
 
-	if (v3_post_daemon(args)) {
+	if (epoch_post_daemon(args)) {
 		if (bpf_extfuse_read_args(ctx, OUT_PARAM_0, &value->out,
 					   sizeof(value->out)) < 0) {
-			bpf_map_delete_elem(&entry_v3_map, key);
+			bpf_map_delete_elem(&epoch_entry_map, key);
 			return RETURN;
 		}
 		/*
-		 * A positive LOOKUP embeds child attributes, but the V3 PRE
+		 * A positive LOOKUP embeds child attributes, but the epoch-coherent PRE
 		 * context can validate only the parent namespace token before the
 		 * cached child nodeid is known.  Child WRITE/SETATTR can therefore
 		 * make a positive row stale without changing the parent token.
@@ -527,24 +527,24 @@ static int v3_lookup(void *ctx, struct extfuse_req *args)
 		 * separately validated child ATTR dependency.
 		 */
 		if (value->out.nodeid) {
-			bpf_map_delete_elem(&entry_v3_map, key);
+			bpf_map_delete_elem(&epoch_entry_map, key);
 			return RETURN;
 		}
 		value->incarnation = target.incarnation;
 		value->namespace_epoch = target.namespace_epoch;
 		value->nlookup = 0;
-		if (bpf_map_update_elem(&entry_v3_map, key, value, BPF_ANY))
-			bpf_map_delete_elem(&entry_v3_map, key);
+		if (bpf_map_update_elem(&epoch_entry_map, key, value, BPF_ANY))
+			bpf_map_delete_elem(&epoch_entry_map, key);
 		return RETURN;
 	}
 
-	value = bpf_map_lookup_elem(&entry_v3_map, key);
+	value = bpf_map_lookup_elem(&epoch_entry_map, key);
 	if (!value || value->incarnation != target.incarnation ||
 	    value->namespace_epoch != target.namespace_epoch)
 		return UPCALL;
-	/* Reject and purge positive rows left by an older V3 object. */
+	/* Reject and purge positive rows left by an older epoch-coherent object. */
 	if (value->out.nodeid) {
-		bpf_map_delete_elem(&entry_v3_map, key);
+		bpf_map_delete_elem(&epoch_entry_map, key);
 		return UPCALL;
 	}
 	ret = bpf_extfuse_write_args(ctx, OUT_PARAM_0, &value->out,
@@ -560,7 +560,7 @@ HANDLER(FUSE_LOOKUP, 1)(void *ctx)
 	int ret = UPCALL;
 
 	if (args->coherence.version == EXTFUSE_COHERENCE_VERSION)
-		return v3_lookup(ctx, args);
+		return epoch_lookup(ctx, args);
 
 #ifdef DEBUGNOW
 	__u64 nid = args->in.h.nodeid;
@@ -638,47 +638,47 @@ HANDLER(FUSE_GETATTR, 3)(void *ctx)
 {
 	struct extfuse_req *args = (struct extfuse_req *)ctx;
 	lookup_attr_key_t key = {0};
-	struct v3_target_snapshot target;
+	struct epoch_target_snapshot target;
 	int ret = gen_attr_key(ctx, IN_PARAM_0_VALUE, "GETATTR", &key);
 	if (ret < 0)
 		return UPCALL;
 
 	if (args->coherence.version == EXTFUSE_COHERENCE_VERSION) {
-		struct extfuse_v3_attr_value replacement = {};
-		struct extfuse_v3_attr_value *cached;
+		struct extfuse_epoch_attr_value replacement = {};
+		struct extfuse_epoch_attr_value *cached;
 
 		if (has_passthrough_mmap_marker(key.nodeid)) {
-			if (v3_post_daemon(args))
-				bpf_map_delete_elem(&attr_v3_map, &key.nodeid);
-			return v3_post_daemon(args) ? RETURN : UPCALL;
+			if (epoch_post_daemon(args))
+				bpf_map_delete_elem(&epoch_attr_map, &key.nodeid);
+			return epoch_post_daemon(args) ? RETURN : UPCALL;
 		}
-		if (v3_post_daemon(args) && args->coherence.daemon_error) {
-			bpf_map_delete_elem(&attr_v3_map, &key.nodeid);
+		if (epoch_post_daemon(args) && args->coherence.daemon_error) {
+			bpf_map_delete_elem(&epoch_attr_map, &key.nodeid);
 			return RETURN;
 		}
-		if (!v3_find_target(args, key.nodeid,
+		if (!epoch_find_target(args, key.nodeid,
 				    EXTFUSE_COHERENCE_DOMAIN_ATTR,
-				    v3_post_daemon(args), &target)) {
-			if (v3_post_daemon(args))
-				bpf_map_delete_elem(&attr_v3_map, &key.nodeid);
-			return v3_post_daemon(args) ? RETURN : UPCALL;
+				    epoch_post_daemon(args), &target)) {
+			if (epoch_post_daemon(args))
+				bpf_map_delete_elem(&epoch_attr_map, &key.nodeid);
+			return epoch_post_daemon(args) ? RETURN : UPCALL;
 		}
-		if (v3_post_daemon(args)) {
+		if (epoch_post_daemon(args)) {
 			replacement.incarnation = target.incarnation;
 			replacement.attr_epoch = target.attr_epoch;
 			if (bpf_extfuse_read_args(
 				    ctx, OUT_PARAM_0, &replacement.out,
 				    sizeof(replacement.out)) < 0) {
-				bpf_map_delete_elem(&attr_v3_map, &key.nodeid);
+				bpf_map_delete_elem(&epoch_attr_map, &key.nodeid);
 				return RETURN;
 			}
-			if (bpf_map_update_elem(&attr_v3_map, &key.nodeid,
+			if (bpf_map_update_elem(&epoch_attr_map, &key.nodeid,
 						&replacement, BPF_ANY))
-				bpf_map_delete_elem(&attr_v3_map, &key.nodeid);
+				bpf_map_delete_elem(&epoch_attr_map, &key.nodeid);
 			return RETURN;
 		}
 
-		cached = bpf_map_lookup_elem(&attr_v3_map, &key.nodeid);
+		cached = bpf_map_lookup_elem(&epoch_attr_map, &key.nodeid);
 		if (!cached || cached->incarnation != target.incarnation ||
 		    cached->attr_epoch != target.attr_epoch)
 			return UPCALL;
@@ -725,8 +725,9 @@ HANDLER(FUSE_GETATTR, 3)(void *ctx)
 
 /*
  * Native passthrough bypasses the ordinary FUSE READ/WRITE request path.
- * The kernel invokes these private handlers before and after the lower I/O so
- * a racing daemon refresh cannot overwrite the final stale transition.
+ * Epoch coherence invokes one private policy hook before lower I/O and closes
+ * the matching epoch in the kernel. Legacy coherence retains the explicit
+ * BEGIN/END map transition implemented below.
  */
 static int mark_passthrough_attr_stale(void *ctx, __u32 mask)
 {
@@ -849,7 +850,7 @@ static int passthrough_notification(void *ctx, __u32 mask, int write,
 
 HANDLER(EXTFUSE_PASSTHROUGH_READ, 65)(void *ctx)
 {
-	if (policy_enabled(EXTFUSE_POLICY_COHERENCE_V3)) {
+	if (policy_enabled(EXTFUSE_POLICY_COHERENCE_EPOCHS)) {
 		__u64 nodeid = 0;
 
 		if (policy_enabled(EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA))
@@ -857,7 +858,7 @@ HANDLER(EXTFUSE_PASSTHROUGH_READ, 65)(void *ctx)
 		if (bpf_extfuse_read_args(
 			    ctx, NODEID, &nodeid, sizeof(nodeid)) < 0)
 			return -EIO;
-		bpf_map_delete_elem(&attr_v3_map, &nodeid);
+		bpf_map_delete_elem(&epoch_attr_map, &nodeid);
 		return RETURN;
 	}
 	/*
@@ -872,7 +873,7 @@ HANDLER(EXTFUSE_PASSTHROUGH_READ, 65)(void *ctx)
 
 HANDLER(EXTFUSE_PASSTHROUGH_WRITE, 66)(void *ctx)
 {
-	if (policy_enabled(EXTFUSE_POLICY_COHERENCE_V3))
+	if (policy_enabled(EXTFUSE_POLICY_COHERENCE_EPOCHS))
 		return RETURN;
 	return passthrough_notification(
 		ctx, FATTR_ATIME | FATTR_SIZE | FATTR_MTIME | FATTR_CTIME,
@@ -890,7 +891,7 @@ HANDLER(EXTFUSE_PASSTHROUGH_MMAP, 67)(void *ctx)
 	if (in.reserved || in.phase != EXTFUSE_PASSTHROUGH_PHASE_BEGIN)
 		return -EINVAL;
 	/* The gate profile never enables this paper-comparison relaxation. */
-	if (!policy_enabled(EXTFUSE_POLICY_COHERENCE_V3) &&
+	if (!policy_enabled(EXTFUSE_POLICY_COHERENCE_EPOCHS) &&
 	    policy_enabled(EXTFUSE_POLICY_RELAX_NATIVE_MMAP_METADATA))
 		return RETURN;
 	if (bpf_extfuse_read_args(ctx, NODEID, &nodeid, sizeof(nodeid)) < 0)
@@ -1054,25 +1055,25 @@ HANDLER(FUSE_READ, 15)(void *ctx)
 #endif
 }
 
-static int v3_publish_mutation_attrs(void *ctx)
+static int epoch_publish_mutation_attrs(void *ctx)
 {
 	struct extfuse_req *args = (struct extfuse_req *)ctx;
-	struct extfuse_v3_scratch *scratch;
-	struct extfuse_v3_mutation_payload *payload;
+	struct extfuse_epoch_scratch *scratch;
+	struct extfuse_epoch_mutation_payload *payload;
 	__u32 scratch_key = 0;
 	__u32 actual;
 	__u32 expected;
 	int index;
 
-	if (!v3_post_daemon(args))
+	if (!epoch_post_daemon(args))
 		return UPCALL;
 	if (args->coherence.daemon_error || args->out.numargs < 2)
 		return RETURN;
 	actual = args->out.args[1].size;
 	if (actual < sizeof(struct fuse_mutation_out) ||
-	    actual > sizeof(struct extfuse_v3_mutation_payload))
+	    actual > sizeof(struct extfuse_epoch_mutation_payload))
 		return RETURN;
-	scratch = bpf_map_lookup_elem(&v3_scratch_map, &scratch_key);
+	scratch = bpf_map_lookup_elem(&epoch_scratch_map, &scratch_key);
 	if (!scratch)
 		return RETURN;
 	payload = &scratch->value.mutation;
@@ -1092,8 +1093,8 @@ static int v3_publish_mutation_attrs(void *ctx)
 
 #pragma unroll
 	for (index = 0; index < FUSE_MUTATION_MAX_NODES; index++) {
-		struct extfuse_v3_attr_value replacement = {};
-		struct v3_target_snapshot target;
+		struct extfuse_epoch_attr_value replacement = {};
+		struct epoch_target_snapshot target;
 		struct fuse_mutation_node_out *node;
 		__u32 xattr_flags = FUSE_MUTATION_NODE_XATTR_UNCHANGED |
 			FUSE_MUTATION_NODE_XATTR_CHANGED;
@@ -1107,16 +1108,16 @@ static int v3_publish_mutation_attrs(void *ctx)
 		    (node->flags & xattr_flags) == xattr_flags ||
 		    !(node->flags & FUSE_MUTATION_NODE_ATTR_VALID))
 			continue;
-		if (!v3_find_target(args, node->nodeid,
+		if (!epoch_find_target(args, node->nodeid,
 				    EXTFUSE_COHERENCE_DOMAIN_ATTR, 1, &target) ||
 		    has_passthrough_mmap_marker(node->nodeid)) {
-			bpf_map_delete_elem(&attr_v3_map, &node->nodeid);
+			bpf_map_delete_elem(&epoch_attr_map, &node->nodeid);
 			continue;
 		}
 		replacement.incarnation = target.incarnation;
 		replacement.attr_epoch = target.attr_epoch;
 		replacement.out = node->attr;
-		bpf_map_update_elem(&attr_v3_map, &node->nodeid,
+		bpf_map_update_elem(&epoch_attr_map, &node->nodeid,
 				    &replacement, BPF_ANY);
 	}
 	return RETURN;
@@ -1128,7 +1129,7 @@ HANDLER(FUSE_WRITE, 16)(void *ctx)
 	lookup_attr_key_t key = {0};
 
 	if (args->coherence.version == EXTFUSE_COHERENCE_VERSION)
-		return v3_publish_mutation_attrs(ctx);
+		return epoch_publish_mutation_attrs(ctx);
 
 	int ret = gen_attr_key(ctx, IN_PARAM_0_VALUE, "WRITE", &key);
 	if (ret < 0)
@@ -1160,12 +1161,12 @@ HANDLER(FUSE_WRITE, 16)(void *ctx)
 
 HANDLER(FUSE_COPY_FILE_RANGE, 47)(void *ctx)
 {
-	return v3_publish_mutation_attrs(ctx);
+	return epoch_publish_mutation_attrs(ctx);
 }
 
 HANDLER(FUSE_COPY_FILE_RANGE_64, 53)(void *ctx)
 {
-	return v3_publish_mutation_attrs(ctx);
+	return epoch_publish_mutation_attrs(ctx);
 }
 
 HANDLER(FUSE_SETATTR, 4)(void *ctx)
@@ -1187,10 +1188,10 @@ HANDLER(FUSE_GETXATTR, 22)(void *ctx)
 	struct extfuse_req *args = (struct extfuse_req *)ctx;
 
 	if (args->coherence.version == EXTFUSE_COHERENCE_VERSION) {
-		struct extfuse_v3_xattr_key *key;
-		struct extfuse_v3_xattr_value *value;
-		struct v3_target_snapshot target;
-		struct extfuse_v3_scratch *scratch;
+		struct extfuse_epoch_xattr_key *key;
+		struct extfuse_epoch_xattr_value *value;
+		struct epoch_target_snapshot target;
+		struct extfuse_epoch_scratch *scratch;
 		struct fuse_getxattr_in in = {};
 		struct fuse_getxattr_out out = {};
 		__u32 dependencies;
@@ -1198,30 +1199,30 @@ HANDLER(FUSE_GETXATTR, 22)(void *ctx)
 		__u32 actual;
 		__s64 ret;
 
-		scratch = bpf_map_lookup_elem(&v3_scratch_map, &scratch_key);
+		scratch = bpf_map_lookup_elem(&epoch_scratch_map, &scratch_key);
 		if (!scratch)
-			return v3_post_daemon(args) ? RETURN : UPCALL;
+			return epoch_post_daemon(args) ? RETURN : UPCALL;
 		key = &scratch->key.xattr;
-		if (v3_gen_xattr_key(ctx, args, key) < 0 ||
+		if (epoch_gen_xattr_key(ctx, args, key) < 0 ||
 		    bpf_extfuse_read_args(ctx, IN_PARAM_0_VALUE, &in,
 					   sizeof(in)) < 0)
-			return v3_post_daemon(args) ? RETURN : UPCALL;
+			return epoch_post_daemon(args) ? RETURN : UPCALL;
 		if (has_passthrough_mmap_marker(key->nodeid)) {
-			if (v3_post_daemon(args))
-				bpf_map_delete_elem(&xattr_v3_map, key);
-			return v3_post_daemon(args) ? RETURN : UPCALL;
+			if (epoch_post_daemon(args))
+				bpf_map_delete_elem(&epoch_xattr_map, key);
+			return epoch_post_daemon(args) ? RETURN : UPCALL;
 		}
 
-		if (v3_post_daemon(args)) {
+		if (epoch_post_daemon(args)) {
 			/* Errors other than an exact size-query ENODATA are not cached. */
 			if (args->coherence.daemon_error) {
 				if ((args->coherence.daemon_error != ENODATA &&
 				     args->coherence.daemon_error != -ENODATA) ||
 				    in.size) {
-					bpf_map_delete_elem(&xattr_v3_map, key);
+					bpf_map_delete_elem(&epoch_xattr_map, key);
 					return RETURN;
 				}
-				dependencies = v3_capability_key(key) ?
+				dependencies = epoch_capability_key(key) ?
 					EXTFUSE_COHERENCE_DOMAIN_XATTR :
 					EXTFUSE_COHERENCE_DOMAIN_XATTR |
 					EXTFUSE_COHERENCE_DOMAIN_DATA;
@@ -1230,9 +1231,9 @@ HANDLER(FUSE_GETXATTR, 22)(void *ctx)
 					       EXTFUSE_COHERENCE_DOMAIN_DATA;
 			}
 
-			if (!v3_find_target(args, key->nodeid, dependencies, 1,
+			if (!epoch_find_target(args, key->nodeid, dependencies, 1,
 					    &target)) {
-				bpf_map_delete_elem(&xattr_v3_map, key);
+				bpf_map_delete_elem(&epoch_xattr_map, key);
 				return RETURN;
 			}
 			value = &scratch->value.xattr;
@@ -1246,48 +1247,48 @@ HANDLER(FUSE_GETXATTR, 22)(void *ctx)
 			} else if (!in.size) {
 				if (bpf_extfuse_read_args(ctx, OUT_PARAM_0, &out,
 							   sizeof(out)) < 0) {
-					bpf_map_delete_elem(&xattr_v3_map, key);
+					bpf_map_delete_elem(&epoch_xattr_map, key);
 					return RETURN;
 				}
-				if (out.size > EXTFUSE_V3_XATTR_VALUE_MAX) {
-					bpf_map_delete_elem(&xattr_v3_map, key);
+				if (out.size > EXTFUSE_EPOCH_XATTR_VALUE_MAX) {
+					bpf_map_delete_elem(&epoch_xattr_map, key);
 					return RETURN;
 				}
 				value->size = out.size;
 			} else {
 				actual = args->out.args[0].size;
-				if (actual > EXTFUSE_V3_XATTR_VALUE_MAX) {
-					bpf_map_delete_elem(&xattr_v3_map, key);
+				if (actual > EXTFUSE_EPOCH_XATTR_VALUE_MAX) {
+					bpf_map_delete_elem(&epoch_xattr_map, key);
 					return RETURN;
 				}
 				/* POST permits a bounded destination larger than actual. */
 				if (bpf_extfuse_read_args(
 					    ctx, OUT_PARAM_0, value->data,
-					    EXTFUSE_V3_XATTR_VALUE_MAX) < 0) {
-					bpf_map_delete_elem(&xattr_v3_map, key);
+					    EXTFUSE_EPOCH_XATTR_VALUE_MAX) < 0) {
+					bpf_map_delete_elem(&epoch_xattr_map, key);
 					return RETURN;
 				}
 				value->size = actual;
 				value->data_valid = 1;
 			}
-			if (bpf_map_update_elem(&xattr_v3_map, key, value, BPF_ANY))
-				bpf_map_delete_elem(&xattr_v3_map, key);
+			if (bpf_map_update_elem(&epoch_xattr_map, key, value, BPF_ANY))
+				bpf_map_delete_elem(&epoch_xattr_map, key);
 			return RETURN;
 		}
 
-		value = bpf_map_lookup_elem(&xattr_v3_map, key);
+		value = bpf_map_lookup_elem(&epoch_xattr_map, key);
 		if (!value)
 			return UPCALL;
-		dependencies = v3_xattr_dependencies(key, value);
+		dependencies = epoch_xattr_dependencies(key, value);
 		if (!dependencies || value->dependencies != dependencies ||
 		    (value->error == ENODATA && in.size))
 			return UPCALL;
-		if (!v3_find_target(args, key->nodeid, dependencies, 0, &target) ||
-		    !v3_xattr_tokens_current(&target, value, dependencies))
+		if (!epoch_find_target(args, key->nodeid, dependencies, 0, &target) ||
+		    !epoch_xattr_tokens_current(&target, value, dependencies))
 			return UPCALL;
 		if (value->error == ENODATA)
 			return -ENODATA;
-		if (value->error || value->size > EXTFUSE_V3_XATTR_VALUE_MAX)
+		if (value->error || value->size > EXTFUSE_EPOCH_XATTR_VALUE_MAX)
 			return UPCALL;
 		if (!in.size) {
 			out.size = value->size;

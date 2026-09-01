@@ -582,17 +582,19 @@ struct fuse_loop_config_v1 {
  * handle the private mmap marker notification. The driver rejects a mapping
  * if that marker cannot be installed, because later page faults cannot be
  * enclosed by a finite request BEGIN/END interval.
+ * Native passthrough READ/WRITE invokes one BPF policy hook before lower I/O;
+ * the driver closes the matching inode epoch without a second BPF callback.
  *
  * This capability requires FUSE_CAP_EXTFUSE. It is disabled by default.
  */
-#define FUSE_CAP_EXTFUSE_COHERENCE_V3 (1ULL << 39)
+#define FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS (1ULL << 39)
 
 /**
  * Indicates that successful mutation replies may carry exact final metadata
  * in a versioned trailer.
  *
- * This capability requires FUSE_CAP_EXTFUSE_COHERENCE_V3 and is disabled by
- * default. Use fuse_reply_write_attr() or
+ * This capability requires FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS and is disabled
+ * by default. Use fuse_reply_write_attr() or
  * fuse_reply_copy_file_range_attrs() to construct such replies.
  */
 #define FUSE_CAP_MUTATION_METADATA (1ULL << 40)
@@ -601,8 +603,8 @@ struct fuse_loop_config_v1 {
  * Indicates support for invalidating all cached extended attributes of an
  * inode with fuse_lowlevel_notify_inval_xattr().
  *
- * This capability requires FUSE_CAP_EXTFUSE_COHERENCE_V3 and is disabled by
- * default.
+ * This capability requires FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS and is disabled
+ * by default.
  */
 #define FUSE_CAP_NOTIFY_INVAL_XATTR (1ULL << 41)
 

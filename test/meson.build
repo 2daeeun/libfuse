@@ -28,12 +28,12 @@ td += executable('test_abi', 'test_abi.c',
 td += executable('test_extfuse_init', 'test_extfuse_init.c',
                  dependencies: [ libfuse_dep ],
                  install: false)
-extfuse_v3_test = executable(
-    'test_extfuse_v3', 'test_extfuse_v3.c',
+extfuse_coherence_epochs_test = executable(
+    'test_extfuse_coherence_epochs', 'test_extfuse_coherence_epochs.c',
     dependencies: [ libfuse_dep ],
     install: false)
-td += extfuse_v3_test
-test('ExtFUSE coherence V3', extfuse_v3_test)
+td += extfuse_coherence_epochs_test
+test('ExtFUSE coherence epochs', extfuse_coherence_epochs_test)
 native_request_counter_test = executable(
     'test_native_request_counter', 'test_native_request_counter.c',
     dependencies: [ libfuse_dep ],

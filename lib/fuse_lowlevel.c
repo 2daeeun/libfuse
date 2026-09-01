@@ -762,7 +762,7 @@ static int fuse_reply_mutation_attrs(
 	struct iovec iov[4];
 
 	if (req->se->conn.proto_minor < 46 ||
-	    !(req->se->conn.want_ext & FUSE_CAP_EXTFUSE_COHERENCE_V3) ||
+	    !(req->se->conn.want_ext & FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS) ||
 	    !(req->se->conn.want_ext & FUSE_CAP_MUTATION_METADATA) ||
 	    !fill_mutation_nodes(nodes, attrs, attr_count))
 		return fuse_reply_write(req, count);
@@ -2759,7 +2759,7 @@ static bool want_flag_dependencies_valid(uint64_t want)
 	const uint64_t attr_release_barrier_dependencies =
 		attr_refresh_dependencies |
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
-	const uint64_t coherence_v3_dependencies = FUSE_CAP_EXTFUSE;
+	const uint64_t coherence_epochs_dependencies = FUSE_CAP_EXTFUSE;
 
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE) &&
 	    (want & coherence_dependencies) != coherence_dependencies) {
@@ -2788,22 +2788,22 @@ static bool want_flag_dependencies_valid(uint64_t want)
 			 "attr release barrier");
 		return false;
 	}
-	if ((want & FUSE_CAP_EXTFUSE_COHERENCE_V3) &&
-	    (want & coherence_v3_dependencies) != coherence_v3_dependencies) {
+	if ((want & FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS) &&
+	    (want & coherence_epochs_dependencies) != coherence_epochs_dependencies) {
 		fuse_log(FUSE_LOG_ERR,
-			 "fuse: ExtFUSE coherence V3 requires ExtFUSE\n");
+			 "fuse: ExtFUSE coherence epochs requires ExtFUSE\n");
 		return false;
 	}
 	if ((want & FUSE_CAP_MUTATION_METADATA) &&
-	    !(want & FUSE_CAP_EXTFUSE_COHERENCE_V3)) {
+	    !(want & FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS)) {
 		fuse_log(FUSE_LOG_ERR,
-			 "fuse: mutation metadata requires ExtFUSE coherence V3\n");
+			 "fuse: mutation metadata requires ExtFUSE coherence epochs\n");
 		return false;
 	}
 	if ((want & FUSE_CAP_NOTIFY_INVAL_XATTR) &&
-	    !(want & FUSE_CAP_EXTFUSE_COHERENCE_V3)) {
+	    !(want & FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS)) {
 		fuse_log(FUSE_LOG_ERR,
-			 "fuse: xattr invalidation notification requires ExtFUSE coherence V3\n");
+			 "fuse: xattr invalidation notification requires ExtFUSE coherence epochs\n");
 		return false;
 	}
 	return true;
@@ -3020,8 +3020,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		    FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER)
 			se->conn.capable_ext |=
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
-		if (inargflags & FUSE_EXTFUSE_COHERENCE_V3)
-			se->conn.capable_ext |= FUSE_CAP_EXTFUSE_COHERENCE_V3;
+		if (inargflags & FUSE_EXTFUSE_COHERENCE_EPOCHS)
+			se->conn.capable_ext |= FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS;
 		if (inargflags & FUSE_MUTATION_METADATA)
 			se->conn.capable_ext |= FUSE_CAP_MUTATION_METADATA;
 		if (inargflags & FUSE_HAS_NOTIFY_INVAL_XATTR)
@@ -3198,8 +3198,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	if (se->conn.want_ext &
 	    FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER)
 		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
-	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_COHERENCE_V3)
-		outargflags |= FUSE_EXTFUSE_COHERENCE_V3;
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS)
+		outargflags |= FUSE_EXTFUSE_COHERENCE_EPOCHS;
 	if (se->conn.want_ext & FUSE_CAP_MUTATION_METADATA)
 		outargflags |= FUSE_MUTATION_METADATA;
 	if (se->conn.want_ext & FUSE_CAP_NOTIFY_INVAL_XATTR)
@@ -3427,7 +3427,7 @@ int fuse_lowlevel_notify_inval_xattr(struct fuse_session *se, fuse_ino_t ino)
 		return -EINVAL;
 
 	if (se->conn.proto_minor < 46 ||
-	    !(se->conn.want_ext & FUSE_CAP_EXTFUSE_COHERENCE_V3) ||
+	    !(se->conn.want_ext & FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS) ||
 	    !(se->conn.want_ext & FUSE_CAP_NOTIFY_INVAL_XATTR))
 		return -ENOSYS;
 

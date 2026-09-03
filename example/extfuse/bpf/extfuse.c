@@ -246,6 +246,26 @@ static int policy_enabled(__u32 flag)
 	return flags && (*flags & flag);
 }
 
+static int capability_name(void *ctx)
+{
+	char name[sizeof("security.capability")] = {};
+
+	if (bpf_extfuse_read_args(ctx, IN_PARAM_1_VALUE, name,
+				   sizeof(name)) < 0)
+		return 0;
+	return !__builtin_memcmp(name, "security.capability", sizeof(name));
+}
+
+static void revoke_paper_capability_policy(void)
+{
+	__u32 key = 0;
+	__u32 *flags = bpf_map_lookup_elem(&policy_map, &key);
+
+	if (flags)
+		__sync_fetch_and_and(flags,
+				     ~EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA);
+}
+
 static int daemon_state_inactive(__u64 nodeid, __u64 *current_state)
 {
 	__u64 *state = bpf_map_lookup_elem(&daemon_io_map, &nodeid);
@@ -567,7 +587,7 @@ HANDLER(EXTFUSE_PASSTHROUGH_READ, 65)(void *ctx)
 	 */
 	return passthrough_notification(
 		ctx, FATTR_ATIME, 0,
-		policy_enabled(EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA));
+		policy_enabled(EXTFUSE_POLICY_PAPER_READ_ATIME_CACHE));
 }
 
 HANDLER(EXTFUSE_PASSTHROUGH_WRITE, 66)(void *ctx)
@@ -739,11 +759,12 @@ HANDLER(FUSE_READ, 15)(void *ctx)
 		/*
 		 * Paper AllOpt makes its complete decision here: a valid registered
 		 * backing file is checked by the driver before lower I/O.  Match the
-		 * original ExtFUSE handler by staling an existing atime row, without
-		 * making that row a forwarding prerequisite.  The strict gate defers
-		 * this side effect to its separately negotiated private BEGIN hook.
+		 * original ExtFUSE request-boundary decision.  Paper mode deliberately
+		 * retains cached atime, matching MDOpt; other profiles stale a resident
+		 * row.  Neither choice makes the row a forwarding prerequisite.
 		 */
 		if (!args->coherence.target_count &&
+		    !policy_enabled(EXTFUSE_POLICY_PAPER_READ_ATIME_CACHE) &&
 		    mark_passthrough_attr_stale(ctx, FATTR_ATIME))
 			return UPCALL;
 		return PASSTHRU;
@@ -866,6 +887,17 @@ HANDLER(FUSE_GETXATTR, 22)(void *ctx)
 					       sizeof(key.name));
 	if (ret < 0)
 		return UPCALL;
+	/*
+	 * The archived ExtFUSE policy answered capability probes in-kernel.  The
+	 * modern port enables that rule only after userspace has proved that the
+	 * lower tree contains no security.capability value.  SETXATTR and
+	 * REMOVEXATTR revoke the global proof before their daemon upcall, so a
+	 * concurrent lookup fails closed into the ordinary cache/daemon path.
+	 */
+	if (policy_enabled(EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA) &&
+	    !__builtin_memcmp(key.name, "security.capability",
+			     sizeof("security.capability")))
+		return -ENODATA;
 	ret = bpf_extfuse_read_args(ctx, IN_PARAM_0_VALUE, &in, sizeof(in));
 	if (ret < 0)
 		return UPCALL;
@@ -902,6 +934,20 @@ HANDLER(FUSE_GETXATTR, 22)(void *ctx)
 						   value->data, value->size);
 	}
 	return ret ? UPCALL : RETURN;
+}
+
+HANDLER(FUSE_SETXATTR, 21)(void *ctx)
+{
+	if (capability_name(ctx))
+		revoke_paper_capability_policy();
+	return UPCALL;
+}
+
+HANDLER(FUSE_REMOVEXATTR, 24)(void *ctx)
+{
+	if (capability_name(ctx))
+		revoke_paper_capability_policy();
+	return UPCALL;
 }
 
 HANDLER(FUSE_FLUSH, 25)(void *ctx)

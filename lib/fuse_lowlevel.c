@@ -2763,8 +2763,8 @@ static bool want_flag_dependencies_valid(uint64_t want)
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE |
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2;
 	const uint64_t wbcache_attr_refresh_dependencies =
-		FUSE_CAP_EXTFUSE | FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS |
-		FUSE_CAP_WRITEBACK_CACHE | FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH;
+		FUSE_CAP_EXTFUSE | FUSE_CAP_WRITEBACK_CACHE |
+		FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH;
 	const uint64_t attr_release_barrier_dependencies =
 		native_attr_refresh_dependencies |
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
@@ -2792,7 +2792,7 @@ static bool want_flag_dependencies_valid(uint64_t want)
 	    (want & wbcache_attr_refresh_dependencies) !=
 		    wbcache_attr_refresh_dependencies) {
 		fuse_log(FUSE_LOG_ERR,
-			 "fuse: ExtFUSE attr refresh requires either native passthrough coherence V2 or writeback-cache passthrough with coherence epochs\n");
+			 "fuse: ExtFUSE attr refresh requires either native passthrough coherence V2 or writeback-cache passthrough\n");
 		return false;
 	}
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER) &&

@@ -140,7 +140,6 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 	    state->mode == MODE_WANTED_WBCACHE_ATTR_RELEASE_BARRIER) {
 		state->helper_enabled =
 			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE);
-		fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS);
 		fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
 		fuse_set_feature_flag(conn,
 				      FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH);
@@ -254,8 +253,8 @@ static int run_case_flags(bool advertise, bool advertise_uring,
 	const struct fuse_out_header *reply_header;
 	const struct fuse_init_out *reply_init;
 	const uint64_t wbcache_attr_flags =
-		FUSE_FS_EXTFUSE | FUSE_EXTFUSE_COHERENCE_EPOCHS |
-		FUSE_WRITEBACK_CACHE | FUSE_EXTFUSE_WBCACHE_PASSTHROUGH |
+		FUSE_FS_EXTFUSE | FUSE_WRITEBACK_CACHE |
+		FUSE_EXTFUSE_WBCACHE_PASSTHROUGH |
 		FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
 	const uint64_t native_attr_flags =
 		FUSE_PASSTHROUGH | FUSE_EXTFUSE_PASSTHROUGH_COHERENCE |
@@ -530,7 +529,7 @@ static int run_case(bool advertise, bool advertise_uring,
 int main(void)
 {
 	const uint64_t wbcache_attr_refresh_prerequisite_flags =
-		FUSE_EXTFUSE_COHERENCE_EPOCHS | FUSE_WRITEBACK_CACHE |
+		FUSE_WRITEBACK_CACHE |
 		FUSE_EXTFUSE_WBCACHE_PASSTHROUGH;
 	int failed = 0;
 

@@ -19,28 +19,28 @@ def _source_region(path, start, end):
 
 
 def test_extfuse_paper_c2_write_contract():
-    """Paper C2 uses the ordinary WRITE hook, not daemon generations."""
+    """Paper C2 uses standard io_uring transport and the C1 data callbacks."""
     root = Path(__file__).resolve().parents[1]
     daemon = root / 'example' / 'extfuse' / 'extfuse_passthrough.c'
     bpf = root / 'example' / 'extfuse' / 'bpf' / 'extfuse.c'
 
-    completion = _source_region(
-        daemon, 'static void perf_uring_write_complete',
-        'static void perf_read_uring_zero_copy')
-    submission = _source_region(
-        daemon, 'static void perf_write_uring_zero_copy',
-        '__attribute__((noinline, used))\nvoid perf_read')
+    daemon_source = daemon.read_text(encoding='utf-8')
+    read_callback = _source_region(
+        daemon, '__attribute__((noinline, used))\nvoid perf_read(fuse_req_t req',
+        '__attribute__((noinline, used))\nvoid perf_write_buf')
+    write_callback = _source_region(
+        daemon, '__attribute__((noinline, used))\nvoid perf_write_buf(fuse_req_t req',
+        'static void perf_flush')
     write_hook = _source_region(
         bpf, 'HANDLER(FUSE_WRITE, 16)', 'HANDLER(FUSE_SETATTR, 4)')
 
-    for region in (completion, submission):
-        assert 'cache_mutation_begin' not in region
-        assert 'cache_mutation_end' not in region
-        assert 'backing_mutex' not in region
-        assert 'xattr_lock' not in region
-    assert '(void)userdata;' in completion
-    assert 'perf_uring_write_complete' in submission
-    assert 'NULL' in submission
+    assert 'perf_read_uring_zero_copy' not in daemon_source
+    assert 'perf_write_uring_zero_copy' not in daemon_source
+    assert 'fuse_uring_submit_fixed_io' not in daemon_source
+    assert 'perf_state.uring_zero_copy_required = false;' in daemon_source
+    assert 'lo_read(req, ino, size, offset, fi);' in read_callback
+    assert 'lo_do_write_buf(req, ino, buffer, offset, fi);' in write_callback
+    assert 'cache_attr(ino, &st, lo->timeout' in write_callback
 
     # One call covers paper AllOpt; the later call covers legacy C1/C2 even
     # when no attr row exists. The helper preserves a negative ENODATA row.

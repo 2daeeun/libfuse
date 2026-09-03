@@ -21,6 +21,7 @@
 #include <sys/sysinfo.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
@@ -32,6 +33,11 @@
 
 /* Size of command data area in SQE when IORING_SETUP_SQE128 is used */
 #define FUSE_URING_MAX_SQE128_CMD_DATA 80
+
+enum fuse_uring_cqe_kind {
+	FUSE_URING_CQE_COMMAND = 0,
+	FUSE_URING_CQE_FIXED_IO,
+};
 
 struct fuse_ring_ent {
 	struct fuse_ring_queue *ring_queue; /* back pointer */
@@ -45,6 +51,13 @@ struct fuse_ring_ent {
 	uint64_t req_commit_id;
 
 	enum fuse_uring_cmd last_cmd;
+	enum fuse_uring_cqe_kind cqe_kind;
+	fuse_uring_fixed_io_callback_t fixed_io_callback;
+	void *fixed_io_userdata;
+	bool fixed_io_pending;
+	bool fixed_io_write;
+	bool fixed_io_completed;
+	unsigned int fixed_buf_index;
 
 	/* header and payload */
 	struct iovec iov[2];
@@ -65,6 +78,20 @@ struct fuse_ring_queue {
 	/* batched inline replies across cqe handling; flushed by the loop */
 	_Atomic bool cqe_processing;
 
+	/* Slot zero owns this queue's shared command payload pool. */
+	void *payload_pool;
+	size_t payload_pool_sz;
+	bool sparse_buffers_registered;
+	uint64_t fixed_read_submitted;
+	uint64_t fixed_read_completed;
+	uint64_t fixed_read_errors;
+	uint64_t fixed_read_bytes;
+	uint64_t fixed_write_submitted;
+	uint64_t fixed_write_completed;
+	uint64_t fixed_write_errors;
+	uint64_t fixed_write_bytes;
+	uint64_t copied_fallbacks;
+
 	/* size depends on queue depth */
 	struct fuse_ring_ent ent[];
 };
@@ -77,6 +104,7 @@ struct fuse_ring_pool {
 
 	/* mirror of se->conn.io_uring_single_issuer, fixed at ring creation */
 	bool single_issuer;
+	bool zero_copy;
 
 	/* number of queues */
 	size_t nr_queues;
@@ -92,6 +120,7 @@ struct fuse_ring_pool {
 
 	unsigned int started_threads;
 	unsigned int failed_threads;
+	atomic_uint ready_queues;
 
 	/* Avoid sending queue entries before FUSE_INIT reply*/
 	sem_t init_sem;
@@ -132,9 +161,9 @@ static void fuse_uring_sqe_set_req_data(struct fuse_uring_cmd_req *req,
 					const unsigned int qid,
 					const uint64_t commit_id)
 {
+	memset(req, 0, sizeof(*req));
 	req->qid = qid;
 	req->commit_id = commit_id;
-	req->flags = 0;
 }
 
 static void
@@ -156,10 +185,20 @@ fuse_uring_sqe_prepare(struct io_uring_sqe *sqe, struct fuse_ring_ent *req,
 	sqe->off = 0;
 
 	io_uring_sqe_set_data(sqe, req);
+	if (req)
+		req->cqe_kind = FUSE_URING_CQE_COMMAND;
 
 	sqe->cmd_op = cmd_op;
 	sqe->__pad1 = 0;
 }
+
+#ifdef HAVE_URING_ZERO_COPY
+static void fuse_uring_use_payload_pool(struct io_uring_sqe *sqe)
+{
+	sqe->uring_cmd_flags = IORING_URING_CMD_FIXED;
+	sqe->buf_index = 0;
+}
+#endif
 
 static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 				 struct fuse_ring_queue *queue,
@@ -203,6 +242,10 @@ static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 	fuse_uring_sqe_prepare(sqe, ring_ent, ring_ent->last_cmd);
 	fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe), queue->qid,
 				    ring_ent->req_commit_id);
+#ifdef HAVE_URING_ZERO_COPY
+	if (ring_pool->zero_copy)
+		fuse_uring_use_payload_pool(sqe);
+#endif
 
 	if (se->debug) {
 		fuse_log(FUSE_LOG_DEBUG, "    unique: %" PRIu64 ", result=%d\n",
@@ -226,6 +269,8 @@ int fuse_req_get_payload(fuse_req_t req, char **payload, size_t *payload_sz,
 	/* Not possible without io-uring interface */
 	if (!req->flags.is_uring)
 		return -EINVAL;
+	if (req->flags.is_uring_zero_copy)
+		return -ENODATA;
 
 	ring_ent = container_of(req, struct fuse_ring_ent, req);
 
@@ -240,6 +285,132 @@ int fuse_req_get_payload(fuse_req_t req, char **payload, size_t *payload_sz,
 		*mr = NULL;
 
 	return 0;
+}
+
+int fuse_uring_submit_fixed_io(fuse_req_t req, int fd, off_t offset,
+			       size_t size, bool write_to_fd,
+			       fuse_uring_fixed_io_callback_t callback,
+			       void *userdata)
+{
+#ifdef HAVE_URING_ZERO_COPY
+	struct fuse_ring_ent *ent;
+	struct fuse_ring_queue *queue;
+	struct fuse_ring_pool *pool;
+	struct fuse_uring_req_header *rrh;
+	struct fuse_in_header *in;
+	uint32_t request_size;
+	struct io_uring_sqe *sqe;
+
+	if (!req || !callback || fd < 0 || offset < 0 || size > UINT_MAX)
+		return -EINVAL;
+	if (!req->flags.is_uring || !req->flags.is_uring_zero_copy)
+		return -EINVAL;
+
+	ent = container_of(req, struct fuse_ring_ent, req);
+	queue = ent->ring_queue;
+	pool = queue->ring_pool;
+	rrh = ent->req_header;
+	in = (struct fuse_in_header *)&rrh->in_out;
+	if ((write_to_fd && in->opcode != FUSE_WRITE) ||
+	    (!write_to_fd && in->opcode != FUSE_READ))
+		return -EINVAL;
+	request_size = write_to_fd ?
+		((struct fuse_write_in *)&rrh->op_in)->size :
+		((struct fuse_read_in *)&rrh->op_in)->size;
+	if (!pool->zero_copy || !pool->single_issuer ||
+	    !ent->fixed_buf_index ||
+	    ent->fixed_buf_index > pool->queue_depth ||
+	    size > request_size || ent->fixed_io_pending ||
+	    !pthread_equal(pthread_self(), queue->tid) ||
+	    !atomic_load_explicit(&queue->cqe_processing,
+				  memory_order_relaxed))
+		return -EINVAL;
+
+	sqe = io_uring_get_sqe(&queue->ring);
+	if (!sqe)
+		return -EAGAIN;
+	if (write_to_fd)
+		io_uring_prep_write_fixed(sqe, fd, NULL, (unsigned int)size,
+					  offset, ent->fixed_buf_index);
+	else
+		io_uring_prep_read_fixed(sqe, fd, NULL, (unsigned int)size,
+					 offset, ent->fixed_buf_index);
+	io_uring_sqe_set_data(sqe, ent);
+	ent->cqe_kind = FUSE_URING_CQE_FIXED_IO;
+	ent->fixed_io_callback = callback;
+	ent->fixed_io_userdata = userdata;
+	ent->fixed_io_pending = true;
+	ent->fixed_io_write = write_to_fd;
+	ent->fixed_io_completed = false;
+
+	if (write_to_fd)
+		queue->fixed_write_submitted++;
+	else
+		queue->fixed_read_submitted++;
+
+	/* The queue loop flushes this SQE before it waits again. */
+	return 0;
+#else
+	(void)req;
+	(void)fd;
+	(void)offset;
+	(void)size;
+	(void)write_to_fd;
+	(void)callback;
+	(void)userdata;
+	return -ENOTSUP;
+#endif
+}
+
+int fuse_reply_uring_zero_copy(fuse_req_t req, size_t count)
+{
+#ifdef HAVE_URING_ZERO_COPY
+	struct fuse_ring_ent *ent;
+	struct fuse_ring_queue *queue;
+	struct fuse_ring_pool *pool;
+	struct fuse_uring_req_header *rrh;
+	struct fuse_out_header *out;
+	struct fuse_uring_ent_in_out *ent_in_out;
+	struct fuse_in_header *in;
+	struct fuse_read_in *read_in;
+	int validation_error;
+	int res;
+
+	if (!req || !req->flags.is_uring || !req->flags.is_uring_zero_copy)
+		return -EINVAL;
+	ent = container_of(req, struct fuse_ring_ent, req);
+	if (ent->fixed_io_pending)
+		return -EBUSY;
+	queue = ent->ring_queue;
+	pool = queue->ring_pool;
+	rrh = ent->req_header;
+	out = (struct fuse_out_header *)&rrh->in_out;
+	ent_in_out = &rrh->ring_ent_in_out;
+	in = (struct fuse_in_header *)&rrh->in_out;
+	read_in = (struct fuse_read_in *)&rrh->op_in;
+	if (in->opcode != FUSE_READ || !ent->fixed_io_completed ||
+	    ent->fixed_io_write || count > read_in->size)
+		return -EINVAL;
+	ent->fixed_io_completed = false;
+
+	validation_error = fuse_uring_prepare_reply(
+		out, ent_in_out, req->unique, 0, count,
+		pool->max_req_payload_sz);
+	if (validation_error)
+		fuse_log(FUSE_LOG_ERR,
+			 "invalid zero-copy io_uring reply size %zu: %s\n",
+			 count, strerror(-validation_error));
+
+	res = fuse_uring_commit_sqe(pool, queue, ent);
+	fuse_free_req(req);
+	if (res)
+		return res;
+	return validation_error;
+#else
+	(void)req;
+	(void)count;
+	return -ENOTSUP;
+#endif
 }
 
 int send_reply_uring(fuse_req_t req, int error, const void *arg, size_t argsize)
@@ -425,10 +596,9 @@ static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
 
 	rc = io_uring_register_files(ring, files, 1);
 	if (rc != 0) {
-		rc = -errno;
 		fuse_log(FUSE_LOG_ERR,
 			 "Failed to register files for ring idx %zu: %s",
-			 qid, strerror(errno));
+			 qid, strerror(-rc));
 		return rc;
 	}
 
@@ -450,6 +620,16 @@ static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
 
 static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 {
+	uint64_t read_submitted = 0;
+	uint64_t read_completed = 0;
+	uint64_t read_errors = 0;
+	uint64_t read_bytes = 0;
+	uint64_t write_submitted = 0;
+	uint64_t write_completed = 0;
+	uint64_t write_errors = 0;
+	uint64_t write_bytes = 0;
+	uint64_t copied_fallbacks = 0;
+
 	for (size_t qid = 0; qid < fuse_ring->nr_queues; qid++) {
 		struct fuse_ring_queue *queue =
 			fuse_uring_get_queue(fuse_ring, qid);
@@ -479,18 +659,115 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 		for (size_t idx = 0; idx < fuse_ring->queue_depth; idx++) {
 			struct fuse_ring_ent *ent = &queue->ent[idx];
 
-			numa_free(ent->op_payload, ent->req_payload_sz);
+			if (!fuse_ring->zero_copy)
+				numa_free(ent->op_payload, ent->req_payload_sz);
 			numa_free(ent->req_header, queue->req_header_sz);
 		}
+		if (queue->payload_pool)
+			numa_free(queue->payload_pool, queue->payload_pool_sz);
+		read_submitted += queue->fixed_read_submitted;
+		read_completed += queue->fixed_read_completed;
+		read_errors += queue->fixed_read_errors;
+		read_bytes += queue->fixed_read_bytes;
+		write_submitted += queue->fixed_write_submitted;
+		write_completed += queue->fixed_write_completed;
+		write_errors += queue->fixed_write_errors;
+		write_bytes += queue->fixed_write_bytes;
+		copied_fallbacks += queue->copied_fallbacks;
 
 		pthread_mutex_destroy(&queue->ring_lock);
 	}
+
+	fuse_log(FUSE_LOG_INFO,
+		 "FUSE_URING_ZERO_COPY_STATS active=%u read_submitted=%" PRIu64
+		 " read_completed=%" PRIu64
+		 " read_errors=%" PRIu64 " read_bytes=%" PRIu64
+		 " write_submitted=%" PRIu64 " write_completed=%" PRIu64
+		 " write_errors=%" PRIu64 " write_bytes=%" PRIu64
+		 " copied_fallbacks=%" PRIu64 "\n",
+		 fuse_ring->zero_copy &&
+		 atomic_load_explicit(&fuse_ring->ready_queues,
+					 memory_order_relaxed) == fuse_ring->nr_queues,
+		 read_submitted, read_completed, read_errors, read_bytes,
+		 write_submitted, write_completed, write_errors, write_bytes,
+		 copied_fallbacks);
 
 	free(fuse_ring->queues);
 	pthread_cond_destroy(&fuse_ring->thread_start_cond);
 	pthread_mutex_destroy(&fuse_ring->thread_start_mutex);
 	free(fuse_ring);
 }
+
+#ifdef HAVE_URING_ZERO_COPY
+static int fuse_uring_submit_control(struct fuse_ring_queue *queue,
+				     enum fuse_uring_cmd command)
+{
+	struct fuse_ring_ent control_ent = { 0 };
+	struct fuse_uring_cmd_req *cmd;
+	struct io_uring_cqe *cqe;
+	struct io_uring_sqe *sqe;
+	int res;
+
+	sqe = io_uring_get_sqe(&queue->ring);
+	if (!sqe)
+		return -EIO;
+	fuse_uring_sqe_prepare(sqe, &control_ent, command);
+	cmd = fuse_uring_get_sqe_cmd(sqe);
+	fuse_uring_sqe_set_req_data(cmd, queue->qid, 0);
+
+	switch (command) {
+	case FUSE_IO_URING_CMD_ADD_QUEUE:
+		cmd->flags = FUSE_URING_ZERO_COPY;
+		break;
+	case FUSE_IO_URING_CMD_ADD_BUFPOOL:
+		cmd->bufpool.uaddr = (uintptr_t)queue->payload_pool;
+		cmd->bufpool.len = (uint32_t)queue->payload_pool_sz;
+		fuse_uring_use_payload_pool(sqe);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	res = io_uring_submit_and_wait(&queue->ring, 1);
+	if (res < 0)
+		return res;
+	if (!res)
+		return -EIO;
+	res = io_uring_wait_cqe(&queue->ring, &cqe);
+	if (res < 0)
+		return res;
+	if (io_uring_cqe_get_data(cqe) != &control_ent || cqe->res > 0)
+		res = -EPROTO;
+	else
+		res = cqe->res;
+	io_uring_cqe_seen(&queue->ring, cqe);
+	return res;
+}
+
+static int fuse_uring_setup_zero_copy_queue(struct fuse_ring_queue *queue)
+{
+	int res;
+
+	if (!queue->sparse_buffers_registered || !queue->payload_pool ||
+	    !queue->payload_pool_sz)
+		return -EINVAL;
+	res = fuse_uring_submit_control(queue, FUSE_IO_URING_CMD_ADD_QUEUE);
+	if (res) {
+		fuse_log(FUSE_LOG_ERR,
+			 "qid=%d FUSE_IO_URING_CMD_ADD_QUEUE failed: %s\n",
+			 queue->qid, strerror(-res));
+		return res;
+	}
+	res = fuse_uring_submit_control(queue, FUSE_IO_URING_CMD_ADD_BUFPOOL);
+	if (res) {
+		fuse_log(FUSE_LOG_ERR,
+			 "qid=%d FUSE_IO_URING_CMD_ADD_BUFPOOL failed: %s\n",
+			 queue->qid, strerror(-res));
+		return res;
+	}
+	return 0;
+}
+#endif
 
 static int fuse_uring_register_ent(struct fuse_ring_queue *queue,
 				   struct fuse_ring_ent *ent)
@@ -514,14 +791,27 @@ static int fuse_uring_register_ent(struct fuse_ring_queue *queue,
 	ent->iov[0].iov_base = ent->req_header;
 	ent->iov[0].iov_len = queue->req_header_sz;
 
-	ent->iov[1].iov_base = ent->op_payload;
-	ent->iov[1].iov_len = ent->req_payload_sz;
+	if (queue->ring_pool->zero_copy) {
+		ent->iov[1].iov_base = NULL;
+		ent->iov[1].iov_len = 0;
+	} else {
+		ent->iov[1].iov_base = ent->op_payload;
+		ent->iov[1].iov_len = ent->req_payload_sz;
+	}
 
 	sqe->addr = (uint64_t)(ent->iov);
 	sqe->len = 2;
 
 	/* this is a fetch, kernel does not read commit id */
 	fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe), queue->qid, 0);
+#ifdef HAVE_URING_ZERO_COPY
+	if (queue->ring_pool->zero_copy) {
+		struct fuse_uring_cmd_req *cmd = fuse_uring_get_sqe_cmd(sqe);
+
+		cmd->ent_zero_copy_buf_index = ent->fixed_buf_index;
+		fuse_uring_use_payload_pool(sqe);
+	}
+#endif
 
 	return 0;
 
@@ -565,6 +855,43 @@ static int fuse_uring_register_queue(struct fuse_ring_queue *queue)
 	return 0;
 }
 
+static int fuse_uring_submit_registered_queue(struct fuse_ring_queue *queue)
+{
+	struct fuse_ring_pool *pool = queue->ring_pool;
+	size_t expected = pool->queue_depth + 1;
+	size_t submitted = 0;
+	unsigned int ready;
+
+	while (submitted < expected) {
+		int res = io_uring_submit(&queue->ring);
+
+		if (res < 0)
+			return res;
+		if (res == 0)
+			return -EIO;
+		submitted += (size_t)res;
+	}
+	if (submitted != expected)
+		return -EIO;
+
+	ready = atomic_fetch_add_explicit(&pool->ready_queues, 1,
+					 memory_order_acq_rel) + 1;
+	if (ready == pool->nr_queues) {
+		if (pool->zero_copy) {
+			fuse_log(FUSE_LOG_INFO,
+				 "FUSE_URING_ZERO_COPY active=1 queues=%zu queue_depth=%zu fixed_buf_slot=0 request_slots=%zu register_entries=%zu\n",
+				 pool->nr_queues, pool->queue_depth,
+				 pool->nr_queues * pool->queue_depth,
+				 pool->nr_queues * pool->queue_depth);
+		} else {
+			fuse_log(FUSE_LOG_INFO,
+				 "FUSE_URING_ZERO_COPY active=0 reason=not-requested queues=%zu queue_depth=%zu\n",
+				 pool->nr_queues, pool->queue_depth);
+		}
+	}
+	return 0;
+}
+
 static struct fuse_ring_pool *fuse_create_ring(struct fuse_session *se)
 {
 	struct fuse_ring_pool *fuse_ring = NULL;
@@ -595,6 +922,8 @@ static struct fuse_ring_pool *fuse_create_ring(struct fuse_session *se)
 	fuse_ring->max_req_payload_sz = payload_sz;
 	fuse_ring->queue_mem_size = queue_sz;
 	fuse_ring->single_issuer = se->conn.io_uring_single_issuer;
+	fuse_ring->zero_copy =
+		(se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL) != 0;
 
 	/*
 	 * very basic queue initialization, that cannot fail and will
@@ -659,10 +988,23 @@ static void fuse_uring_resubmit(struct fuse_ring_queue *queue,
 		sqe->len = 2;
 		fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe),
 					    queue->qid, 0);
+#ifdef HAVE_URING_ZERO_COPY
+		if (queue->ring_pool->zero_copy) {
+			struct fuse_uring_cmd_req *cmd =
+				fuse_uring_get_sqe_cmd(sqe);
+
+			cmd->ent_zero_copy_buf_index = ent->fixed_buf_index;
+			fuse_uring_use_payload_pool(sqe);
+		}
+#endif
 		break;
 	case FUSE_IO_URING_CMD_COMMIT_AND_FETCH:
 		fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe),
 					    queue->qid, ent->req_commit_id);
+#ifdef HAVE_URING_ZERO_COPY
+		if (queue->ring_pool->zero_copy)
+			fuse_uring_use_payload_pool(sqe);
+#endif
 		break;
 	default:
 		fuse_log(FUSE_LOG_ERR, "Unknown command type: %d\n",
@@ -677,23 +1019,27 @@ static void fuse_uring_resubmit(struct fuse_ring_queue *queue,
 		pthread_mutex_unlock(&queue->ring_lock);
 }
 
-static void fuse_uring_handle_cqe(struct fuse_ring_queue *queue,
-				  struct io_uring_cqe *cqe)
+static int fuse_uring_handle_cqe(struct fuse_ring_queue *queue,
+				 struct io_uring_cqe *cqe)
 {
 	struct fuse_ring_ent *ent = io_uring_cqe_get_data(cqe);
+	struct fuse_uring_ent_in_out *ent_in_out;
+	struct fuse_ring_pool *fuse_ring = queue->ring_pool;
+	struct fuse_req *req;
+	struct fuse_uring_req_header *rrh;
+	struct fuse_in_header *in;
+	bool zero_copy;
 
 	if (!ent) {
 		fuse_log(FUSE_LOG_ERR,
 			 "cqe=%p io_uring_cqe_get_data returned NULL\n", cqe);
-		return;
+		return -EIO;
 	}
 
-	struct fuse_req *req = &ent->req;
-	struct fuse_ring_pool *fuse_ring = queue->ring_pool;
-	struct fuse_uring_req_header *rrh = ent->req_header;
-
-	struct fuse_in_header *in = (struct fuse_in_header *)&rrh->in_out;
-	struct fuse_uring_ent_in_out *ent_in_out = &rrh->ring_ent_in_out;
+	req = &ent->req;
+	rrh = ent->req_header;
+	in = (struct fuse_in_header *)&rrh->in_out;
+	ent_in_out = &rrh->ring_ent_in_out;
 
 	ent->req_commit_id = ent_in_out->commit_id;
 	if (unlikely(ent->req_commit_id == 0)) {
@@ -704,10 +1050,48 @@ static void fuse_uring_handle_cqe(struct fuse_ring_queue *queue,
 		fuse_log(FUSE_LOG_ERR, "Received invalid commit_id=0\n");
 		abort();
 	}
+	if (ent_in_out->payload_sz > fuse_ring->max_req_payload_sz ||
+	    ent_in_out->reserved ||
+	    (ent_in_out->flags & ~FUSE_URING_ENT_ZERO_COPY)) {
+		fuse_log(FUSE_LOG_ERR,
+			 "qid=%d invalid io_uring request metadata flags=%" PRIu64
+			 " payload=%u offset=%u reserved=%" PRIu64 "\n",
+			 queue->qid, ent_in_out->flags, ent_in_out->payload_sz,
+			 ent_in_out->offset, ent_in_out->reserved);
+		return -EPROTO;
+	}
+
+	zero_copy = (ent_in_out->flags & FUSE_URING_ENT_ZERO_COPY) != 0;
+	if (fuse_ring->zero_copy) {
+		if (ent_in_out->offset > queue->payload_pool_sz ||
+		    fuse_ring->max_req_payload_sz >
+			    queue->payload_pool_sz - ent_in_out->offset ||
+		    (zero_copy && in->opcode != FUSE_READ &&
+		     in->opcode != FUSE_WRITE)) {
+			fuse_log(FUSE_LOG_ERR,
+				 "qid=%d invalid zero-copy request opcode=%u flags=%" PRIu64
+				 " offset=%u\n",
+				 queue->qid, in->opcode, ent_in_out->flags,
+				 ent_in_out->offset);
+			return -EPROTO;
+		}
+		ent->op_payload = (char *)queue->payload_pool +
+				  ent_in_out->offset;
+	} else if (zero_copy || ent_in_out->offset) {
+		fuse_log(FUSE_LOG_ERR,
+			 "qid=%d received buffer-pool metadata without a pool\n",
+			 queue->qid);
+		return -EPROTO;
+	}
 
 	memset(&req->flags, 0, sizeof(req->flags));
 	memset(&req->u, 0, sizeof(req->u));
 	req->flags.is_uring = 1;
+	req->flags.is_uring_zero_copy = zero_copy;
+	ent->fixed_io_completed = false;
+	if (fuse_ring->zero_copy && !zero_copy &&
+	    (in->opcode == FUSE_READ || in->opcode == FUSE_WRITE))
+		queue->copied_fallbacks++;
 	req->ref_cnt++;
 	req->ch = NULL; /* not needed for uring */
 	req->interrupted = 0;
@@ -715,6 +1099,46 @@ static void fuse_uring_handle_cqe(struct fuse_ring_queue *queue,
 
 	fuse_session_process_uring_cqe(fuse_ring->se, req, in, &rrh->op_in,
 				       ent->op_payload, ent_in_out->payload_sz);
+	return 0;
+}
+
+static int fuse_uring_handle_fixed_io_cqe(struct fuse_ring_queue *queue,
+					   struct fuse_ring_ent *ent,
+					   int result)
+{
+	fuse_uring_fixed_io_callback_t callback = ent->fixed_io_callback;
+	void *userdata = ent->fixed_io_userdata;
+	bool write_to_fd = ent->fixed_io_write;
+
+	if (!ent->fixed_io_pending || !callback) {
+		fuse_log(FUSE_LOG_ERR,
+			 "qid=%d unexpected fixed-I/O completion\n", queue->qid);
+		return -EIO;
+	}
+	ent->fixed_io_pending = false;
+	ent->fixed_io_callback = NULL;
+	ent->fixed_io_userdata = NULL;
+	ent->cqe_kind = FUSE_URING_CQE_COMMAND;
+	ent->fixed_io_completed = true;
+
+	if (write_to_fd) {
+		if (result < 0)
+			queue->fixed_write_errors++;
+		else {
+			queue->fixed_write_completed++;
+			queue->fixed_write_bytes += (uint64_t)result;
+		}
+	} else {
+		if (result < 0)
+			queue->fixed_read_errors++;
+		else {
+			queue->fixed_read_completed++;
+			queue->fixed_read_bytes += (uint64_t)result;
+		}
+	}
+
+	callback(&ent->req, result, userdata);
+	return 0;
 }
 
 static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
@@ -729,23 +1153,32 @@ static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
 
 	io_uring_for_each_cqe(&queue->ring, head, cqe) {
 		int err = 0;
+		void *cqe_data = io_uring_cqe_get_data(cqe);
 
 		num_completed++;
 
 		err = cqe->res;
-		if (unlikely(err != 0)) {
-			if (err > 0 && ((uintptr_t)io_uring_cqe_get_data(cqe) ==
-					(unsigned int)queue->eventfd)) {
-				/* teardown from eventfd */
+		if ((uintptr_t)cqe_data == (unsigned int)queue->eventfd) {
+			if (err > 0)
 				return -ENOTCONN;
-			}
+			if (err < 0 && err != -ECANCELED)
+				ret = err;
+			continue;
+		}
 
-
+		ent = cqe_data;
+		if (ent && ent->cqe_kind == FUSE_URING_CQE_FIXED_IO) {
+			err = fuse_uring_handle_fixed_io_cqe(queue, ent, err);
+			if (err && !ret)
+				ret = err;
+			continue;
+		}
+		if (unlikely(err != 0)) {
 			switch (err) {
 			case -EAGAIN:
 				fallthrough;
 			case -EINTR:
-				ent = io_uring_cqe_get_data(cqe);
+				ent = cqe_data;
 				fuse_uring_resubmit(queue, ent);
 				continue;
 			default:
@@ -762,7 +1195,9 @@ static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
 			}
 
 		} else {
-			fuse_uring_handle_cqe(queue, cqe);
+			err = fuse_uring_handle_cqe(queue, cqe);
+			if (err && !ret)
+				ret = err;
 		}
 	}
 
@@ -865,6 +1300,36 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 
 	queue->req_header_sz = ROUND_UP(sizeof(struct fuse_uring_req_header),
 				       page_sz);
+	if (ring->zero_copy) {
+#ifdef HAVE_URING_ZERO_COPY
+		struct iovec payload_iov;
+		__u64 payload_tag = 0;
+
+		if (ring->queue_depth > UINT_MAX - 1 ||
+		    ring->max_req_payload_sz >
+			    UINT32_MAX / ring->queue_depth)
+			return -EOVERFLOW;
+		queue->payload_pool_sz = ring->queue_depth *
+					 ring->max_req_payload_sz;
+		queue->payload_pool = numa_alloc_local(queue->payload_pool_sz);
+		if (!queue->payload_pool)
+			return -ENOMEM;
+
+		res = io_uring_register_buffers_sparse(
+			&queue->ring, (unsigned int)ring->queue_depth + 1);
+		if (res)
+			return res;
+		queue->sparse_buffers_registered = true;
+		payload_iov.iov_base = queue->payload_pool;
+		payload_iov.iov_len = queue->payload_pool_sz;
+		res = io_uring_register_buffers_update_tag(
+			&queue->ring, 0, &payload_iov, &payload_tag, 1);
+		if (res != 1)
+			return res < 0 ? res : -EIO;
+#else
+		return -ENOTSUP;
+#endif
+	}
 
 	for (size_t idx = 0; idx < ring->queue_depth; idx++) {
 		struct fuse_ring_ent *ring_ent = &queue->ent[idx];
@@ -881,27 +1346,24 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 		if (!ring_ent->req_header)
 			return -ENOMEM;
 		ring_ent->req_payload_sz = ring->max_req_payload_sz;
+		ring_ent->fixed_buf_index = (unsigned int)idx + 1;
 
-		ring_ent->op_payload =
-			numa_alloc_local(ring_ent->req_payload_sz);
-		if (!ring_ent->op_payload)
-			return -ENOMEM;
+		if (ring->zero_copy) {
+			ring_ent->op_payload =
+				(char *)queue->payload_pool +
+				idx * ring_ent->req_payload_sz;
+		} else {
+			ring_ent->op_payload =
+				numa_alloc_local(ring_ent->req_payload_sz);
+			if (!ring_ent->op_payload)
+				return -ENOMEM;
+		}
 
 		req->se = se;
 		pthread_mutex_init(&req->lock, NULL);
 		req->flags.is_uring = 1;
 		req->ref_cnt = 1; /* extra ref to avoid destruction */
 		list_init_req(req);
-	}
-
-	res = fuse_uring_register_queue(queue);
-	if (res != 0) {
-		fuse_log(
-			FUSE_LOG_ERR,
-			"Grave fuse-uring error on preparing SQEs, aborting\n");
-		se->error = -EIO;
-		fuse_session_exit(se);
-		return res;
 	}
 
 	return queue->ring.ring_fd;
@@ -938,13 +1400,21 @@ static void *fuse_uring_thread(void *arg)
 
 	sem_wait(&ring_pool->init_sem);
 
-	/*
-	 * Multi-issuer flushes the registration SQEs here - safe without
-	 * ring_lock, no request can reach this queue yet. Single-issuer's
-	 * first submit_and_wait() below flushes them instead.
-	 */
-	if (!single_issuer)
-		io_uring_submit(&queue->ring);
+	if (ring_pool->zero_copy) {
+#ifdef HAVE_URING_ZERO_COPY
+		err = fuse_uring_setup_zero_copy_queue(queue);
+#else
+		err = -ENOTSUP;
+#endif
+		if (err)
+			goto err;
+	}
+	err = fuse_uring_register_queue(queue);
+	if (err)
+		goto err;
+	err = fuse_uring_submit_registered_queue(queue);
+	if (err)
+		goto err;
 
 	/* Not using fuse_session_exited(se), as that cannot be inlined */
 	while (!atomic_load_explicit(&se->mt_exited, memory_order_relaxed)) {
@@ -957,11 +1427,15 @@ static void *fuse_uring_thread(void *arg)
 		 * re-scans and advances the CQ.
 		 */
 		if (single_issuer) {
-			io_uring_submit_and_wait(&queue->ring, 1);
+			err = io_uring_submit_and_wait(&queue->ring, 1);
+			if (err < 0)
+				goto err;
 		} else {
 			struct io_uring_cqe *cqe;
 
-			io_uring_wait_cqe(&queue->ring, &cqe);
+			err = io_uring_wait_cqe(&queue->ring, &cqe);
+			if (err < 0)
+				goto err;
 		}
 
 		/*
@@ -987,8 +1461,10 @@ static void *fuse_uring_thread(void *arg)
 		 */
 		if (!single_issuer) {
 			pthread_mutex_lock(&queue->ring_lock);
-			io_uring_submit(&queue->ring);
+			err = io_uring_submit(&queue->ring);
 			pthread_mutex_unlock(&queue->ring_lock);
+			if (err < 0)
+				goto err;
 		}
 	}
 
@@ -1021,6 +1497,22 @@ static int fuse_uring_sanity_check(struct fuse_session *se)
 		fuse_log(FUSE_LOG_ERR, "io-uring queue depth must be > 0\n");
 		return -EINVAL;
 	}
+	if ((se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL) &&
+	    !se->conn.io_uring_single_issuer) {
+		fuse_log(FUSE_LOG_ERR,
+			 "io-uring zero-copy requires single-issuer queues\n");
+		return -EINVAL;
+	}
+	if ((se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL) &&
+	    se->uring.q_depth > UINT16_MAX) {
+		fuse_log(FUSE_LOG_ERR,
+			 "io-uring zero-copy queue depth exceeds the 16-bit buffer index\n");
+		return -EOVERFLOW;
+	}
+#ifndef HAVE_URING_ZERO_COPY
+	if (se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL)
+		return -ENOTSUP;
+#endif
 
 	_Static_assert(sizeof(struct fuse_uring_cmd_req) <=
 		       FUSE_URING_MAX_SQE128_CMD_DATA,

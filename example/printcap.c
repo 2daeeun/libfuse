@@ -79,6 +79,9 @@ static const struct cap_info capabilities[] = {
 					"FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS"},
 	{FUSE_CAP_MUTATION_METADATA,		"FUSE_CAP_MUTATION_METADATA"},
 	{FUSE_CAP_NOTIFY_INVAL_XATTR,		"FUSE_CAP_NOTIFY_INVAL_XATTR"},
+	{FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH,
+				"FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH"},
+	{FUSE_CAP_IO_URING_BUFPOOL,		"FUSE_CAP_IO_URING_BUFPOOL"},
     // Add any new capabilities here
     {0, NULL} // Sentinel to mark the end of the array
 };

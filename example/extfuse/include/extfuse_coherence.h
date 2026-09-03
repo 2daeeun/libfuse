@@ -12,9 +12,10 @@
 	((1ULL << (64U - EXTFUSE_NATIVE_STATE_ACTIVE_BITS)) - 1)
 
 /*
- * Request-count policy shared by the daemon and BPF handlers.  These flags
- * deliberately relax metadata freshness only for the paper-like profile;
- * the functional gate leaves the policy map at zero.
+ * Request-count policy shared by the daemon and BPF handlers.  Paper-like
+ * WBCache forwarding uses the ordinary READ/WRITE handlers without the
+ * coherence-epochs bit; the strict gate combines both bits and enables the
+ * private BEGIN/END protocol.
  */
 #define EXTFUSE_POLICY_RELAX_NATIVE_READ_METADATA (1U << 0)
 #define EXTFUSE_POLICY_RELAX_NATIVE_MMAP_METADATA (1U << 1)

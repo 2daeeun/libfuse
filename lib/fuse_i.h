@@ -41,6 +41,7 @@ struct fuse_req {
 	struct {
 		unsigned int ioctl_64bit : 1;
 		unsigned int is_uring : 1;
+		unsigned int is_uring_zero_copy : 1;
 		unsigned int is_copy_file_range_64 : 1;
 	} flags;
 	union {

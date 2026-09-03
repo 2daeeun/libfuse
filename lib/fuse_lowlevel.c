@@ -596,6 +596,8 @@ static void fill_open(struct fuse_open_out *arg,
 		arg->open_flags |= FOPEN_NOFLUSH;
 	if (f->parallel_direct_writes)
 		arg->open_flags |= FOPEN_PARALLEL_DIRECT_WRITES;
+	if (f->io_uring_zero_copy)
+		arg->open_flags |= FOPEN_IO_URING_ZERO_COPY;
 }
 
 int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e)
@@ -2756,17 +2758,21 @@ static bool want_flag_dependencies_valid(uint64_t want)
 {
 	const uint64_t coherence_dependencies =
 		FUSE_CAP_EXTFUSE | FUSE_CAP_PASSTHROUGH;
-	const uint64_t attr_refresh_dependencies =
+	const uint64_t native_attr_refresh_dependencies =
 		coherence_dependencies |
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE |
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2;
+	const uint64_t wbcache_attr_refresh_dependencies =
+		FUSE_CAP_EXTFUSE | FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS |
+		FUSE_CAP_WRITEBACK_CACHE | FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH;
 	const uint64_t attr_release_barrier_dependencies =
-		attr_refresh_dependencies |
+		native_attr_refresh_dependencies |
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
 	const uint64_t coherence_epochs_dependencies = FUSE_CAP_EXTFUSE;
 	const uint64_t wbcache_passthrough_dependencies =
-		FUSE_CAP_EXTFUSE | FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS |
-		FUSE_CAP_WRITEBACK_CACHE;
+		FUSE_CAP_EXTFUSE | FUSE_CAP_WRITEBACK_CACHE;
+	const uint64_t io_uring_bufpool_dependencies =
+		FUSE_CAP_OVER_IO_URING;
 
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE) &&
 	    (want & coherence_dependencies) != coherence_dependencies) {
@@ -2781,10 +2787,12 @@ static bool want_flag_dependencies_valid(uint64_t want)
 		return false;
 	}
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH) &&
-	    (want & attr_refresh_dependencies) != attr_refresh_dependencies) {
+	    (want & native_attr_refresh_dependencies) !=
+		    native_attr_refresh_dependencies &&
+	    (want & wbcache_attr_refresh_dependencies) !=
+		    wbcache_attr_refresh_dependencies) {
 		fuse_log(FUSE_LOG_ERR,
-			 "fuse: ExtFUSE attr refresh requires passthrough "
-			 "coherence V2 and its prerequisites\n");
+			 "fuse: ExtFUSE attr refresh requires either native passthrough coherence V2 or writeback-cache passthrough with coherence epochs\n");
 		return false;
 	}
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER) &&
@@ -2818,7 +2826,14 @@ static bool want_flag_dependencies_valid(uint64_t want)
 		     wbcache_passthrough_dependencies ||
 	     (want & FUSE_CAP_PASSTHROUGH))) {
 		fuse_log(FUSE_LOG_ERR,
-			 "fuse: ExtFUSE writeback-cache passthrough requires ExtFUSE, coherence epochs and writeback cache, and excludes native passthrough\n");
+			 "fuse: ExtFUSE writeback-cache passthrough requires ExtFUSE and writeback cache, and excludes native passthrough\n");
+		return false;
+	}
+	if ((want & FUSE_CAP_IO_URING_BUFPOOL) &&
+	    (want & io_uring_bufpool_dependencies) !=
+		    io_uring_bufpool_dependencies) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: io-uring buffer pools require FUSE over io-uring\n");
 		return false;
 	}
 	return true;
@@ -2924,6 +2939,7 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	bool buf_reallocable = se->buf_reallocable;
 	(void) nodeid;
 	bool enable_io_uring = false;
+	bool require_io_uring_bufpool = false;
 
 	if (se->debug) {
 		fuse_log(FUSE_LOG_DEBUG, "INIT: %u.%u\n", arg->major, arg->minor);
@@ -3044,6 +3060,11 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		if (inargflags & FUSE_EXTFUSE_WBCACHE_PASSTHROUGH)
 			se->conn.capable_ext |=
 				FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH;
+#ifdef HAVE_URING_ZERO_COPY
+		if (arg->minor >= 48 &&
+		    (inargflags & FUSE_HAS_IO_URING_BUFPOOL))
+			se->conn.capable_ext |= FUSE_CAP_IO_URING_BUFPOOL;
+#endif
 
 	} else {
 		se->conn.max_readahead = 0;
@@ -3111,8 +3132,14 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		fuse_convert_to_conn_want_ext(&se->conn);
 	}
 
+	require_io_uring_bufpool =
+		(se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL) != 0;
 	if (!want_flags_valid(se->conn.capable_ext, se->conn.want_ext) ||
-	    !want_flag_dependencies_valid(se->conn.want_ext)) {
+	    !want_flag_dependencies_valid(se->conn.want_ext) ||
+	    (require_io_uring_bufpool && !se->uring.enable)) {
+		if (require_io_uring_bufpool && !se->uring.enable)
+			fuse_log(FUSE_LOG_ERR,
+				 "fuse: io-uring buffer pools require the io_uring mount option\n");
 		fuse_reply_err(req, EPROTO);
 		se->error = -EPROTO;
 		fuse_session_exit(se);
@@ -3227,6 +3254,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_HAS_NOTIFY_INVAL_XATTR;
 	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH)
 		outargflags |= FUSE_EXTFUSE_WBCACHE_PASSTHROUGH;
+	if (se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL)
+		outargflags |= FUSE_HAS_IO_URING_BUFPOOL;
 
 	if ((inargflags & FUSE_REQUEST_TIMEOUT) && se->conn.request_timeout) {
 		outargflags |= FUSE_REQUEST_TIMEOUT;
@@ -3277,15 +3306,23 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	else if (arg->minor < 23)
 		outargsize = FUSE_COMPAT_22_INIT_OUT_SIZE;
 
-	/* XXX: Add an option to make non-available io-uring fatal */
 	if (enable_io_uring) {
 		int ring_rc = fuse_uring_start(se);
 
 		if (ring_rc != 0) {
+			int ring_error = ring_rc < 0 ? -ring_rc : ring_rc;
+
 			fuse_log(FUSE_LOG_INFO,
 				 "fuse: failed to start io-uring: %s\n",
-				 strerror(ring_rc));
+				 strerror(ring_error));
+			if (require_io_uring_bufpool) {
+				fuse_reply_err(req, ring_error);
+				se->error = -ring_error;
+				fuse_session_exit(se);
+				return;
+			}
 			outargflags &= ~FUSE_OVER_IO_URING;
+			outargflags &= ~FUSE_HAS_IO_URING_BUFPOOL;
 			enable_io_uring = false;
 		}
 	}
@@ -3731,6 +3768,11 @@ bool fuse_req_is_uring(fuse_req_t req)
 	return req->flags.is_uring;
 }
 
+bool fuse_req_is_uring_zero_copy(fuse_req_t req)
+{
+	return req->flags.is_uring_zero_copy;
+}
+
 #ifndef HAVE_URING
 int fuse_req_get_payload(fuse_req_t req, char **payload, size_t *payload_sz,
 			 void **mr)
@@ -3739,6 +3781,28 @@ int fuse_req_get_payload(fuse_req_t req, char **payload, size_t *payload_sz,
 	(void)payload;
 	(void)payload_sz;
 	(void)mr;
+	return -ENOTSUP;
+}
+
+int fuse_uring_submit_fixed_io(fuse_req_t req, int fd, off_t offset,
+			       size_t size, bool write_to_fd,
+			       fuse_uring_fixed_io_callback_t callback,
+			       void *userdata)
+{
+	(void)req;
+	(void)fd;
+	(void)offset;
+	(void)size;
+	(void)write_to_fd;
+	(void)callback;
+	(void)userdata;
+	return -ENOTSUP;
+}
+
+int fuse_reply_uring_zero_copy(fuse_req_t req, size_t count)
+{
+	(void)req;
+	(void)count;
 	return -ENOTSUP;
 }
 #endif
@@ -4112,7 +4176,8 @@ void fuse_session_process_uring_cqe(struct fuse_session *se,
 		struct fuse_bufvec bufv = {
 			.buf[0] = { .size = payload_len,
 				    .flags = 0,
-				    .mem = op_payload },
+				    .mem = req->flags.is_uring_zero_copy ?
+					    NULL : op_payload },
 			.count = 1,
 		};
 		_do_write_buf(req, in->nodeid, op_in, &bufv);

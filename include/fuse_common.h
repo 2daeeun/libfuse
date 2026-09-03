@@ -103,8 +103,15 @@ struct fuse_file_info {
 	 */
 	uint32_t extfuse_wbcache_passthrough : 1;
 
+	/**
+	 * Can be filled by open/create to request page-payload zero-copy through
+	 * the serving FUSE io-uring queue.  The filesystem must have negotiated
+	 * FUSE_CAP_IO_URING_BUFPOOL and use the fixed-I/O request APIs.
+	 */
+	uint32_t io_uring_zero_copy : 1;
+
 	/** Padding.  Reserved for future use*/
-	uint32_t padding : 22;
+	uint32_t padding : 21;
 	uint32_t padding2 : 32;
 	uint32_t padding3 : 32;
 
@@ -554,13 +561,17 @@ struct fuse_loop_config_v1 {
 
 /**
  * Indicates that the kernel can lazily refresh regular-file attributes through
- * the ExtFUSE identity view after a native passthrough operation invalidates
- * cached attributes.
+ * the ExtFUSE identity view after a passthrough operation invalidates cached
+ * attributes.
  *
- * This opt-in capability is meaningful only together with
- * FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2,
- * FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE, FUSE_CAP_EXTFUSE and
- * FUSE_CAP_PASSTHROUGH. It is disabled by default.
+ * This opt-in capability requires FUSE_CAP_EXTFUSE and either:
+ *
+ *  - native FUSE_CAP_PASSTHROUGH with ExtFUSE passthrough coherence V1/V2; or
+ *  - FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH with
+ *    FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS and FUSE_CAP_WRITEBACK_CACHE.
+ *
+ * It is disabled by default.  The RELEASE barrier remains a native
+ * passthrough-only extension.
  */
 #define FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH (1ULL << 37)
 
@@ -588,11 +599,14 @@ struct fuse_loop_config_v1 {
  * incarnations and per-domain epochs.
  *
  * A filesystem that enables this capability must make its ExtFUSE program
- * handle the private mmap marker notification. The driver rejects a mapping
- * if that marker cannot be installed, because later page faults cannot be
- * enclosed by a finite request BEGIN/END interval.
- * Native passthrough READ/WRITE invokes one BPF policy hook before lower I/O;
- * the driver closes the matching inode epoch without a second BPF callback.
+ * handle the private mmap marker notification. Native passthrough and DAX
+ * install it before publishing a mapping because later page faults bypass
+ * ordinary FUSE I/O. Ordinary cached FUSE mappings stay unmarked at mmap
+ * creation; their first actual shared-write page_mkwrite installs the marker
+ * before delayed writeback can change lower metadata. Failure to install a
+ * required marker rejects the mapping or write fault.
+ * Native passthrough READ/WRITE brackets lower I/O with explicit BPF BEGIN/END
+ * policy hooks and a matching driver-owned inode epoch.
  *
  * This capability requires FUSE_CAP_EXTFUSE. It is disabled by default.
  */
@@ -619,11 +633,20 @@ struct fuse_loop_config_v1 {
 
 /**
  * Indicates support for ExtFUSE policy forwarding below the ordinary FUSE
- * writeback cache.  This capability requires FUSE_CAP_EXTFUSE,
- * FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS and FUSE_CAP_WRITEBACK_CACHE.  It is
- * mutually exclusive with native FUSE_CAP_PASSTHROUGH.
+ * writeback cache.  This capability requires FUSE_CAP_EXTFUSE and
+ * FUSE_CAP_WRITEBACK_CACHE, and is mutually exclusive with native
+ * FUSE_CAP_PASSTHROUGH.  FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS is an optional
+ * strict-coherence extension rather than a forwarding prerequisite.
  */
 #define FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH (1ULL << 42)
+
+/**
+ * Indicates support for FUSE io-uring payload buffer pools and per-entry
+ * dynamic fixed buffers.  Requesting this capability makes libfuse create
+ * zero-copy-capable queues; individual files opt in with
+ * fuse_file_info.io_uring_zero_copy.
+ */
+#define FUSE_CAP_IO_URING_BUFPOOL (1ULL << 43)
 
 /**
  * Ioctl flags

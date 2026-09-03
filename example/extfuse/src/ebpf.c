@@ -167,10 +167,6 @@ ebpf_context_t *ebpf_init(const char *filename)
 		[EXTFUSE_NATIVE_IO_MAP] = "native_io_map",
 		[EXTFUSE_MMAP_MAP] = "mmap_map",
 		[EXTFUSE_POLICY_MAP] = "policy_map",
-		[EXTFUSE_EPOCH_ENTRY_MAP] = "epoch_entry_map",
-		[EXTFUSE_EPOCH_ATTR_MAP] = "epoch_attr_map",
-		[EXTFUSE_EPOCH_XATTR_MAP] = "epoch_xattr_map",
-		[EXTFUSE_EPOCH_SCRATCH_MAP] = "epoch_scratch_map",
 		[EXTFUSE_HANDLERS_MAP] = "handlers",
 	};
 	struct bpf_program *main_program;

@@ -169,6 +169,23 @@ int main(void) {
     return ret;
 }'''
 
+zero_copy_code = '''
+#include <liburing.h>
+#include <sys/uio.h>
+int main(void) {
+    struct io_uring ring = { 0 };
+    struct io_uring_sqe sqe = { 0 };
+    struct iovec iov = { 0 };
+    __u64 tag = 0;
+#ifndef IORING_URING_CMD_FIXED
+#error "No fixed uring-cmd buffer support"
+#endif
+    io_uring_prep_read_fixed(&sqe, -1, 0, 0, 0, 1);
+    io_uring_prep_write_fixed(&sqe, -1, 0, 0, 0, 1);
+    return io_uring_register_buffers_sparse(&ring, 2) +
+           io_uring_register_buffers_update_tag(&ring, 0, &iov, &tag, 1);
+}'''
+
 liburing = dependency('liburing', required: false)
 libnuma = dependency('numa', required: false)
 
@@ -177,6 +194,11 @@ if get_option('enable-io-uring') and liburing.found() and libnuma.found()
               name: 'liburing linking and SQE128 support',
               dependencies: [liburing])
       private_cfg.set('HAVE_URING', true)
+      if cc.links(zero_copy_code,
+                  name: 'liburing sparse fixed-buffer support',
+                  dependencies: [liburing])
+         private_cfg.set('HAVE_URING_ZERO_COPY', true)
+      endif
    endif
 endif
 
@@ -329,4 +351,3 @@ endif
 foreach n : subdirs
     subdir(n)
 endforeach
-

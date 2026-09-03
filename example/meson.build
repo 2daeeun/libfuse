@@ -81,7 +81,6 @@ if get_option('enable-extfuse-example')
         'extfuse/bpf/xattr.h',
         'extfuse/include/extfuse.h',
         'extfuse/include/extfuse_coherence.h',
-        'extfuse/include/extfuse_epoch_cache.h',
     )
     custom_target(
         'extfuse-bpf',

@@ -44,6 +44,24 @@ _Static_assert(FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH == (1U << 8),
 	       "unexpected writeback-cache passthrough open bit");
 _Static_assert(FUSE_OVER_IO_URING == (1ULL << 41),
 	       "unexpected FUSE-over-io_uring wire capability bit");
+_Static_assert(FUSE_CAP_IO_URING_BUFPOOL == (1ULL << 43),
+	       "unexpected io-uring buffer-pool capability bit");
+_Static_assert(FUSE_HAS_IO_URING_BUFPOOL == (1ULL << 52),
+	       "unexpected io-uring buffer-pool wire bit");
+_Static_assert(FOPEN_IO_URING_ZERO_COPY == (1U << 9),
+	       "unexpected io-uring zero-copy open bit");
+_Static_assert(FUSE_IO_URING_CMD_ADD_QUEUE == 3,
+	       "unexpected io-uring add-queue command");
+_Static_assert(FUSE_IO_URING_CMD_ADD_BUFPOOL == 4,
+	       "unexpected io-uring add-buffer-pool command");
+_Static_assert(FUSE_URING_ENT_ZERO_COPY == (1U << 0),
+	       "unexpected io-uring zero-copy entry bit");
+_Static_assert(FUSE_URING_ZERO_COPY == (1U << 0),
+	       "unexpected io-uring zero-copy queue bit");
+_Static_assert(sizeof(struct fuse_uring_ent_in_out) == 32,
+	       "unexpected io-uring entry metadata size");
+_Static_assert(sizeof(struct fuse_uring_cmd_req) == 40,
+	       "unexpected io-uring command size");
 _Static_assert(sizeof(struct fuse_file_info) == 64,
 	       "fuse_file_info ABI size changed");
 _Static_assert(sizeof(struct fuse_conn_info) == 128,
@@ -64,6 +82,9 @@ enum test_mode {
 	MODE_WANTED_COHERENCE_V2,
 	MODE_WANTED_ATTR_REFRESH,
 	MODE_WANTED_ATTR_RELEASE_BARRIER,
+	MODE_WANTED_WBCACHE_PASSTHROUGH,
+	MODE_WANTED_WBCACHE_ATTR_REFRESH,
+	MODE_WANTED_WBCACHE_ATTR_RELEASE_BARRIER,
 	MODE_FORCE_INVALID_WANT,
 	MODE_FORCE_ATTR_REFRESH_WANT,
 	MODE_FORCE_ATTR_RELEASE_BARRIER_WANT,
@@ -83,6 +104,7 @@ struct test_state {
 	bool coherence_v2_helper_enabled;
 	bool attr_refresh_helper_enabled;
 	bool attr_release_barrier_helper_enabled;
+	bool wbcache_helper_enabled;
 	_Alignas(max_align_t)
 	unsigned char reply[sizeof(struct fuse_out_header) +
 			    sizeof(struct fuse_init_out)];
@@ -106,7 +128,30 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 	state->saw_attr_release_barrier_capability = fuse_get_feature_flag(
 		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
 
-	if (state->mode == MODE_WANTED ||
+	if (state->mode == MODE_WANTED_WBCACHE_PASSTHROUGH) {
+		state->helper_enabled =
+			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE);
+		fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
+		state->wbcache_helper_enabled = fuse_set_feature_flag(
+			conn, FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH);
+		conn->max_backing_stack_depth = FUSE_BACKING_STACKED_UNDER;
+		conn->extfuse_prog_fd = TEST_PROG_FD;
+	} else if (state->mode == MODE_WANTED_WBCACHE_ATTR_REFRESH ||
+	    state->mode == MODE_WANTED_WBCACHE_ATTR_RELEASE_BARRIER) {
+		state->helper_enabled =
+			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE);
+		fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS);
+		fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
+		fuse_set_feature_flag(conn,
+				      FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH);
+		state->attr_refresh_helper_enabled = fuse_set_feature_flag(
+			conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH);
+		if (state->mode == MODE_WANTED_WBCACHE_ATTR_RELEASE_BARRIER)
+			state->attr_release_barrier_helper_enabled = fuse_set_feature_flag(
+				conn,
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
+		conn->extfuse_prog_fd = TEST_PROG_FD;
+	} else if (state->mode == MODE_WANTED ||
 	    state->mode == MODE_WANTED_COHERENCE ||
 	    state->mode == MODE_WANTED_COHERENCE_V2 ||
 	    state->mode == MODE_WANTED_ATTR_REFRESH ||
@@ -181,11 +226,12 @@ static ssize_t unused_read(int fd, void *buf, size_t buf_len, void *userdata)
 	return -1;
 }
 
-static int run_case(bool advertise, bool advertise_uring,
-		    bool advertise_coherence, bool advertise_coherence_v2,
-		    bool advertise_attr_refresh,
-		    bool advertise_attr_release_barrier, enum test_mode mode,
-		    bool expect_error, const char *name)
+static int run_case_flags(bool advertise, bool advertise_uring,
+			  bool advertise_coherence, bool advertise_coherence_v2,
+			  bool advertise_attr_refresh,
+			  bool advertise_attr_release_barrier,
+			  uint64_t additional_flags, enum test_mode mode,
+			  bool expect_error, const char *name)
 {
 	struct {
 		struct fuse_in_header header;
@@ -207,6 +253,14 @@ static int run_case(bool advertise, bool advertise_uring,
 	};
 	const struct fuse_out_header *reply_header;
 	const struct fuse_init_out *reply_init;
+	const uint64_t wbcache_attr_flags =
+		FUSE_FS_EXTFUSE | FUSE_EXTFUSE_COHERENCE_EPOCHS |
+		FUSE_WRITEBACK_CACHE | FUSE_EXTFUSE_WBCACHE_PASSTHROUGH |
+		FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
+	const uint64_t native_attr_flags =
+		FUSE_PASSTHROUGH | FUSE_EXTFUSE_PASSTHROUGH_COHERENCE |
+		FUSE_EXTFUSE_PASSTHROUGH_COHERENCE_V2 |
+		FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
 	uint64_t reply_flags;
 	int pipefd[2] = { -1, -1 };
 	int rc = 1;
@@ -232,7 +286,8 @@ static int run_case(bool advertise, bool advertise_uring,
 	request.header.unique = 1;
 	request.init.major = FUSE_KERNEL_VERSION;
 	request.init.minor = FUSE_KERNEL_MINOR_VERSION;
-	request.init.flags = FUSE_INIT_EXT;
+	request.init.flags = FUSE_INIT_EXT | (uint32_t)additional_flags;
+	request.init.flags2 = (uint32_t)(additional_flags >> 32);
 	if (advertise)
 		request.init.flags2 |= (uint32_t)(FUSE_FS_EXTFUSE >> 32);
 	if (advertise_uring)
@@ -341,7 +396,9 @@ static int run_case(bool advertise, bool advertise_uring,
 	if ((mode == MODE_WANTED || mode == MODE_WANTED_COHERENCE ||
 	     mode == MODE_WANTED_COHERENCE_V2 ||
 	     mode == MODE_WANTED_ATTR_REFRESH ||
-	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER) &&
+	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER ||
+	     mode == MODE_WANTED_WBCACHE_PASSTHROUGH ||
+	     mode == MODE_WANTED_WBCACHE_ATTR_REFRESH) &&
 	    advertise) {
 		if (!state.helper_enabled ||
 		    !(reply_flags & FUSE_FS_EXTFUSE) ||
@@ -389,7 +446,8 @@ static int run_case(bool advertise, bool advertise_uring,
 		goto out_session;
 	}
 	if ((mode == MODE_WANTED_ATTR_REFRESH ||
-	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER) &&
+	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER ||
+	     mode == MODE_WANTED_WBCACHE_ATTR_REFRESH) &&
 	    advertise_attr_refresh) {
 		if (!state.attr_refresh_helper_enabled ||
 		    !(reply_flags & FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH)) {
@@ -420,6 +478,28 @@ static int run_case(bool advertise, bool advertise_uring,
 			name);
 		goto out_session;
 	}
+	if (mode == MODE_WANTED_WBCACHE_ATTR_REFRESH &&
+	    ((reply_flags & wbcache_attr_flags) != wbcache_attr_flags ||
+	     (reply_flags & native_attr_flags))) {
+		fprintf(stderr,
+			"%s: WBCache attr-refresh opt-in was not serialized\n",
+			name);
+		goto out_session;
+	}
+	if (mode == MODE_WANTED_WBCACHE_PASSTHROUGH &&
+	    (!state.wbcache_helper_enabled ||
+	     !(reply_flags & FUSE_WRITEBACK_CACHE) ||
+	     !(reply_flags & FUSE_EXTFUSE_WBCACHE_PASSTHROUGH) ||
+	     (reply_flags & (FUSE_EXTFUSE_COHERENCE_EPOCHS |
+			    FUSE_MUTATION_METADATA |
+			    FUSE_HAS_NOTIFY_INVAL_XATTR |
+			    FUSE_EXTFUSE_PASSTHROUGH_ATTR_REFRESH |
+			    FUSE_PASSTHROUGH)) ||
+	     reply_init->max_stack_depth != 1)) {
+		fprintf(stderr,
+			"paper WBCache passthrough opt-in was not serialized\n");
+		goto out_session;
+	}
 
 	rc = 0;
 
@@ -435,8 +515,23 @@ out_args:
 	return rc;
 }
 
+static int run_case(bool advertise, bool advertise_uring,
+		    bool advertise_coherence, bool advertise_coherence_v2,
+		    bool advertise_attr_refresh,
+		    bool advertise_attr_release_barrier, enum test_mode mode,
+		    bool expect_error, const char *name)
+{
+	return run_case_flags(advertise, advertise_uring, advertise_coherence,
+			      advertise_coherence_v2, advertise_attr_refresh,
+			      advertise_attr_release_barrier, 0, mode,
+			      expect_error, name);
+}
+
 int main(void)
 {
+	const uint64_t wbcache_attr_refresh_prerequisite_flags =
+		FUSE_EXTFUSE_COHERENCE_EPOCHS | FUSE_WRITEBACK_CACHE |
+		FUSE_EXTFUSE_WBCACHE_PASSTHROUGH;
 	int failed = 0;
 
 	failed |= run_case(false, false, false, false, false, false, MODE_NOT_WANTED,
@@ -470,6 +565,25 @@ int main(void)
 	failed |= run_case(true, false, true, true, false, false,
 			   MODE_FORCE_ATTR_REFRESH_WANT, true,
 			   "extfuse-attr-refresh-unadvertised-forced-want");
+	failed |= run_case_flags(
+		true, false, false, false, false, false,
+		FUSE_WRITEBACK_CACHE | FUSE_EXTFUSE_WBCACHE_PASSTHROUGH,
+		MODE_WANTED_WBCACHE_PASSTHROUGH, false,
+		"extfuse-paper-wbcache-passthrough-advertised-wanted");
+	failed |= run_case_flags(
+		true, false, false, false, true, false,
+		wbcache_attr_refresh_prerequisite_flags,
+		MODE_WANTED_WBCACHE_ATTR_REFRESH, false,
+		"extfuse-wbcache-attr-refresh-advertised-wanted");
+	failed |= run_case_flags(
+		true, false, false, false, true, false,
+		wbcache_attr_refresh_prerequisite_flags & ~FUSE_WRITEBACK_CACHE,
+		MODE_WANTED_WBCACHE_ATTR_REFRESH, true,
+		"extfuse-wbcache-attr-refresh-without-writeback-rejected");
+	failed |= run_case_flags(true, false, false, false, true, true,
+				 wbcache_attr_refresh_prerequisite_flags,
+				 MODE_WANTED_WBCACHE_ATTR_RELEASE_BARRIER, true,
+				 "extfuse-wbcache-release-barrier-rejected");
 	failed |= run_case(true, false, true, true, true, true,
 			   MODE_NOT_WANTED, false,
 			   "extfuse-attr-release-barrier-advertised-not-wanted");

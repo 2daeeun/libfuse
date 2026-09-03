@@ -17,7 +17,9 @@
 #define FUSE_OPS_COUNT 64
 
 /*
- * Private opcodes used only by the v6.19 native-passthrough coherence hook.
+ * Private opcodes used by the v6.19 ExtFUSE lower-I/O coherence hooks.
+ * READ/WRITE cover native and WBCache forwarding; MMAP marks native/DAX
+ * mappings at creation and cached mappings at their first shared-write fault.
  * They never appear on /dev/fuse and deliberately live above the FUSE ABI
  * opcode range used by this experiment.
  */

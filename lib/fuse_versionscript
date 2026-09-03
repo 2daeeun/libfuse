@@ -215,7 +215,10 @@ FUSE_3.17.3 {
 FUSE_3.18 {
 	global:
 		fuse_req_is_uring;
+		fuse_req_is_uring_zero_copy;
 		fuse_req_get_payload;
+		fuse_uring_submit_fixed_io;
+		fuse_reply_uring_zero_copy;
 		fuse_set_conn_flag;
 		fuse_lowlevel_notify_increment_epoch;
 		fuse_session_native_request_counter_start;

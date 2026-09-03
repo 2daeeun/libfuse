@@ -2487,6 +2487,12 @@ int fuse_session_receive_buf(struct fuse_session *se, struct fuse_buf *buf);
 bool fuse_req_is_uring(fuse_req_t req);
 
 /**
+ * Check whether the kernel placed this request's page payload in the
+ * io-uring entry's dynamic fixed-buffer slot.
+ */
+bool fuse_req_is_uring_zero_copy(fuse_req_t req);
+
+/**
  * Get the payload of a request
  * (for requests submitted through fuse-io-uring only)
  *
@@ -2503,6 +2509,39 @@ bool fuse_req_is_uring(fuse_req_t req);
  */
 int fuse_req_get_payload(fuse_req_t req, char **payload, size_t *payload_sz,
 			 void **mr);
+
+/**
+ * Completion callback for fuse_uring_submit_fixed_io().
+ *
+ * @param req request whose dynamic fixed buffer was used
+ * @param result non-negative byte count, or a negative errno value
+ * @param userdata opaque callback argument
+ */
+typedef void (*fuse_uring_fixed_io_callback_t)(fuse_req_t req,
+					       ssize_t result,
+					       void *userdata);
+
+/**
+ * Submit backing-file I/O directly against a zero-copied request's dynamic
+ * registered-buffer slot.  When write_to_fd is true this issues WRITE_FIXED
+ * from the request pages to fd; otherwise it issues READ_FIXED from fd into
+ * the request pages.  The callback runs on the same per-queue io-uring thread
+ * and must eventually reply to req.
+ *
+ * @return zero when queued, otherwise a negative errno value
+ */
+int fuse_uring_submit_fixed_io(fuse_req_t req, int fd, off_t offset,
+			       size_t size, bool write_to_fd,
+			       fuse_uring_fixed_io_callback_t callback,
+			       void *userdata);
+
+/**
+ * Complete a zero-copied READ without copying its page payload through the
+ * userspace payload pool.
+ *
+ * @return zero when the reply was queued, otherwise a negative errno value
+ */
+int fuse_reply_uring_zero_copy(fuse_req_t req, size_t count);
 
 #ifdef __cplusplus
 }

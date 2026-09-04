@@ -110,8 +110,15 @@ struct fuse_file_info {
 	 */
 	uint32_t io_uring_zero_copy : 1;
 
+	/**
+	 * Can be filled by open/create to request page-payload zero-copy only
+	 * for WRITE requests through the serving FUSE io-uring queue.  This is
+	 * mutually exclusive with io_uring_zero_copy.
+	 */
+	uint32_t io_uring_zero_copy_write : 1;
+
 	/** Padding.  Reserved for future use*/
-	uint32_t padding : 21;
+	uint32_t padding : 20;
 	uint32_t padding2 : 32;
 	uint32_t padding3 : 32;
 
@@ -643,10 +650,28 @@ struct fuse_loop_config_v1 {
 /**
  * Indicates support for FUSE io-uring payload buffer pools and per-entry
  * dynamic fixed buffers.  Requesting this capability makes libfuse create
- * zero-copy-capable queues; individual files opt in with
- * fuse_file_info.io_uring_zero_copy.
+ * zero-copy-capable queues; individual files opt in for both directions with
+ * fuse_file_info.io_uring_zero_copy or for WRITE only with
+ * fuse_file_info.io_uring_zero_copy_write.
  */
 #define FUSE_CAP_IO_URING_BUFPOOL (1ULL << 43)
+
+/**
+ * Indicates that the kernel can route synchronous READ directly to the daemon
+ * without running the negotiated ExtFUSE BPF program. Background readahead
+ * retains the ordinary ExtFUSE path. This requires ExtFUSE and is mutually
+ * exclusive with ExtFUSE writeback-cache forwarding and coherence epochs.
+ */
+#define FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY (1ULL << 44)
+
+/**
+ * Indicates that ExtFUSE writeback-cache forwarding can execute each per-open
+ * contiguous max_write FUSE_WRITE_CACHE run in bounded batches. A run may end
+ * with one contiguous partial write; a partial write cannot start or extend a
+ * run. This requires ExtFUSE, writeback cache, and ExtFUSE writeback-cache
+ * passthrough, and excludes coherence epochs.
+ */
+#define FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM (1ULL << 45)
 
 /**
  * Ioctl flags

@@ -160,7 +160,7 @@ struct xattr_value {
 #define PERF_INIT_BUFPOOL_FMT \
 	"uring_bufpool_capable=%u uring_bufpool_requested=%u "
 #define PERF_INIT_ZERO_COPY_FMT \
-	"uring_zero_copy_required=%u prog_fd=%u rc=%d "
+	"uring_fixed_write_required=%u prog_fd=%u rc=%d "
 #define PERF_INIT_STD_CAPS_FMT "capable_std=0x%08x want_std=0x%08x "
 #define PERF_INIT_EXT_CAPS_FMT \
 	"capable_ext=0x%016" PRIx64 " want_ext=0x%016" PRIx64 " "
@@ -313,6 +313,10 @@ struct perf_state {
 	const char *transport;
 	bool count_callbacks;
 	bool trace_metadata_upcalls;
+	bool read_upcall_only;
+	bool paper_write_fast;
+	bool c2_fixed_write;
+	bool wbcache_write_stream;
 	ebpf_context_t *bpf;
 	struct fuse_conn_info_opts *conn_opts;
 	struct fuse_session *session;
@@ -331,6 +335,11 @@ struct perf_state {
 	bool uring_bufpool_capable;
 	bool uring_bufpool_requested;
 	bool uring_zero_copy_required;
+	bool read_upcall_only_capable;
+	bool read_upcall_only_requested;
+	bool read_handler_removed;
+	bool wbcache_write_stream_capable;
+	bool wbcache_write_stream_requested;
 	bool passthrough_capable;
 	bool passthrough_requested;
 	bool wbcache_passthrough_capable;
@@ -355,7 +364,9 @@ struct perf_state {
 		*inode_generations[PERF_INODE_GENERATION_BUCKETS];
 	bool cache_bypass;
 	bool xattr_cache_bypass;
-	bool paper_capability_enodata_safe;
+	bool paper_capability_verified_absent;
+	const char *paper_capability_source;
+	atomic_bool paper_capability_enodata_safe;
 	pthread_mutex_t policy_mutex;
 };
 
@@ -420,9 +431,10 @@ static int verify_paper_capability_absent(const char *source)
 			source, errno, strerror(errno));
 		return -1;
 	}
-	perf_state.paper_capability_enodata_safe = true;
+	perf_state.paper_capability_verified_absent = true;
+	perf_state.paper_capability_source = source;
 	fprintf(stderr,
-		"PAPER_CAPABILITY_POLICY result=enabled source=%s lower_tree=verified-absent\n",
+		"PAPER_CAPABILITY_POLICY result=verified source=%s lower_tree=verified-absent\n",
 		source);
 	return 0;
 }
@@ -891,6 +903,30 @@ static bool strict_wbcache_coherence_enabled(void)
 {
 	return wbcache_passthrough_enabled() &&
 	       perf_state.profile == PERF_PROFILE_GATE;
+}
+
+static bool c2_fixed_write_enabled(void)
+{
+	return perf_state.c2_fixed_write &&
+	       perf_state.uring_bufpool_requested;
+}
+
+static void enable_c2_fixed_write_for_open(struct fuse_file_info *fi)
+{
+	if (c2_fixed_write_enabled())
+		fi->io_uring_zero_copy_write = 1;
+}
+
+static bool paper_capability_is_safe(void)
+{
+	return atomic_load_explicit(
+		&perf_state.paper_capability_enodata_safe,
+		memory_order_acquire);
+}
+
+static bool paper_write_fast_active(void)
+{
+	return perf_state.paper_write_fast && paper_capability_is_safe();
 }
 
 static const char *coherence_mode_name(void)
@@ -1379,19 +1415,21 @@ out:
 	return counter_value(&perf_state.counters.cache_bypass_errors) == 0;
 }
 
-static void cache_mutation_end(struct perf_cache_mutation *mutation)
+static bool cache_mutation_end(struct perf_cache_mutation *mutation)
 {
 	struct perf_inode_generation *state;
 	bool invalid_state = false;
+	bool quiescent = true;
 	size_t index;
 
 	if (!mutation->armed)
-		return;
+		return false;
 	pthread_mutex_lock(&perf_state.backing_mutex);
 	for (index = 0; index < mutation->count; index++) {
 		state = find_inode_generation_locked(mutation->inodes[index]);
 		if (!state || !state->active) {
 			invalid_state = true;
+			quiescent = false;
 			continue;
 		}
 		if (state->generation == EXTFUSE_NATIVE_STATE_SEQUENCE_MAX)
@@ -1399,19 +1437,25 @@ static void cache_mutation_end(struct perf_cache_mutation *mutation)
 		else {
 			state->generation++;
 			state->active--;
+			if (state->active)
+				quiescent = false;
 			publish_inode_generation_locked(
 				mutation->inodes[index], state,
 				"daemon-mutation-end");
 			continue;
 		}
 		state->active--;
+		quiescent = false;
 	}
 	mutation->armed = false;
 	if (invalid_state) {
 		counter_increment(&perf_state.counters.passthrough_state_errors);
 		disable_all_caches_locked("inode-generation-state");
 	}
+	if (perf_state.cache_bypass)
+		quiescent = false;
 	pthread_mutex_unlock(&perf_state.backing_mutex);
+	return quiescent && !invalid_state;
 }
 
 static uint64_t timeout_seconds(double timeout)
@@ -2539,13 +2583,18 @@ static int configure_bpf_policy(void)
 	uint32_t key = 0;
 	uint32_t flags = 0;
 	uint32_t observed = 0;
+	bool capability_policy_was_safe;
+	bool capability_policy_is_safe;
 
 	if (wbcache_passthrough_enabled())
 		flags |= EXTFUSE_POLICY_WBCACHE_PASSTHROUGH;
 	if (paper_wbcache_passthrough_enabled())
 		flags |= EXTFUSE_POLICY_PAPER_READ_ATIME_CACHE;
-	if (perf_state.paper_capability_enodata_safe)
+	if (perf_state.paper_capability_verified_absent)
 		flags |= EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA;
+	if (perf_state.paper_write_fast &&
+	    perf_state.paper_capability_verified_absent)
+		flags |= EXTFUSE_POLICY_PAPER_WRITE_FAST;
 	if (perf_state.passthrough_attr_release_barrier_requested)
 		flags |= EXTFUSE_POLICY_ATTR_RELEASE_BARRIER;
 	if (coherence_epochs_enabled())
@@ -2572,8 +2621,20 @@ static int configure_bpf_policy(void)
 		return -1;
 	}
 	perf_state.bpf_policy_flags = flags;
+	/* Publish userspace fast-path eligibility only after the BPF policy. */
+	capability_policy_was_safe = paper_capability_is_safe();
+	capability_policy_is_safe =
+		(flags & EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA) != 0;
+	atomic_store_explicit(
+		&perf_state.paper_capability_enodata_safe,
+		capability_policy_is_safe,
+		memory_order_release);
+	if (capability_policy_is_safe && !capability_policy_was_safe)
+		fprintf(stderr,
+			"PAPER_CAPABILITY_POLICY result=enabled source=%s lower_tree=verified-absent\n",
+			perf_state.paper_capability_source);
 	fprintf(stderr,
-		"BPF_POLICY flags=0x%08x %s=%s %s=%s %s=%s %s=%s %s=%s %s=%s\n",
+		"BPF_POLICY flags=0x%08x %s=%s %s=%s %s=%s %s=%s %s=%s %s=%s %s=%s\n",
 		flags,
 		"paper_read_atime_cache",
 		(flags & EXTFUSE_POLICY_PAPER_READ_ATIME_CACHE) ?
@@ -2592,6 +2653,9 @@ static int configure_bpf_policy(void)
 			"enabled" : "disabled",
 		"paper_capability_enodata",
 		(flags & EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA) ?
+			"enabled" : "disabled",
+		"paper_write_fast",
+		(flags & EXTFUSE_POLICY_PAPER_WRITE_FAST) ?
 			"enabled" : "disabled");
 	return 0;
 }
@@ -2601,13 +2665,15 @@ static void revoke_paper_capability_enodata(const char *operation)
 	uint32_t key = 0;
 	uint32_t flags;
 
-	if (!perf_state.bpf ||
-	    !perf_state.paper_capability_enodata_safe)
+	if (!perf_state.bpf || !paper_capability_is_safe())
 		return;
 	pthread_mutex_lock(&perf_state.policy_mutex);
-	if (!perf_state.paper_capability_enodata_safe)
+	if (!paper_capability_is_safe())
 		goto out;
-	perf_state.paper_capability_enodata_safe = false;
+	/* Publish the slow-path transition before clearing either BPF policy. */
+	perf_state.paper_capability_verified_absent = false;
+	atomic_store_explicit(&perf_state.paper_capability_enodata_safe, false,
+			      memory_order_release);
 	if (ebpf_data_lookup(perf_state.bpf, &key, &flags,
 			     EXTFUSE_POLICY_MAP)) {
 		fprintf(stderr,
@@ -2616,7 +2682,8 @@ static void revoke_paper_capability_enodata(const char *operation)
 		request_allopt_session_exit();
 		goto out;
 	}
-	flags &= ~EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA;
+	flags &= ~(EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA |
+		   EXTFUSE_POLICY_PAPER_WRITE_FAST);
 	if (ebpf_data_update(perf_state.bpf, &key, &flags,
 			     EXTFUSE_POLICY_MAP, 1)) {
 		fprintf(stderr,
@@ -2669,10 +2736,10 @@ static int force_all_upcalls(void)
 static int disable_nonmetadata_hits(void)
 {
 	uint32_t opcodes[] = { FUSE_FLUSH, FUSE_READ };
-	bool retain_read_attr =
+	bool remove_read_handler =
 		perf_state.mode == PERF_MODE_HIT &&
 		perf_state.profile == PERF_PROFILE_PAPER_LIKE;
-	size_t opcode_count = retain_read_attr ? 2 : 1;
+	size_t opcode_count = remove_read_handler ? 2 : 1;
 	size_t i;
 
 	for (i = 0; i < opcode_count; i++) {
@@ -2685,10 +2752,11 @@ static int disable_nonmetadata_hits(void)
 			return -1;
 		}
 	}
+	perf_state.read_handler_removed = remove_read_handler;
 	fprintf(stderr,
 		"HANDLERS mode=hit common_fastpath=LOOKUP,GETATTR,GETXATTR "
 		"forced_upcall=FLUSH paper_read_attr_policy=%s\n",
-		retain_read_attr ? "retain" : "coherent-refresh");
+		remove_read_handler ? "retain" : "coherent-refresh");
 	return 0;
 }
 
@@ -2962,12 +3030,12 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		 FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH) != 0;
 	perf_state.uring_bufpool_capable =
 		(conn->capable_ext & FUSE_CAP_IO_URING_BUFPOOL) != 0;
-	/*
-	 * C2 is MDOpt transported over the standard libfuse io_uring queue.  The
-	 * experimental per-request fixed-buffer path remains available as a generic
-	 * opt-in API, but it is not part of the paper configuration.
-	 */
-	perf_state.uring_zero_copy_required = false;
+	perf_state.read_upcall_only_capable =
+		(conn->capable_ext & FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY) != 0;
+	perf_state.wbcache_write_stream_capable =
+		(conn->capable_ext &
+		 FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM) != 0;
+	perf_state.uring_zero_copy_required = perf_state.c2_fixed_write;
 	if (wbcache_passthrough_enabled()) {
 		/* C3/C4 retain the upper FUSE cache; native passthrough stays off. */
 		lo->writeback = 1;
@@ -2981,8 +3049,22 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 	if (!strcmp(perf_state.transport, "uring"))
 		perf_state.single_issuer = fuse_set_conn_flag(
 			conn, FUSE_CONN_FLAG_SINGLE_ISSUER);
-	fuse_unset_feature_flag(conn, FUSE_CAP_IO_URING_BUFPOOL);
-	perf_state.uring_bufpool_requested = false;
+	if (perf_state.uring_zero_copy_required) {
+		if (perf_state.uring_bufpool_capable)
+			perf_state.uring_bufpool_requested =
+				fuse_set_feature_flag(
+					conn, FUSE_CAP_IO_URING_BUFPOOL);
+		if (!perf_state.single_issuer ||
+		    !perf_state.uring_bufpool_requested) {
+			if (!perf_state.init_rc)
+				perf_state.init_rc = -EOPNOTSUPP;
+			/* Never measure C2 fixed WRITE through a copied fallback. */
+			conn->want_ext |= FUSE_CAP_IO_URING_BUFPOOL;
+		}
+	} else {
+		fuse_unset_feature_flag(conn, FUSE_CAP_IO_URING_BUFPOOL);
+		perf_state.uring_bufpool_requested = false;
+	}
 	perf_state.capable =
 		(conn->capable_ext & FUSE_CAP_EXTFUSE) != 0;
 	if (perf_state.mode != PERF_MODE_OFF) {
@@ -2993,6 +3075,22 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 			if (!perf_state.init_rc)
 				perf_state.init_rc = extfuse_rc;
 		}
+	}
+	if (perf_state.read_upcall_only && perf_state.requested &&
+	    perf_state.read_handler_removed) {
+		if (perf_state.read_upcall_only_capable)
+			perf_state.read_upcall_only_requested =
+				fuse_set_feature_flag(
+					conn,
+					FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY);
+		if (!perf_state.read_upcall_only_requested) {
+			if (!perf_state.init_rc)
+				perf_state.init_rc = -EOPNOTSUPP;
+			conn->want_ext |= FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY;
+		}
+	} else {
+		fuse_unset_feature_flag(conn,
+				FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY);
 	}
 	if (perf_state.requested && strict_wbcache_coherence_enabled()) {
 		if (perf_state.coherence_epochs_capable)
@@ -3045,6 +3143,20 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 			conn->want_ext |=
 				FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH;
 		}
+		if (perf_state.wbcache_write_stream &&
+		    perf_state.wbcache_passthrough_requested &&
+		    perf_state.wbcache_write_stream_capable)
+			perf_state.wbcache_write_stream_requested =
+				fuse_set_feature_flag(
+					conn,
+					FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM);
+		if (perf_state.wbcache_write_stream &&
+		    !perf_state.wbcache_write_stream_requested) {
+			if (!perf_state.init_rc)
+				perf_state.init_rc = -EOPNOTSUPP;
+			conn->want_ext |=
+				FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM;
+		}
 		if (perf_state.wbcache_passthrough_requested &&
 		    perf_state.passthrough_attr_refresh_capable)
 			perf_state.passthrough_attr_refresh_requested =
@@ -3088,6 +3200,9 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		PERF_NOTIFY_INVAL_XATTR_INIT_FMT
 		"passthrough_capable=%u passthrough_requested=%u "
 		PERF_WBCACHE_PASSTHROUGH_INIT_FMT
+		"read_upcall_only_capable=%u read_upcall_only_requested=%u "
+		"wbcache_write_stream_capable=%u "
+		"wbcache_write_stream_requested=%u "
 		"passthrough_coherence_capable=%u "
 		"passthrough_coherence_requested=%u "
 		"passthrough_coherence_v2_capable=%u "
@@ -3097,6 +3212,7 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		PERF_ATTR_RELEASE_BARRIER_INIT_FMT
 		"paper_read_atime_cache=%s "
 		"paper_capability_enodata=%s "
+		"paper_write_fast_enabled=%u "
 		"wbcache_policy_enabled=%u "
 		"readdirplus_policy=stackfs-compatible-disabled "
 		"readdirplus_requested=%u readdirplus_auto_requested=%u "
@@ -3120,6 +3236,10 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		perf_state.passthrough_requested,
 		perf_state.wbcache_passthrough_capable,
 		perf_state.wbcache_passthrough_requested,
+		perf_state.read_upcall_only_capable,
+		perf_state.read_upcall_only_requested,
+		perf_state.wbcache_write_stream_capable,
+		perf_state.wbcache_write_stream_requested,
 		perf_state.passthrough_coherence_capable,
 		perf_state.passthrough_coherence_requested,
 		perf_state.passthrough_coherence_v2_capable,
@@ -3138,6 +3258,8 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		(perf_state.bpf_policy_flags &
 		 EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA) ?
 			"enabled" : "disabled",
+		(perf_state.bpf_policy_flags &
+		 EXTFUSE_POLICY_PAPER_WRITE_FAST) != 0,
 		(perf_state.bpf_policy_flags &
 		 EXTFUSE_POLICY_WBCACHE_PASSTHROUGH) != 0,
 		(conn->want_ext & FUSE_CAP_READDIRPLUS) != 0,
@@ -3608,6 +3730,7 @@ static void perf_tmpfile(fuse_req_t req, fuse_ino_t parent, mode_t mode,
 	else if (lo->cache == CACHE_ALWAYS)
 		fi->keep_cache = 1;
 	fi->parallel_direct_writes = 1;
+	enable_c2_fixed_write_for_open(fi);
 	if (wbcache_passthrough_enabled())
 		attach_wbcache_passthrough(req, entry.ino, fd, fi, candidate,
 					   tombstone_candidate);
@@ -3706,6 +3829,7 @@ void perf_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 	else if (lo->cache == CACHE_ALWAYS)
 		fi->keep_cache = 1;
 	fi->parallel_direct_writes = 1;
+	enable_c2_fixed_write_for_open(fi);
 
 	error = lo_do_lookup(req, parent, name, &entry);
 	if (error) {
@@ -4046,6 +4170,7 @@ void perf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 		pthread_mutex_unlock(xattr_lock);
 	}
 
+	enable_c2_fixed_write_for_open(fi);
 	if (wbcache_passthrough_enabled())
 		attach_wbcache_passthrough(req, ino, (int)fi->fh, fi, candidate,
 					   tombstone_candidate);
@@ -4241,6 +4366,179 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 	fuse_reply_err(req, 0);
 }
 
+struct perf_uring_write_context {
+	struct perf_cache_mutation mutation;
+	struct lo_data *lo;
+	fuse_ino_t ino;
+	size_t requested;
+	int inode_fd;
+	dev_t dev;
+	ino_t lower_ino;
+	bool capability_fast;
+};
+
+static void perf_write_contract_failed(const char *path,
+				       const char *operation, int error)
+{
+	int report_error = error < 0 ? -error : error;
+
+	fprintf(stderr,
+		"FUSE_WRITE_CONTRACT_ERROR path=%s operation=%s error=%d reason=%s\n",
+		path, operation, error, strerror(report_error));
+	if (perf_state.session)
+		fuse_session_exit(perf_state.session);
+}
+
+static void refill_capability_after_write(fuse_req_t req, fuse_ino_t ino)
+{
+	pthread_mutex_t *xattr_lock = xattr_lock_for_inode(ino);
+
+	pthread_mutex_lock(xattr_lock);
+	invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
+	prefetch_xattr_serialized(req, ino, PERF_CAPABILITY_XATTR);
+	pthread_mutex_unlock(xattr_lock);
+}
+
+static enum perf_cache_attr_outcome publish_pinned_write_attr(
+	fuse_ino_t ino, int inode_fd, dev_t dev, ino_t lower_ino,
+	struct lo_data *lo, struct stat *st, double *reply_timeout)
+{
+	struct perf_cache_snapshot snapshot;
+
+	if (!cache_snapshot_begin(ino, &snapshot))
+		return PERF_CACHE_ATTR_ERROR;
+	if ((snapshot.daemon_state | snapshot.native_state) &
+	    EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
+		return PERF_CACHE_ATTR_UNSTABLE;
+	if (extfuse_snapshot_pinned_inode(inode_fd, dev, lower_ino, st))
+		return PERF_CACHE_ATTR_ERROR;
+	return cache_attr(ino, st, lo->timeout, &snapshot, false,
+			  reply_timeout);
+}
+
+static void perf_uring_write_complete(fuse_req_t req, ssize_t result,
+				      void *userdata)
+{
+	struct perf_uring_write_context *context = userdata;
+	struct stat st;
+	double ignored_reply_timeout;
+	enum perf_cache_attr_outcome attr_outcome = PERF_CACHE_ATTR_MISSING;
+	bool attr_published = false;
+	bool quiescent;
+	int reply_result;
+
+	quiescent = cache_mutation_end(&context->mutation);
+	if (quiescent &&
+	    (!context->capability_fast || !paper_capability_is_safe()))
+		refill_capability_after_write(req, context->ino);
+	if (quiescent) {
+		attr_outcome = publish_pinned_write_attr(
+			context->ino, context->inode_fd, context->dev,
+			context->lower_ino, context->lo, &st,
+			&ignored_reply_timeout);
+		attr_published = attr_outcome == PERF_CACHE_ATTR_PUBLISHED;
+	}
+
+	if (result < 0) {
+		reply_result = fuse_reply_err(req, (int)-result);
+		perf_write_contract_failed("uring-fixed", "write-io",
+					   (int)result);
+	} else if ((size_t)result > context->requested) {
+		reply_result = fuse_reply_err(req, EIO);
+		perf_write_contract_failed("uring-fixed", "write-oversize",
+					   EIO);
+	} else {
+		reply_result = fuse_reply_write(req, (size_t)result);
+		if ((size_t)result != context->requested)
+			perf_write_contract_failed("uring-fixed", "write-short",
+						   EIO);
+	}
+	/* A new writer may supersede quiescence before this snapshot is installed. */
+	if (quiescent && !attr_published &&
+	    attr_outcome != PERF_CACHE_ATTR_UNSTABLE)
+		perf_write_contract_failed(
+			"uring-fixed", "write-attr-publication", EIO);
+	if (reply_result)
+		perf_write_contract_failed("uring-fixed", "write-reply",
+					   reply_result);
+	free(context);
+}
+
+static void perf_write_uring_zero_copy(fuse_req_t req, fuse_ino_t ino,
+				       struct fuse_bufvec *buffer,
+				       off_t offset,
+				       struct fuse_file_info *fi)
+{
+	struct perf_uring_write_context *context;
+	struct lo_inode *inode;
+	enum perf_cache_attr_outcome attr_outcome = PERF_CACHE_ATTR_MISSING;
+	bool attr_published = false;
+	bool quiescent;
+	int reply_result;
+	int result;
+
+	if (!fuse_req_is_uring_zero_copy(req)) {
+		fuse_reply_err(req, EOPNOTSUPP);
+		perf_write_contract_failed("uring-fixed", "write-request",
+					   EOPNOTSUPP);
+		return;
+	}
+	context = calloc(1, sizeof(*context));
+	if (!context) {
+		fuse_reply_err(req, ENOMEM);
+		perf_write_contract_failed("uring-fixed", "write-context",
+					   ENOMEM);
+		return;
+	}
+	inode = lo_inode(req, ino);
+	context->lo = lo_data(req);
+	context->ino = ino;
+	context->requested = fuse_buf_size(buffer);
+	context->inode_fd = inode->fd;
+	context->dev = inode->dev;
+	context->lower_ino = inode->ino;
+	context->capability_fast = paper_write_fast_active();
+	cache_mutation_add(&context->mutation, ino);
+	if (!cache_mutation_begin(&context->mutation)) {
+		cache_mutation_end(&context->mutation);
+		free(context);
+		fuse_reply_err(req, EIO);
+		perf_write_contract_failed(
+			"uring-fixed", "write-mutation-begin", EIO);
+		return;
+	}
+	result = fuse_uring_submit_fixed_io(
+		req, (int)fi->fh, offset, context->requested, true,
+		perf_uring_write_complete, context);
+	if (!result)
+		return;
+
+	quiescent = cache_mutation_end(&context->mutation);
+	if (quiescent &&
+	    (!context->capability_fast || !paper_capability_is_safe()))
+		refill_capability_after_write(req, ino);
+	if (quiescent) {
+		struct stat st;
+		double ignored_reply_timeout;
+
+		attr_outcome = publish_pinned_write_attr(
+			ino, context->inode_fd, context->dev,
+			context->lower_ino, context->lo, &st,
+			&ignored_reply_timeout);
+		attr_published = attr_outcome == PERF_CACHE_ATTR_PUBLISHED;
+	}
+	free(context);
+	reply_result = fuse_reply_err(req, -result);
+	if (quiescent && !attr_published &&
+	    attr_outcome != PERF_CACHE_ATTR_UNSTABLE)
+		perf_write_contract_failed(
+			"uring-fixed", "write-submit-attr-publication", EIO);
+	if (reply_result)
+		perf_write_contract_failed(
+			"uring-fixed", "write-submit-reply", reply_result);
+	perf_write_contract_failed("uring-fixed", "write-submit", result);
+}
+
 __attribute__((noinline, used))
 void perf_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	       off_t offset, struct fuse_file_info *fi)
@@ -4316,13 +4614,18 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 	struct lo_data *lo;
 	struct lo_inode *inode;
 	struct perf_cache_mutation mutation = {};
-	pthread_mutex_t *xattr_lock;
+	pthread_mutex_t *xattr_lock = NULL;
 	struct stat st;
 	double ignored_reply_timeout;
 	struct perf_cache_snapshot snapshot;
 	struct fuse_mutation_attr mutation_attr;
-	bool carry_negative_capability;
+	enum perf_cache_attr_outcome attr_outcome = PERF_CACHE_ATTR_MISSING;
+	bool carry_negative_capability = false;
+	bool capability_fast;
 	bool have_attr = false;
+	bool publish_attr;
+	bool quiescent;
+	int reply_result;
 	uint64_t negative_capability_daemon_state;
 	ssize_t result;
 	int inode_fd;
@@ -4331,6 +4634,10 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 		counter_increment(
 			&perf_state.counters.wbcache_daemon_write_fallbacks);
 	callback_increment(&perf_state.counters.write);
+	if (c2_fixed_write_enabled()) {
+		perf_write_uring_zero_copy(req, ino, buffer, offset, fi);
+		return;
+	}
 	if (!metadata_hits_enabled()) {
 		lo_write_buf(req, ino, buffer, offset, fi);
 		return;
@@ -4338,36 +4645,57 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 	lo = lo_data(req);
 	inode = lo_inode(req, ino);
 	inode_fd = inode->fd;
-	xattr_lock = xattr_lock_for_inode(ino);
-	pthread_mutex_lock(xattr_lock);
-	carry_negative_capability =
-		negative_capability_cache_current_serialized(
-			ino, &negative_capability_daemon_state);
+	capability_fast = paper_write_fast_active();
+	if (!capability_fast) {
+		xattr_lock = xattr_lock_for_inode(ino);
+		pthread_mutex_lock(xattr_lock);
+		carry_negative_capability =
+			negative_capability_cache_current_serialized(
+				ino, &negative_capability_daemon_state);
+	}
 	cache_mutation_add(&mutation, ino);
 	if (!cache_mutation_begin(&mutation)) {
 		cache_mutation_end(&mutation);
-		pthread_mutex_unlock(xattr_lock);
+		if (xattr_lock)
+			pthread_mutex_unlock(xattr_lock);
 		fuse_reply_err(req, EIO);
 		return;
 	}
-	invalidate_attr(ino);
-	if (!carry_negative_capability)
-		invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
+	if (!capability_fast) {
+		/* Preserve the legacy C1/C2 and C3/C4 daemon fallback contract. */
+		invalidate_attr(ino);
+		if (!carry_negative_capability)
+			invalidate_xattr_serialized(
+				ino, PERF_CAPABILITY_XATTR, true);
+	}
 	result = lo_do_write_buf(req, ino, buffer, offset, fi);
-	cache_mutation_end(&mutation);
-	if (result >= 0 && carry_negative_capability)
+	quiescent = cache_mutation_end(&mutation);
+	if (!capability_fast && result >= 0 && carry_negative_capability)
 		refresh_negative_capability_serialized(
 			ino, negative_capability_daemon_state);
-	pthread_mutex_unlock(xattr_lock);
+	if (xattr_lock)
+		pthread_mutex_unlock(xattr_lock);
+	if (result >= 0 && quiescent && perf_state.paper_write_fast &&
+	    !paper_capability_is_safe())
+		refill_capability_after_write(req, ino);
 
 	if (result >= 0) {
-		/* Populate the new snapshot before the successful WRITE reply. */
-		cache_snapshot_begin(ino, &snapshot);
-		if (!extfuse_snapshot_pinned_inode(inode_fd, inode->dev,
-						    inode->ino, &st)) {
-			cache_attr(ino, &st, lo->timeout, &snapshot, false,
-				   &ignored_reply_timeout);
-			have_attr = true;
+		/* Coalesce only the explicit paper-fast writer cohort. */
+		publish_attr = !capability_fast || quiescent;
+		if (publish_attr && cache_snapshot_begin(ino, &snapshot)) {
+			if (capability_fast &&
+			    ((snapshot.daemon_state | snapshot.native_state) &
+			     EXTFUSE_NATIVE_STATE_ACTIVE_MASK)) {
+				attr_outcome = PERF_CACHE_ATTR_UNSTABLE;
+			} else if (!extfuse_snapshot_pinned_inode(
+					   inode_fd, inode->dev, inode->ino, &st)) {
+				attr_outcome = cache_attr(
+					ino, &st, lo->timeout, &snapshot, false,
+					&ignored_reply_timeout);
+				/* Legacy/C3/C4 retain their pre-existing reply behavior. */
+				have_attr = !capability_fast ||
+					    attr_outcome == PERF_CACHE_ATTR_PUBLISHED;
+			}
 		}
 		if (have_attr && mutation_metadata_enabled()) {
 			mutation_attr = (struct fuse_mutation_attr) {
@@ -4377,11 +4705,19 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 					ino, ignored_reply_timeout),
 				.flags = FUSE_MUTATION_NODE_ATTR_VALID,
 			};
-			fuse_reply_write_attr(req, (size_t)result,
-					      &mutation_attr);
+			reply_result = fuse_reply_write_attr(
+				req, (size_t)result, &mutation_attr);
 		} else {
-			fuse_reply_write(req, (size_t)result);
+			reply_result = fuse_reply_write(req, (size_t)result);
 		}
+		/* UNSTABLE means a newer writer now owns the final publication. */
+		if (capability_fast && quiescent && !have_attr &&
+		    attr_outcome != PERF_CACHE_ATTR_UNSTABLE)
+			perf_write_contract_failed(
+				"sync", "write-attr-publication", EIO);
+		if (capability_fast && reply_result)
+			perf_write_contract_failed(
+				"sync", "write-reply", reply_result);
 	} else {
 		fuse_reply_err(req, (int)-result);
 	}
@@ -5150,6 +5486,52 @@ static int parse_metadata_upcall_tracing(bool *enabled)
 	return -1;
 }
 
+static int parse_boolean_environment(const char *name, bool *enabled)
+{
+	const char *text = getenv(name);
+
+	if (!text || !strcmp(text, "0")) {
+		*enabled = false;
+		return 0;
+	}
+	if (!strcmp(text, "1")) {
+		*enabled = true;
+		return 0;
+	}
+	return -1;
+}
+
+static int validate_experiment_toggles(void)
+{
+	bool paper_profile = perf_state.profile == PERF_PROFILE_PAPER_LIKE;
+	bool c1_or_c2 = perf_state.mode == PERF_MODE_HIT && paper_profile;
+	bool c3_or_c4 = perf_state.mode == PERF_MODE_ALLOPT && paper_profile;
+
+	if (perf_state.read_upcall_only && !c1_or_c2) {
+		fprintf(stderr,
+			"EXTFUSE_READ_UPCALL_ONLY requires hit mode and paper-like profile\n");
+		return -1;
+	}
+	if (perf_state.paper_write_fast && !c1_or_c2) {
+		fprintf(stderr,
+			"EXTFUSE_PAPER_WRITE_FAST requires hit mode and paper-like profile\n");
+		return -1;
+	}
+	if (perf_state.c2_fixed_write &&
+	    (!c1_or_c2 || strcmp(perf_state.transport, "uring") ||
+	     !perf_state.paper_write_fast)) {
+		fprintf(stderr,
+			"EXTFUSE_C2_FIXED_WRITE requires hit mode, uring transport, paper-like profile, and EXTFUSE_PAPER_WRITE_FAST=1\n");
+		return -1;
+	}
+	if (perf_state.wbcache_write_stream && !c3_or_c4) {
+		fprintf(stderr,
+			"EXTFUSE_WBCACHE_WRITE_STREAM requires allopt mode and paper-like profile\n");
+		return -1;
+	}
+	return 0;
+}
+
 static int parse_uring_q_depth(unsigned int *q_depth)
 {
 	const char *text = getenv("EXTFUSE_URING_Q_DEPTH");
@@ -5217,6 +5599,20 @@ int main(int argc, char **argv)
 			"EXTFUSE_TRACE_METADATA_UPCALLS must be 0 or 1\n");
 		return 2;
 	}
+	if (parse_boolean_environment("EXTFUSE_READ_UPCALL_ONLY",
+				      &perf_state.read_upcall_only) ||
+	    parse_boolean_environment("EXTFUSE_PAPER_WRITE_FAST",
+				      &perf_state.paper_write_fast) ||
+	    parse_boolean_environment("EXTFUSE_C2_FIXED_WRITE",
+				      &perf_state.c2_fixed_write) ||
+	    parse_boolean_environment("EXTFUSE_WBCACHE_WRITE_STREAM",
+				      &perf_state.wbcache_write_stream)) {
+		fprintf(stderr,
+			"ExtFUSE experiment toggles must be exactly 0 or 1\n");
+		return 2;
+	}
+	if (validate_experiment_toggles())
+		return 2;
 	if (perf_state.trace_metadata_upcalls &&
 	    perf_state.mode != PERF_MODE_HIT &&
 	    perf_state.mode != PERF_MODE_ALLOPT) {
@@ -5364,11 +5760,15 @@ int main(int argc, char **argv)
 		"START mode=%s transport=%s profile=%s source=%s "
 		PERF_START_MOUNT_FMT
 		PERF_START_WBCACHE_FMT
+		"EXTFUSE_READ_UPCALL_ONLY=%u EXTFUSE_PAPER_WRITE_FAST=%u "
+		"EXTFUSE_C2_FIXED_WRITE=%u EXTFUSE_WBCACHE_WRITE_STREAM=%u "
 		"xattr_lock_buckets=%u passthrough_extra_args=%zu "
 		"mount_options=%s\n",
 		perf_state.mode_name, perf_state.transport, argv[3],
 		source, mountpoint, debug_enabled, perf_state.count_callbacks,
-		wbcache_passthrough_enabled(), PERF_XATTR_LOCK_BUCKETS,
+		wbcache_passthrough_enabled(), perf_state.read_upcall_only,
+		perf_state.paper_write_fast, perf_state.c2_fixed_write,
+		perf_state.wbcache_write_stream, PERF_XATTR_LOCK_BUCKETS,
 		extra_argc, options);
 	for (i = 0; i < extra_argc; i++)
 		fprintf(stderr, "PASSTHROUGH_ARG index=%zu value=%s\n", i,

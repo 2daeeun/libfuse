@@ -82,6 +82,10 @@ static const struct cap_info capabilities[] = {
 	{FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH,
 				"FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH"},
 	{FUSE_CAP_IO_URING_BUFPOOL,		"FUSE_CAP_IO_URING_BUFPOOL"},
+	{FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY,
+				"FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY"},
+	{FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM,
+				"FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM"},
     // Add any new capabilities here
     {0, NULL} // Sentinel to mark the end of the array
 };

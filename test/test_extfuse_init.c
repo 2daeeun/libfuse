@@ -50,6 +50,16 @@ _Static_assert(FUSE_HAS_IO_URING_BUFPOOL == (1ULL << 52),
 	       "unexpected io-uring buffer-pool wire bit");
 _Static_assert(FOPEN_IO_URING_ZERO_COPY == (1U << 9),
 	       "unexpected io-uring zero-copy open bit");
+_Static_assert(FOPEN_IO_URING_ZERO_COPY_WRITE == (1U << 10),
+	       "unexpected io-uring write-only zero-copy open bit");
+_Static_assert(FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY == (1ULL << 44),
+	       "unexpected READ upcall-only capability bit");
+_Static_assert(FUSE_EXTFUSE_READ_UPCALL_ONLY == (1ULL << 53),
+	       "unexpected READ upcall-only wire bit");
+_Static_assert(FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM == (1ULL << 45),
+	       "unexpected WBCache write-stream capability bit");
+_Static_assert(FUSE_EXTFUSE_WBCACHE_WRITE_STREAM == (1ULL << 54),
+	       "unexpected WBCache write-stream wire bit");
 _Static_assert(FUSE_IO_URING_CMD_ADD_QUEUE == 3,
 	       "unexpected io-uring add-queue command");
 _Static_assert(FUSE_IO_URING_CMD_ADD_BUFPOOL == 4,
@@ -85,6 +95,8 @@ enum test_mode {
 	MODE_WANTED_WBCACHE_PASSTHROUGH,
 	MODE_WANTED_WBCACHE_ATTR_REFRESH,
 	MODE_WANTED_WBCACHE_ATTR_RELEASE_BARRIER,
+	MODE_WANTED_READ_UPCALL_ONLY,
+	MODE_WANTED_WBCACHE_WRITE_STREAM,
 	MODE_FORCE_INVALID_WANT,
 	MODE_FORCE_ATTR_REFRESH_WANT,
 	MODE_FORCE_ATTR_RELEASE_BARRIER_WANT,
@@ -98,6 +110,8 @@ struct test_state {
 	bool saw_coherence_v2_capability;
 	bool saw_attr_refresh_capability;
 	bool saw_attr_release_barrier_capability;
+	bool saw_read_upcall_only_capability;
+	bool saw_wbcache_write_stream_capability;
 	bool helper_enabled;
 	bool passthrough_helper_enabled;
 	bool coherence_helper_enabled;
@@ -105,6 +119,8 @@ struct test_state {
 	bool attr_refresh_helper_enabled;
 	bool attr_release_barrier_helper_enabled;
 	bool wbcache_helper_enabled;
+	bool read_upcall_only_helper_enabled;
+	bool wbcache_write_stream_helper_enabled;
 	_Alignas(max_align_t)
 	unsigned char reply[sizeof(struct fuse_out_header) +
 			    sizeof(struct fuse_init_out)];
@@ -127,8 +143,24 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH);
 	state->saw_attr_release_barrier_capability = fuse_get_feature_flag(
 		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
+	state->saw_read_upcall_only_capability = fuse_get_feature_flag(
+		conn, FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY);
+	state->saw_wbcache_write_stream_capability = fuse_get_feature_flag(
+		conn, FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM);
 
-	if (state->mode == MODE_WANTED_WBCACHE_PASSTHROUGH) {
+	if (state->mode == MODE_WANTED_WBCACHE_WRITE_STREAM) {
+		state->helper_enabled =
+			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE);
+		fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
+		state->wbcache_helper_enabled = fuse_set_feature_flag(
+			conn, FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH);
+		state->wbcache_write_stream_helper_enabled =
+			fuse_set_feature_flag(
+				conn,
+				FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM);
+		conn->max_backing_stack_depth = FUSE_BACKING_STACKED_UNDER;
+		conn->extfuse_prog_fd = TEST_PROG_FD;
+	} else if (state->mode == MODE_WANTED_WBCACHE_PASSTHROUGH) {
 		state->helper_enabled =
 			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE);
 		fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
@@ -149,6 +181,12 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 			state->attr_release_barrier_helper_enabled = fuse_set_feature_flag(
 				conn,
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
+		conn->extfuse_prog_fd = TEST_PROG_FD;
+	} else if (state->mode == MODE_WANTED_READ_UPCALL_ONLY) {
+		state->helper_enabled =
+			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE);
+		state->read_upcall_only_helper_enabled = fuse_set_feature_flag(
+			conn, FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY);
 		conn->extfuse_prog_fd = TEST_PROG_FD;
 	} else if (state->mode == MODE_WANTED ||
 	    state->mode == MODE_WANTED_COHERENCE ||
@@ -335,7 +373,13 @@ static int run_case_flags(bool advertise, bool advertise_uring,
 		    state.saw_attr_refresh_capability !=
 			    advertise_attr_refresh ||
 		    state.saw_attr_release_barrier_capability !=
-			    advertise_attr_release_barrier) {
+			    advertise_attr_release_barrier ||
+		    state.saw_read_upcall_only_capability !=
+			    ((additional_flags &
+			      FUSE_EXTFUSE_READ_UPCALL_ONLY) != 0) ||
+		    state.saw_wbcache_write_stream_capability !=
+			    ((additional_flags &
+			      FUSE_EXTFUSE_WBCACHE_WRITE_STREAM) != 0)) {
 			fprintf(stderr, "%s: error-path capability mapping mismatch\n",
 				name);
 			goto out_session;
@@ -387,6 +431,20 @@ static int run_case_flags(bool advertise, bool advertise_uring,
 			name);
 		goto out_session;
 	}
+	if (state.saw_read_upcall_only_capability !=
+	    ((additional_flags & FUSE_EXTFUSE_READ_UPCALL_ONLY) != 0)) {
+		fprintf(stderr,
+			"%s: READ upcall-only capable_ext mapping mismatch\n",
+			name);
+		goto out_session;
+	}
+	if (state.saw_wbcache_write_stream_capability !=
+	    ((additional_flags & FUSE_EXTFUSE_WBCACHE_WRITE_STREAM) != 0)) {
+		fprintf(stderr,
+			"%s: WBCache write-stream capable_ext mapping mismatch\n",
+			name);
+		goto out_session;
+	}
 	if (reply_flags & FUSE_OVER_IO_URING) {
 		fprintf(stderr, "%s: io_uring enabled without mount option\n",
 			name);
@@ -397,7 +455,9 @@ static int run_case_flags(bool advertise, bool advertise_uring,
 	     mode == MODE_WANTED_ATTR_REFRESH ||
 	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER ||
 	     mode == MODE_WANTED_WBCACHE_PASSTHROUGH ||
-	     mode == MODE_WANTED_WBCACHE_ATTR_REFRESH) &&
+	     mode == MODE_WANTED_WBCACHE_ATTR_REFRESH ||
+	     mode == MODE_WANTED_READ_UPCALL_ONLY ||
+	     mode == MODE_WANTED_WBCACHE_WRITE_STREAM) &&
 	    advertise) {
 		if (!state.helper_enabled ||
 		    !(reply_flags & FUSE_FS_EXTFUSE) ||
@@ -499,6 +559,28 @@ static int run_case_flags(bool advertise, bool advertise_uring,
 			"paper WBCache passthrough opt-in was not serialized\n");
 		goto out_session;
 	}
+	if (mode == MODE_WANTED_READ_UPCALL_ONLY &&
+	    (!state.read_upcall_only_helper_enabled ||
+	     !(reply_flags & FUSE_EXTFUSE_READ_UPCALL_ONLY) ||
+	     (reply_flags & (FUSE_EXTFUSE_WBCACHE_PASSTHROUGH |
+			     FUSE_EXTFUSE_COHERENCE_EPOCHS)))) {
+		fprintf(stderr,
+			"%s: READ upcall-only opt-in was not serialized\n",
+			name);
+		goto out_session;
+	}
+	if (mode == MODE_WANTED_WBCACHE_WRITE_STREAM &&
+	    (!state.wbcache_helper_enabled ||
+	     !state.wbcache_write_stream_helper_enabled ||
+	     !(reply_flags & FUSE_WRITEBACK_CACHE) ||
+	     !(reply_flags & FUSE_EXTFUSE_WBCACHE_PASSTHROUGH) ||
+	     !(reply_flags & FUSE_EXTFUSE_WBCACHE_WRITE_STREAM) ||
+	     (reply_flags & FUSE_EXTFUSE_COHERENCE_EPOCHS))) {
+		fprintf(stderr,
+			"%s: WBCache write-stream opt-in was not serialized\n",
+			name);
+		goto out_session;
+	}
 
 	rc = 0;
 
@@ -569,6 +651,27 @@ int main(void)
 		FUSE_WRITEBACK_CACHE | FUSE_EXTFUSE_WBCACHE_PASSTHROUGH,
 		MODE_WANTED_WBCACHE_PASSTHROUGH, false,
 		"extfuse-paper-wbcache-passthrough-advertised-wanted");
+	failed |= run_case_flags(
+		true, false, false, false, false, false,
+		FUSE_EXTFUSE_READ_UPCALL_ONLY,
+		MODE_WANTED_READ_UPCALL_ONLY, false,
+		"extfuse-read-upcall-only-advertised-wanted");
+	failed |= run_case_flags(
+		false, false, false, false, false, false,
+		FUSE_EXTFUSE_READ_UPCALL_ONLY,
+		MODE_WANTED_READ_UPCALL_ONLY, true,
+		"extfuse-read-upcall-only-without-extfuse-rejected");
+	failed |= run_case_flags(
+		true, false, false, false, false, false,
+		FUSE_WRITEBACK_CACHE | FUSE_EXTFUSE_WBCACHE_PASSTHROUGH |
+			FUSE_EXTFUSE_WBCACHE_WRITE_STREAM,
+		MODE_WANTED_WBCACHE_WRITE_STREAM, false,
+		"extfuse-wbcache-write-stream-advertised-wanted");
+	failed |= run_case_flags(
+		true, false, false, false, false, false,
+		FUSE_WRITEBACK_CACHE | FUSE_EXTFUSE_WBCACHE_WRITE_STREAM,
+		MODE_WANTED_WBCACHE_WRITE_STREAM, true,
+		"extfuse-wbcache-write-stream-without-passthrough-rejected");
 	failed |= run_case_flags(
 		true, false, false, false, true, false,
 		wbcache_attr_refresh_prerequisite_flags,

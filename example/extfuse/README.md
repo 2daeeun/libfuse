@@ -32,6 +32,31 @@ The hand runner consumes only these libfuse-tree artifacts:
 No file under `fuse_exp/fig9_mo/runtime/` is a build or runtime input for the
 hand runner.
 
+The performance changes in this example are disabled by default and selected
+with strict Boolean environment values (`0` or `1`):
+
+- `EXTFUSE_READ_UPCALL_ONLY=1` is valid only for `hit`, `paper-like` C1/C2. It
+  negotiates a direct daemon route for synchronous READ after this daemon
+  removes the READ BPF handler. Background readahead retains the ordinary
+  ExtFUSE route; GETATTR and GETXATTR remain eligible for ExtFUSE.
+- `EXTFUSE_PAPER_WRITE_FAST=1` is valid only for `hit`, `paper-like` C1/C2. It
+  removes the per-write capability lock/map churn while the startup proof that
+  `security.capability` is absent remains active. A concurrent policy revoke
+  switches completion to the locked refill path before the WRITE reply.
+- `EXTFUSE_C2_FIXED_WRITE=1` is valid only for `hit`, `uring`, `paper-like` C2.
+  It also requires `EXTFUSE_PAPER_WRITE_FAST=1`, the negotiated io_uring buffer
+  pool, and a single-issuer queue, and marks opens for WRITE-only fixed I/O.
+  READ remains on the ordinary copied daemon path. A fixed-WRITE failure is
+  never replayed through a copied path.
+- `EXTFUSE_WBCACHE_WRITE_STREAM=1` is valid only for `allopt`, `paper-like`
+  C3/C4. It negotiates bounded, per-open contiguous full-`max_write`
+  `FUSE_WRITE_CACHE` runs. One contiguous partial write may terminate a run;
+  it cannot lead or extend one. The mode is incompatible with coherence epochs.
+
+Invalid values or mode/profile/transport combinations are rejected before the
+mount. `START` records the requested toggles; `INIT` separately records the
+capabilities that were actually negotiated.
+
 With the paired protocol-7.48 kernel, the `gate` profile negotiates driver-owned
 ExtFUSE coherence epochs. Native passthrough and strict WBCache passthrough
 bracket lower READ/WRITE with explicit BPF BEGIN/END policy hooks and a matching
@@ -89,18 +114,25 @@ hook stales any resident row at the actual lower-I/O boundary, and a later
 daemon GETATTR publishes the lazy refresh.  Strict and legacy native modes keep
 their existing epoch or tombstone safeguards.
 
-Paper-like C2 keeps logical READ/WRITE callbacks in the daemon and submits the
-request pages with io_uring fixed I/O.  The ordinary FUSE_WRITE BPF hook is the
-paper-like coherence boundary for both C1 and C2: it marks a resident attribute
-row stale and removes only a positive `security.capability` row before the
-daemon write, while preserving an exact negative `ENODATA` row.  The fixed-I/O
-submission and completion therefore do not take the global generation lock,
-publish daemon BEGIN/END states, issue map syscalls, carry callback userdata, or
-perform fstat/attribute publication.  This intentionally retains the archived
-ExtFUSE request-boundary coherence scope: a concurrent daemon metadata refresh
-can race a data write because paper-like mode has no epoch protocol.  The
-`gate` profile remains the strict race-validation mode and does not use this C2
-zero-copy shortcut.
+By default paper-like C2 keeps logical READ/WRITE callbacks in the daemon and
+uses the ordinary io_uring payload path. `EXTFUSE_C2_FIXED_WRITE=1` changes only
+WRITE: the request's registered pages are submitted directly to the lower fd.
+The async context owns the mutation token and pinned lower identity until the
+completion. It closes the mutation, performs any capability-policy revoke
+recovery, and lets only a quiescent completion publish pinned-inode attributes
+before replying. No pthread mutex is held from submission to completion, and a
+submission or I/O failure is reported without a copied replay. READ never opts
+in to the write-only open flag.
+
+With `EXTFUSE_PAPER_WRITE_FAST=1`, the ordinary FUSE_WRITE BPF hook and daemon
+skip positive-capability lookup and negative-row refresh only while the verified
+global `security.capability=ENODATA` policy is active. Proactive capability
+prefetch remains enabled. SETXATTR or REMOVEXATTR publishes the userspace slow
+path before revoking the BPF policy; a write that overlaps that transition uses
+the serialized lower-value refill. GETATTR and GETXATTR remain fail-closed on
+unstable, missing, or evicted cache state, so diagnostic runs must still verify
+that no daemon metadata callback occurred rather than inferring it from source
+validation.
 
 In the `paper-like` throughput profile C1/C2 do not install the READ cache
 handler.  C3/C4 use the ordinary READ handler to mark an existing atime row

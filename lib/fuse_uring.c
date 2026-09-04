@@ -91,6 +91,8 @@ struct fuse_ring_queue {
 	uint64_t fixed_write_errors;
 	uint64_t fixed_write_bytes;
 	uint64_t copied_fallbacks;
+	uint64_t copied_read_fallbacks;
+	uint64_t copied_write_fallbacks;
 
 	/* size depends on queue depth */
 	struct fuse_ring_ent ent[];
@@ -629,6 +631,8 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 	uint64_t write_errors = 0;
 	uint64_t write_bytes = 0;
 	uint64_t copied_fallbacks = 0;
+	uint64_t copied_read_fallbacks = 0;
+	uint64_t copied_write_fallbacks = 0;
 
 	for (size_t qid = 0; qid < fuse_ring->nr_queues; qid++) {
 		struct fuse_ring_queue *queue =
@@ -674,6 +678,8 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 		write_errors += queue->fixed_write_errors;
 		write_bytes += queue->fixed_write_bytes;
 		copied_fallbacks += queue->copied_fallbacks;
+		copied_read_fallbacks += queue->copied_read_fallbacks;
+		copied_write_fallbacks += queue->copied_write_fallbacks;
 
 		pthread_mutex_destroy(&queue->ring_lock);
 	}
@@ -684,13 +690,16 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 		 " read_errors=%" PRIu64 " read_bytes=%" PRIu64
 		 " write_submitted=%" PRIu64 " write_completed=%" PRIu64
 		 " write_errors=%" PRIu64 " write_bytes=%" PRIu64
-		 " copied_fallbacks=%" PRIu64 "\n",
+		 " copied_fallbacks=%" PRIu64
+		 " copied_read_fallbacks=%" PRIu64
+		 " copied_write_fallbacks=%" PRIu64 "\n",
 		 fuse_ring->zero_copy &&
 		 atomic_load_explicit(&fuse_ring->ready_queues,
 					 memory_order_relaxed) == fuse_ring->nr_queues,
 		 read_submitted, read_completed, read_errors, read_bytes,
 		 write_submitted, write_completed, write_errors, write_bytes,
-		 copied_fallbacks);
+		 copied_fallbacks, copied_read_fallbacks,
+		 copied_write_fallbacks);
 
 	free(fuse_ring->queues);
 	pthread_cond_destroy(&fuse_ring->thread_start_cond);
@@ -1090,8 +1099,13 @@ static int fuse_uring_handle_cqe(struct fuse_ring_queue *queue,
 	req->flags.is_uring_zero_copy = zero_copy;
 	ent->fixed_io_completed = false;
 	if (fuse_ring->zero_copy && !zero_copy &&
-	    (in->opcode == FUSE_READ || in->opcode == FUSE_WRITE))
+	    (in->opcode == FUSE_READ || in->opcode == FUSE_WRITE)) {
 		queue->copied_fallbacks++;
+		if (in->opcode == FUSE_READ)
+			queue->copied_read_fallbacks++;
+		else
+			queue->copied_write_fallbacks++;
+	}
 	req->ref_cnt++;
 	req->ch = NULL; /* not needed for uring */
 	req->interrupted = 0;

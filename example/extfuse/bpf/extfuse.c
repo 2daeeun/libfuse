@@ -263,7 +263,8 @@ static void revoke_paper_capability_policy(void)
 
 	if (flags)
 		__sync_fetch_and_and(flags,
-				     ~EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA);
+				     ~(EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA |
+				       EXTFUSE_POLICY_PAPER_WRITE_FAST));
 }
 
 static int daemon_state_inactive(__u64 nodeid, __u64 *current_state)
@@ -830,7 +831,8 @@ HANDLER(FUSE_WRITE, 16)(void *ctx)
 	 * data-write path cannot create a capability xattr.  This also applies when
 	 * no attr row is resident and the request is necessarily an upcall.
 	 */
-	if (invalidate_positive_capability(ctx))
+	if (!policy_enabled(EXTFUSE_POLICY_PAPER_WRITE_FAST) &&
+	    invalidate_positive_capability(ctx))
 		return UPCALL;
 
 	/* get cached attr value */

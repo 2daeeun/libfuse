@@ -598,6 +598,8 @@ static void fill_open(struct fuse_open_out *arg,
 		arg->open_flags |= FOPEN_PARALLEL_DIRECT_WRITES;
 	if (f->io_uring_zero_copy)
 		arg->open_flags |= FOPEN_IO_URING_ZERO_COPY;
+	if (f->io_uring_zero_copy_write)
+		arg->open_flags |= FOPEN_IO_URING_ZERO_COPY_WRITE;
 }
 
 int fuse_reply_entry(fuse_req_t req, const struct fuse_entry_param *e)
@@ -2773,6 +2775,10 @@ static bool want_flag_dependencies_valid(uint64_t want)
 		FUSE_CAP_EXTFUSE | FUSE_CAP_WRITEBACK_CACHE;
 	const uint64_t io_uring_bufpool_dependencies =
 		FUSE_CAP_OVER_IO_URING;
+	const uint64_t read_upcall_only_dependencies = FUSE_CAP_EXTFUSE;
+	const uint64_t wbcache_write_stream_dependencies =
+		FUSE_CAP_EXTFUSE | FUSE_CAP_WRITEBACK_CACHE |
+		FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH;
 
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE) &&
 	    (want & coherence_dependencies) != coherence_dependencies) {
@@ -2834,6 +2840,23 @@ static bool want_flag_dependencies_valid(uint64_t want)
 		    io_uring_bufpool_dependencies) {
 		fuse_log(FUSE_LOG_ERR,
 			 "fuse: io-uring buffer pools require FUSE over io-uring\n");
+		return false;
+	}
+	if ((want & FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY) &&
+	    ((want & read_upcall_only_dependencies) !=
+		     read_upcall_only_dependencies ||
+	     (want & (FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH |
+		      FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS)))) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: ExtFUSE READ upcall-only requires ExtFUSE and excludes writeback-cache passthrough and coherence epochs\n");
+		return false;
+	}
+	if ((want & FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM) &&
+	    ((want & wbcache_write_stream_dependencies) !=
+		     wbcache_write_stream_dependencies ||
+	     (want & FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS))) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: ExtFUSE writeback-cache write stream requires ExtFUSE writeback-cache passthrough and excludes coherence epochs\n");
 		return false;
 	}
 	return true;
@@ -3060,6 +3083,12 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		if (inargflags & FUSE_EXTFUSE_WBCACHE_PASSTHROUGH)
 			se->conn.capable_ext |=
 				FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH;
+		if (inargflags & FUSE_EXTFUSE_READ_UPCALL_ONLY)
+			se->conn.capable_ext |=
+				FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY;
+		if (inargflags & FUSE_EXTFUSE_WBCACHE_WRITE_STREAM)
+			se->conn.capable_ext |=
+				FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM;
 #ifdef HAVE_URING_ZERO_COPY
 		if (arg->minor >= 48 &&
 		    (inargflags & FUSE_HAS_IO_URING_BUFPOOL))
@@ -3256,6 +3285,10 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_EXTFUSE_WBCACHE_PASSTHROUGH;
 	if (se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL)
 		outargflags |= FUSE_HAS_IO_URING_BUFPOOL;
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY)
+		outargflags |= FUSE_EXTFUSE_READ_UPCALL_ONLY;
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM)
+		outargflags |= FUSE_EXTFUSE_WBCACHE_WRITE_STREAM;
 
 	if ((inargflags & FUSE_REQUEST_TIMEOUT) && se->conn.request_timeout) {
 		outargflags |= FUSE_REQUEST_TIMEOUT;

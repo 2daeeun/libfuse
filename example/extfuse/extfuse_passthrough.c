@@ -192,6 +192,17 @@ struct perf_tombstone {
 
 #define PERF_INODE_GENERATION_BUCKETS (1U << 16)
 #define PERF_CACHE_MUTATION_MAX_INODES 4U
+#define PERF_CACHE_LOCK_BUCKETS 4096U
+
+struct perf_cache_lock {
+	/* Unrelated inode locks must not share the mutex's cache line. */
+	_Alignas(64) pthread_mutex_t mutex;
+};
+
+struct perf_cache_lockset {
+	size_t buckets[PERF_CACHE_MUTATION_MAX_INODES];
+	size_t count;
+};
 
 /*
  * A metadata snapshot only conflicts with mutations of the same FUSE nodeid.
@@ -204,6 +215,10 @@ struct perf_inode_generation {
 	fuse_ino_t ino;
 	uint64_t generation;
 	uint64_t active;
+	uint64_t xattr_generation;
+	uint64_t xattr_active;
+	struct extfuse_io_state published;
+	bool published_valid;
 };
 
 struct perf_cache_mutation {
@@ -211,11 +226,14 @@ struct perf_cache_mutation {
 	size_t count;
 	bool overflow;
 	bool armed;
+	bool attr_only;
+	bool xattr_quiescent;
 };
 
 struct perf_cache_snapshot {
 	uint64_t daemon_state;
 	uint64_t native_state;
+	bool xattr;
 };
 
 enum perf_cache_attr_outcome {
@@ -230,6 +248,7 @@ enum perf_cache_attr_outcome {
 _Static_assert(sizeof(struct entry_key) == 264, "entry key ABI");
 _Static_assert(sizeof(struct entry_value) == 48, "entry value ABI");
 _Static_assert(sizeof(struct attr_key) == 8, "attr key ABI");
+_Static_assert(sizeof(struct extfuse_io_state) == 16, "io state ABI");
 _Static_assert(sizeof(struct attr_value) == 128, "attr value ABI");
 _Static_assert(offsetof(struct attr_value, native_state) == 8,
 	       "attr native-state alignment");
@@ -338,6 +357,10 @@ struct perf_state {
 	bool read_upcall_only_capable;
 	bool read_upcall_only_requested;
 	bool read_handler_removed;
+	bool syncfs_support;
+	bool syncfs_pure;
+	bool paper_read_guard;
+	int syncfs_fd;
 	bool wbcache_write_stream_capable;
 	bool wbcache_write_stream_requested;
 	bool passthrough_capable;
@@ -356,14 +379,17 @@ struct perf_state {
 	uint32_t bpf_policy_flags;
 	pthread_rwlock_t namespace_lock;
 	pthread_mutex_t backing_mutex;
+	pthread_mutex_t cache_disable_mutex;
+	struct perf_cache_lock cache_locks[PERF_CACHE_LOCK_BUCKETS];
+	size_t cache_locks_initialized;
 	pthread_mutex_t xattr_locks[PERF_XATTR_LOCK_BUCKETS];
 	size_t xattr_locks_initialized;
 	struct perf_backing *backings;
 	struct perf_tombstone *tombstones[PERF_TOMBSTONE_BUCKETS];
 	struct perf_inode_generation
 		*inode_generations[PERF_INODE_GENERATION_BUCKETS];
-	bool cache_bypass;
-	bool xattr_cache_bypass;
+	atomic_bool cache_bypass;
+	atomic_bool xattr_cache_bypass;
 	bool paper_capability_verified_absent;
 	const char *paper_capability_source;
 	atomic_bool paper_capability_enodata_safe;
@@ -371,8 +397,10 @@ struct perf_state {
 };
 
 static struct perf_state perf_state = {
+	.syncfs_fd = -1,
 	.namespace_lock = PTHREAD_RWLOCK_INITIALIZER,
 	.backing_mutex = PTHREAD_MUTEX_INITIALIZER,
+	.cache_disable_mutex = PTHREAD_MUTEX_INITIALIZER,
 	.policy_mutex = PTHREAD_MUTEX_INITIALIZER,
 };
 
@@ -864,6 +892,9 @@ _Static_assert((PERF_XATTR_LOCK_BUCKETS &
 _Static_assert((PERF_INODE_GENERATION_BUCKETS &
 		(PERF_INODE_GENERATION_BUCKETS - 1)) == 0,
 	       "inode generation bucket count must be a power of two");
+_Static_assert((PERF_CACHE_LOCK_BUCKETS & (PERF_CACHE_LOCK_BUCKETS - 1)) == 0 &&
+	       PERF_CACHE_LOCK_BUCKETS <= PERF_INODE_GENERATION_BUCKETS,
+	       "generation hash chains must belong to exactly one cache lock");
 
 static bool metadata_hits_enabled(void)
 {
@@ -1044,6 +1075,31 @@ static void cleanup_xattr_locks(void)
 				--perf_state.xattr_locks_initialized]);
 }
 
+static void cleanup_cache_locks(void)
+{
+	while (perf_state.cache_locks_initialized)
+		pthread_mutex_destroy(&perf_state.cache_locks[
+			--perf_state.cache_locks_initialized].mutex);
+}
+
+static int initialize_cache_locks(void)
+{
+	size_t index;
+
+	for (index = 0; index < PERF_CACHE_LOCK_BUCKETS; index++) {
+		int error = pthread_mutex_init(
+			&perf_state.cache_locks[index].mutex, NULL);
+
+		if (error) {
+			cleanup_cache_locks();
+			errno = error;
+			return -1;
+		}
+		perf_state.cache_locks_initialized = index + 1;
+	}
+	return 0;
+}
+
 static bool find_tombstone_locked(fuse_ino_t ino)
 {
 	struct perf_tombstone *tombstone;
@@ -1133,6 +1189,9 @@ static bool attr_cache_suppressed_locked(fuse_ino_t ino,
 	struct perf_backing *backing;
 
 	*mmap_suppressed = false;
+	/* Metadata-only mounts never register a native/WBCache backing. */
+	if (perf_state.mode == PERF_MODE_HIT)
+		return false;
 	/*
 	 * Paper WBCache has a finite ordinary READ/WRITE request boundary.  Those
 	 * handlers stale any existing row before lower I/O, so the mere presence
@@ -1166,6 +1225,63 @@ static size_t inode_generation_bucket(fuse_ino_t ino)
 	value *= UINT64_C(0xff51afd7ed558ccd);
 	value ^= value >> 33;
 	return (size_t)value & (PERF_INODE_GENERATION_BUCKETS - 1);
+}
+
+static pthread_mutex_t *cache_lock_for_inode(fuse_ino_t ino)
+{
+	size_t bucket = inode_generation_bucket(ino) &
+			(PERF_CACHE_LOCK_BUCKETS - 1);
+
+	/* Preserve AllOpt's backing registry/coherence serialization. */
+	if (perf_state.mode != PERF_MODE_HIT)
+		return &perf_state.backing_mutex;
+	return &perf_state.cache_locks[bucket].mutex;
+}
+
+/*
+ * Hot metadata-only I/O takes only inode stripes. Cold entry/backing code may
+ * take backing_mutex THEN a stripe, never the reverse. Namespace mutations
+ * take their distinct stripes in ascending order, including hash collisions.
+ * The error-only cache_disable_mutex is last in either lock order.
+ */
+static void cache_mutation_lock(const struct perf_cache_mutation *mutation,
+				struct perf_cache_lockset *locks)
+{
+	size_t index;
+
+	locks->count = 0;
+	if (perf_state.mode != PERF_MODE_HIT) {
+		pthread_mutex_lock(&perf_state.backing_mutex);
+		return;
+	}
+	for (index = 0; index < mutation->count; index++) {
+		size_t bucket = inode_generation_bucket(mutation->inodes[index]) &
+				(PERF_CACHE_LOCK_BUCKETS - 1);
+		size_t pos = 0;
+
+		while (pos < locks->count && locks->buckets[pos] < bucket)
+			pos++;
+		if (pos < locks->count && locks->buckets[pos] == bucket)
+			continue;
+		memmove(&locks->buckets[pos + 1], &locks->buckets[pos],
+			(locks->count - pos) * sizeof(locks->buckets[0]));
+		locks->buckets[pos] = bucket;
+		locks->count++;
+	}
+	for (index = 0; index < locks->count; index++)
+		pthread_mutex_lock(
+			&perf_state.cache_locks[locks->buckets[index]].mutex);
+}
+
+static void cache_mutation_unlock(struct perf_cache_lockset *locks)
+{
+	if (perf_state.mode != PERF_MODE_HIT) {
+		pthread_mutex_unlock(&perf_state.backing_mutex);
+		return;
+	}
+	while (locks->count)
+		pthread_mutex_unlock(&perf_state.cache_locks[
+			locks->buckets[--locks->count]].mutex);
 }
 
 static struct perf_inode_generation *
@@ -1202,17 +1318,21 @@ get_inode_generation_locked(fuse_ino_t ino)
 }
 
 static bool inode_generation_value_locked(
-	const struct perf_inode_generation *state, uint64_t *value)
+	const struct perf_inode_generation *state, uint64_t *value, bool xattr)
 {
+	uint64_t generation;
+	uint64_t active;
+
 	if (!state) {
 		*value = 0;
 		return true;
 	}
-	if (state->generation > EXTFUSE_NATIVE_STATE_SEQUENCE_MAX ||
-	    state->active > EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
+	generation = xattr ? state->xattr_generation : state->generation;
+	active = xattr ? state->xattr_active : state->active;
+	if (generation > EXTFUSE_NATIVE_STATE_SEQUENCE_MAX ||
+	    active > EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
 		return false;
-	*value = (state->generation << EXTFUSE_NATIVE_STATE_ACTIVE_BITS) |
-		 state->active;
+	*value = (generation << EXTFUSE_NATIVE_STATE_ACTIVE_BITS) | active;
 	return true;
 }
 
@@ -1222,20 +1342,47 @@ static void disable_all_caches_locked(const char *reason)
 	disable_xattr_cache_locked(reason);
 }
 
+static bool daemon_domain_equivalent(uint64_t published, uint64_t current)
+{
+	return published == current ||
+	       ((published & EXTFUSE_NATIVE_STATE_ACTIVE_MASK) &&
+		(current & EXTFUSE_NATIVE_STATE_ACTIVE_MASK));
+}
+
 static bool publish_inode_generation_locked(
-	fuse_ino_t ino, const struct perf_inode_generation *state,
+	fuse_ino_t ino, struct perf_inode_generation *state,
 	const char *reason)
 {
 	uint64_t key = ino;
-	uint64_t value;
+	struct extfuse_io_state value;
+	uint64_t attr_state;
+	uint64_t xattr_state;
 
-	if (!inode_generation_value_locked(state, &value)) {
+	if (!inode_generation_value_locked(state, &attr_state, false) ||
+	    !inode_generation_value_locked(state, &xattr_state, true)) {
 		errno = EOVERFLOW;
 		goto error;
 	}
-	if (!ebpf_data_update(perf_state.bpf, &key, &value,
-			      EXTFUSE_DAEMON_IO_MAP, 1))
+	value.attr_state = attr_state;
+	value.xattr_state = xattr_state;
+	/*
+	 * BPF rejects every active token, regardless of its exact active count.
+	 * Keep exact local counts/sequences, but avoid replacing an already-active
+	 * map row for each overlapping I/O. Both domains must remain equivalent:
+	 * the first WRITE during a READ and the last WRITE before a READ finishes
+	 * still publish the XATTR boundary. Never skip a quiescent generation or a
+	 * failed first publication. AllOpt keeps its original publication policy.
+	 */
+	if (perf_state.mode == PERF_MODE_HIT && state->published_valid &&
+	    daemon_domain_equivalent(state->published.attr_state, attr_state) &&
+	    daemon_domain_equivalent(state->published.xattr_state, xattr_state))
 		return true;
+	if (!ebpf_data_update(perf_state.bpf, &key, &value,
+			      EXTFUSE_DAEMON_IO_MAP, 1)) {
+		state->published = value;
+		state->published_valid = true;
+		return true;
+	}
 error:
 	counter_increment(&perf_state.counters.cache_update_errors);
 	counter_increment(&perf_state.counters.passthrough_state_errors);
@@ -1248,18 +1395,21 @@ error:
 }
 
 static bool native_state_snapshot_locked(fuse_ino_t ino, uint64_t *state,
-					 const char *reason)
+					 const char *reason, bool xattr)
 {
 	uint64_t key = ino;
+	struct extfuse_io_state value;
 	int lookup_error;
 
 	*state = 0;
 	if (!perf_state.passthrough_coherence_v2_requested &&
 	    !perf_state.wbcache_passthrough_requested)
 		return true;
-	if (!ebpf_data_lookup(perf_state.bpf, &key, state,
-			      EXTFUSE_NATIVE_IO_MAP))
+	if (!ebpf_data_lookup(perf_state.bpf, &key, &value,
+			      EXTFUSE_NATIVE_IO_MAP)) {
+		*state = xattr ? value.xattr_state : value.attr_state;
 		return true;
+	}
 	lookup_error = errno;
 	if (lookup_error == ENOENT)
 		return true;
@@ -1274,37 +1424,47 @@ static bool native_state_snapshot_locked(fuse_ino_t ino, uint64_t *state,
 	return false;
 }
 
-static bool cache_snapshot_begin(fuse_ino_t ino,
-				 struct perf_cache_snapshot *snapshot)
+static bool cache_snapshot_begin_domain(fuse_ino_t ino,
+					struct perf_cache_snapshot *snapshot,
+					bool xattr)
 {
 	struct perf_inode_generation *state;
+	pthread_mutex_t *lock = cache_lock_for_inode(ino);
 	bool result;
 
 	memset(snapshot, 0, sizeof(*snapshot));
+	snapshot->xattr = xattr;
 	if (!metadata_hits_enabled())
 		return true;
-	pthread_mutex_lock(&perf_state.backing_mutex);
+	pthread_mutex_lock(lock);
 	state = find_inode_generation_locked(ino);
-	result = inode_generation_value_locked(state, &snapshot->daemon_state);
+	result = inode_generation_value_locked(state, &snapshot->daemon_state,
+					       xattr);
 	if (!result) {
 		counter_increment(&perf_state.counters.passthrough_state_errors);
 		disable_all_caches_locked("daemon-state-snapshot");
 	}
 	if (!native_state_snapshot_locked(
-		    ino, &snapshot->native_state, "native-state-snapshot"))
+		    ino, &snapshot->native_state, "native-state-snapshot", xattr))
 		result = false;
-	pthread_mutex_unlock(&perf_state.backing_mutex);
+	pthread_mutex_unlock(lock);
 	return result;
 }
 
+static bool cache_snapshot_begin(fuse_ino_t ino,
+				 struct perf_cache_snapshot *snapshot)
+{
+	return cache_snapshot_begin_domain(ino, snapshot, false);
+}
+
 static bool inode_generation_stable_locked(fuse_ino_t ino,
-					    uint64_t expected_state)
+					    uint64_t expected_state, bool xattr)
 {
 	struct perf_inode_generation *state;
 	uint64_t current_state;
 
 	state = find_inode_generation_locked(ino);
-	if (!inode_generation_value_locked(state, &current_state))
+	if (!inode_generation_value_locked(state, &current_state, xattr))
 		return false;
 	return current_state == expected_state &&
 	       !(current_state & EXTFUSE_NATIVE_STATE_ACTIVE_MASK);
@@ -1316,10 +1476,10 @@ static bool cache_snapshot_stable_locked(
 	uint64_t native_state;
 
 	if (!inode_generation_stable_locked(
-		    ino, snapshot->daemon_state))
+		    ino, snapshot->daemon_state, snapshot->xattr))
 		return false;
 	if (!native_state_snapshot_locked(
-		    ino, &native_state, "native-state-validation"))
+		    ino, &native_state, "native-state-validation", snapshot->xattr))
 		return false;
 	return native_state == snapshot->native_state &&
 	       !(native_state & EXTFUSE_NATIVE_STATE_ACTIVE_MASK);
@@ -1339,12 +1499,14 @@ static void advance_inode_generation_locked(fuse_ino_t ino,
 		disable_all_caches_locked(reason);
 		return;
 	}
-	if (state->generation == EXTFUSE_NATIVE_STATE_SEQUENCE_MAX) {
+	if (state->generation == EXTFUSE_NATIVE_STATE_SEQUENCE_MAX ||
+	    state->xattr_generation == EXTFUSE_NATIVE_STATE_SEQUENCE_MAX) {
 		counter_increment(&perf_state.counters.passthrough_state_errors);
 		disable_all_caches_locked("inode-generation-counter-overflow");
 		return;
 	}
 	state->generation++;
+	state->xattr_generation++;
 	publish_inode_generation_locked(ino, state, reason);
 }
 
@@ -1369,11 +1531,12 @@ static void cache_mutation_add(struct perf_cache_mutation *mutation,
 static bool cache_mutation_begin(struct perf_cache_mutation *mutation)
 {
 	struct perf_inode_generation *states[PERF_CACHE_MUTATION_MAX_INODES];
+	struct perf_cache_lockset locks;
 	size_t index;
 
 	if (!metadata_hits_enabled() || !mutation->count)
 		return true;
-	pthread_mutex_lock(&perf_state.backing_mutex);
+	cache_mutation_lock(mutation, &locks);
 	if (perf_state.cache_bypass && perf_state.xattr_cache_bypass)
 		goto out;
 	if (mutation->overflow) {
@@ -1393,7 +1556,12 @@ static bool cache_mutation_begin(struct perf_cache_mutation *mutation)
 		}
 		if (states[index]->generation ==
 				EXTFUSE_NATIVE_STATE_SEQUENCE_MAX ||
-		    states[index]->active == EXTFUSE_NATIVE_STATE_ACTIVE_MASK) {
+		    states[index]->active == EXTFUSE_NATIVE_STATE_ACTIVE_MASK ||
+		    (!mutation->attr_only &&
+		     (states[index]->xattr_generation ==
+				EXTFUSE_NATIVE_STATE_SEQUENCE_MAX ||
+		      states[index]->xattr_active ==
+				EXTFUSE_NATIVE_STATE_ACTIVE_MASK))) {
 			counter_increment(
 				&perf_state.counters.passthrough_state_errors);
 			disable_all_caches_locked(
@@ -1404,6 +1572,10 @@ static bool cache_mutation_begin(struct perf_cache_mutation *mutation)
 	for (index = 0; index < mutation->count; index++) {
 		states[index]->generation++;
 		states[index]->active++;
+		if (!mutation->attr_only) {
+			states[index]->xattr_generation++;
+			states[index]->xattr_active++;
+		}
 	}
 	mutation->armed = true;
 	for (index = 0; index < mutation->count; index++)
@@ -1411,40 +1583,55 @@ static bool cache_mutation_begin(struct perf_cache_mutation *mutation)
 						 states[index],
 						 "daemon-mutation-begin");
 out:
-	pthread_mutex_unlock(&perf_state.backing_mutex);
+	cache_mutation_unlock(&locks);
 	return counter_value(&perf_state.counters.cache_bypass_errors) == 0;
 }
 
-static bool cache_mutation_end(struct perf_cache_mutation *mutation)
+static bool cache_mutation_end_with_snapshot(
+	struct perf_cache_mutation *mutation, struct perf_cache_snapshot *snapshot)
 {
 	struct perf_inode_generation *state;
+	struct perf_cache_lockset locks;
 	bool invalid_state = false;
 	bool quiescent = true;
+	bool xattr_quiescent = true;
 	size_t index;
 
+	mutation->xattr_quiescent = false;
 	if (!mutation->armed)
 		return false;
-	pthread_mutex_lock(&perf_state.backing_mutex);
+	cache_mutation_lock(mutation, &locks);
 	for (index = 0; index < mutation->count; index++) {
 		state = find_inode_generation_locked(mutation->inodes[index]);
-		if (!state || !state->active) {
+		if (!state || !state->active ||
+		    (!mutation->attr_only && !state->xattr_active)) {
 			invalid_state = true;
 			quiescent = false;
 			continue;
 		}
-		if (state->generation == EXTFUSE_NATIVE_STATE_SEQUENCE_MAX)
+		if (state->generation == EXTFUSE_NATIVE_STATE_SEQUENCE_MAX ||
+		    (!mutation->attr_only && state->xattr_generation ==
+					EXTFUSE_NATIVE_STATE_SEQUENCE_MAX))
 			invalid_state = true;
 		else {
 			state->generation++;
 			state->active--;
+			if (!mutation->attr_only) {
+				state->xattr_generation++;
+				state->xattr_active--;
+			}
 			if (state->active)
 				quiescent = false;
+			if (state->xattr_active)
+				xattr_quiescent = false;
 			publish_inode_generation_locked(
 				mutation->inodes[index], state,
 				"daemon-mutation-end");
 			continue;
 		}
 		state->active--;
+		if (!mutation->attr_only)
+			state->xattr_active--;
 		quiescent = false;
 	}
 	mutation->armed = false;
@@ -1454,8 +1641,44 @@ static bool cache_mutation_end(struct perf_cache_mutation *mutation)
 	}
 	if (perf_state.cache_bypass)
 		quiescent = false;
-	pthread_mutex_unlock(&perf_state.backing_mutex);
+	mutation->xattr_quiescent = xattr_quiescent && !invalid_state &&
+				     !perf_state.xattr_cache_bypass;
+	/*
+	 * READ completion already owns the generation lock. Capture its quiescent
+	 * identity here instead of unlocking and immediately contending for the
+	 * same inode lock again. The lower fstat remains outside this
+	 * lock, and cache_attr() still revalidates both tokens before publication.
+	 * Do not change WRITE/namespace callers or their xattr quiescence result.
+	 */
+	if (snapshot && quiescent && !invalid_state) {
+		memset(snapshot, 0, sizeof(*snapshot));
+		if (!mutation->attr_only || mutation->count != 1) {
+			quiescent = false;
+		} else {
+			state = find_inode_generation_locked(mutation->inodes[0]);
+			if (!inode_generation_value_locked(
+				    state, &snapshot->daemon_state, false)) {
+				counter_increment(
+					&perf_state.counters.passthrough_state_errors);
+				disable_all_caches_locked("daemon-state-snapshot");
+				quiescent = false;
+			}
+			if (!native_state_snapshot_locked(
+				    mutation->inodes[0], &snapshot->native_state,
+				    "native-state-snapshot", false))
+				quiescent = false;
+			if ((snapshot->daemon_state | snapshot->native_state) &
+			    EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
+				quiescent = false;
+		}
+	}
+	cache_mutation_unlock(&locks);
 	return quiescent && !invalid_state;
+}
+
+static bool cache_mutation_end(struct perf_cache_mutation *mutation)
+{
+	return cache_mutation_end_with_snapshot(mutation, NULL);
 }
 
 static uint64_t timeout_seconds(double timeout)
@@ -1510,9 +1733,10 @@ static int disable_metadata_cache_locked(const char *reason)
 	size_t index;
 	int result = 0;
 
+	/* Serialize rare cross-stripe failures, not successful inode I/O. */
+	pthread_mutex_lock(&perf_state.cache_disable_mutex);
 	if (perf_state.cache_bypass)
-		return 0;
-	perf_state.cache_bypass = true;
+		goto out;
 	counter_increment(&perf_state.counters.cache_bypass_events);
 	for (index = 0; index < sizeof(opcodes) / sizeof(opcodes[0]); index++) {
 		ebpf_ctrl_key_t key = { .opcode = opcodes[index] };
@@ -1528,8 +1752,12 @@ static int disable_metadata_cache_locked(const char *reason)
 	}
 	if (result && perf_state.session)
 		fuse_session_exit(perf_state.session);
+	/* Publish bypass only after handler removal or a recorded fatal error. */
+	perf_state.cache_bypass = true;
 	fprintf(stderr, "CACHE_BYPASS reason=%s result=%s\n", reason,
 		result ? "FATAL" : "UPCALL");
+out:
+	pthread_mutex_unlock(&perf_state.cache_disable_mutex);
 	return result;
 }
 
@@ -1538,9 +1766,9 @@ static int disable_xattr_cache_locked(const char *reason)
 	ebpf_ctrl_key_t key = { .opcode = FUSE_GETXATTR };
 	int result = 0;
 
+	pthread_mutex_lock(&perf_state.cache_disable_mutex);
 	if (perf_state.xattr_cache_bypass)
-		return 0;
-	perf_state.xattr_cache_bypass = true;
+		goto out;
 	counter_increment(&perf_state.counters.cache_bypass_events);
 	if (ebpf_ctrl_delete(perf_state.bpf, &key) && errno != ENOENT) {
 		counter_increment(&perf_state.counters.cache_bypass_errors);
@@ -1552,8 +1780,11 @@ static int disable_xattr_cache_locked(const char *reason)
 	}
 	if (result && perf_state.session)
 		fuse_session_exit(perf_state.session);
+	perf_state.xattr_cache_bypass = true;
 	fprintf(stderr, "CACHE_BYPASS opcode=GETXATTR reason=%s result=%s\n",
 		reason, result ? "FATAL" : "UPCALL");
+out:
+	pthread_mutex_unlock(&perf_state.cache_disable_mutex);
 	return result;
 }
 
@@ -1607,6 +1838,7 @@ cache_attr(fuse_ino_t nodeid, const struct stat *st, double timeout,
 	   const struct perf_cache_snapshot *snapshot, bool existing_only,
 	   double *reply_timeout)
 {
+	pthread_mutex_t *lock = cache_lock_for_inode(nodeid);
 	bool missing;
 	bool suppressed;
 	bool mmap_suppressed;
@@ -1616,7 +1848,7 @@ cache_attr(fuse_ino_t nodeid, const struct stat *st, double timeout,
 	*reply_timeout = timeout;
 	if (!metadata_hits_enabled())
 		return outcome;
-	pthread_mutex_lock(&perf_state.backing_mutex);
+	pthread_mutex_lock(lock);
 	if (perf_state.cache_bypass) {
 		*reply_timeout = 0;
 		goto out;
@@ -1658,7 +1890,7 @@ cache_attr(fuse_ino_t nodeid, const struct stat *st, double timeout,
 		outcome = PERF_CACHE_ATTR_PUBLISHED;
 	}
 out:
-	pthread_mutex_unlock(&perf_state.backing_mutex);
+	pthread_mutex_unlock(lock);
 	return outcome;
 }
 
@@ -1666,6 +1898,7 @@ static int cache_entry(fuse_ino_t parent, const char *name,
 			       struct fuse_entry_param *entry,
 			       const struct perf_cache_snapshot *snapshot)
 {
+	pthread_mutex_t *lock = cache_lock_for_inode(entry->ino);
 	struct entry_key key = {};
 	struct entry_value value = {
 		.nlookup = 1,
@@ -1690,6 +1923,8 @@ static int cache_entry(fuse_ino_t parent, const char *name,
 	value.entry_valid_nsec = timeout_nanoseconds(entry->entry_timeout);
 
 	pthread_mutex_lock(&perf_state.backing_mutex);
+	if (lock != &perf_state.backing_mutex)
+		pthread_mutex_lock(lock);
 	if (perf_state.cache_bypass) {
 		entry->attr_timeout = 0;
 		goto out;
@@ -1747,6 +1982,8 @@ static int cache_entry(fuse_ino_t parent, const char *name,
 	}
 	counter_increment(&perf_state.counters.cache_entry_updates);
 out:
+	if (lock != &perf_state.backing_mutex)
+		pthread_mutex_unlock(lock);
 	pthread_mutex_unlock(&perf_state.backing_mutex);
 	return result;
 }
@@ -1825,6 +2062,7 @@ static int cache_xattr_reply_serialized(fuse_ino_t nodeid, const char *name,
 					int error,
 					const struct perf_cache_snapshot *snapshot)
 {
+	pthread_mutex_t *lock = cache_lock_for_inode(nodeid);
 	struct xattr_key key;
 	struct xattr_value value = {
 		.error = error,
@@ -1834,7 +2072,8 @@ static int cache_xattr_reply_serialized(fuse_ino_t nodeid, const char *name,
 	};
 	int result = 0;
 
-	if (!metadata_hits_enabled() || size > PERF_XATTR_VALUE_MAX)
+	if (!metadata_hits_enabled() || size > PERF_XATTR_VALUE_MAX ||
+	    !snapshot->xattr)
 		return 0;
 	if ((error != 0 && error != ENODATA) ||
 	    (error == ENODATA && (size || data)) || (size && !data))
@@ -1844,7 +2083,7 @@ static int cache_xattr_reply_serialized(fuse_ino_t nodeid, const char *name,
 	if (size)
 		memcpy(value.data, data, size);
 
-	pthread_mutex_lock(&perf_state.backing_mutex);
+	pthread_mutex_lock(lock);
 	if (perf_state.xattr_cache_bypass)
 		goto out;
 	if (!cache_snapshot_stable_locked(nodeid, snapshot))
@@ -1862,7 +2101,7 @@ static int cache_xattr_reply_serialized(fuse_ino_t nodeid, const char *name,
 	}
 	counter_increment(&perf_state.counters.cache_xattr_updates);
 out:
-	pthread_mutex_unlock(&perf_state.backing_mutex);
+	pthread_mutex_unlock(lock);
 	return result;
 }
 
@@ -1870,6 +2109,7 @@ out:
 static bool negative_capability_cache_current_serialized(fuse_ino_t nodeid,
 							 uint64_t *daemon_state)
 {
+	pthread_mutex_t *lock = cache_lock_for_inode(nodeid);
 	struct xattr_key key;
 	struct xattr_value value;
 	bool current = false;
@@ -1879,7 +2119,7 @@ static bool negative_capability_cache_current_serialized(fuse_ino_t nodeid,
 	    fill_xattr_key(&key, nodeid, PERF_CAPABILITY_XATTR))
 		return false;
 
-	pthread_mutex_lock(&perf_state.backing_mutex);
+	pthread_mutex_lock(lock);
 	if (perf_state.xattr_cache_bypass ||
 	    (wbcache_passthrough_enabled() &&
 	     has_passthrough_mmap_marker_locked(nodeid)))
@@ -1896,11 +2136,12 @@ static bool negative_capability_cache_current_serialized(fuse_ino_t nodeid,
 		goto out;
 	}
 	current = value.error == ENODATA && !value.size &&
-		  inode_generation_stable_locked(nodeid, value.daemon_state);
+		  inode_generation_stable_locked(nodeid, value.daemon_state,
+						 true);
 	if (current)
 		*daemon_state = value.daemon_state;
 out:
-	pthread_mutex_unlock(&perf_state.backing_mutex);
+	pthread_mutex_unlock(lock);
 	return current;
 }
 
@@ -1914,6 +2155,7 @@ static void
 refresh_negative_capability_serialized(fuse_ino_t nodeid,
 				       uint64_t previous_daemon_state)
 {
+	pthread_mutex_t *lock = cache_lock_for_inode(nodeid);
 	struct perf_inode_generation *state;
 	struct xattr_key key;
 	struct xattr_value current;
@@ -1925,13 +2167,14 @@ refresh_negative_capability_serialized(fuse_ino_t nodeid,
 	    fill_xattr_key(&key, nodeid, PERF_CAPABILITY_XATTR))
 		return;
 
-	pthread_mutex_lock(&perf_state.backing_mutex);
+	pthread_mutex_lock(lock);
 	if (perf_state.xattr_cache_bypass ||
 	    (wbcache_passthrough_enabled() &&
 	     has_passthrough_mmap_marker_locked(nodeid)))
 		goto out;
 	state = find_inode_generation_locked(nodeid);
-	if (!inode_generation_value_locked(state, &replacement.daemon_state)) {
+	if (!inode_generation_value_locked(state, &replacement.daemon_state,
+					   true)) {
 		counter_increment(
 			&perf_state.counters.passthrough_state_errors);
 		disable_all_caches_locked("negative-capability-state");
@@ -1964,7 +2207,7 @@ error:
 		(uint64_t)nodeid, errno, strerror(errno));
 	disable_xattr_cache_locked("negative-capability-refresh");
 out:
-	pthread_mutex_unlock(&perf_state.backing_mutex);
+	pthread_mutex_unlock(lock);
 }
 
 static int invalidate_xattr_locked(fuse_ino_t nodeid, const char *name,
@@ -2030,7 +2273,7 @@ static int invalidate_xattr_serialized(fuse_ino_t nodeid, const char *name,
 	return result;
 }
 
-static int invalidate_attr_locked(fuse_ino_t nodeid)
+static int invalidate_attr_generation_locked(fuse_ino_t nodeid)
 {
 	struct attr_key key = { .nodeid = nodeid };
 
@@ -2062,6 +2305,20 @@ static int invalidate_attr_locked(fuse_ino_t nodeid)
 		(uint64_t)nodeid, errno, strerror(errno));
 	disable_metadata_cache_locked("attr-delete");
 	return -1;
+}
+
+/* Entry/backing callers own backing_mutex; also exclude hot inode I/O. */
+static int invalidate_attr_locked(fuse_ino_t nodeid)
+{
+	pthread_mutex_t *lock = cache_lock_for_inode(nodeid);
+	int result;
+
+	if (lock != &perf_state.backing_mutex)
+		pthread_mutex_lock(lock);
+	result = invalidate_attr_generation_locked(nodeid);
+	if (lock != &perf_state.backing_mutex)
+		pthread_mutex_unlock(lock);
+	return result;
 }
 
 static int invalidate_attr(fuse_ino_t nodeid)
@@ -2495,10 +2752,17 @@ static void cleanup_inode_generation_state(void)
 
 	pthread_mutex_lock(&perf_state.backing_mutex);
 	for (bucket = 0; bucket < PERF_INODE_GENERATION_BUCKETS; bucket++) {
+		pthread_mutex_t *lock = &perf_state.cache_locks[
+			bucket & (PERF_CACHE_LOCK_BUCKETS - 1)].mutex;
+
+		if (perf_state.mode == PERF_MODE_HIT)
+			pthread_mutex_lock(lock);
 		while ((state = perf_state.inode_generations[bucket])) {
 			perf_state.inode_generations[bucket] = state->next;
 			free(state);
 		}
+		if (perf_state.mode == PERF_MODE_HIT)
+			pthread_mutex_unlock(lock);
 	}
 	pthread_mutex_unlock(&perf_state.backing_mutex);
 }
@@ -2555,12 +2819,14 @@ static int check_maps(void)
 		       check_map_layout(
 			       perf_state.bpf->data_fd[EXTFUSE_DAEMON_IO_MAP],
 			       BPF_MAP_TYPE_HASH, sizeof(uint64_t),
-			       sizeof(uint64_t), PERF_METADATA_MAX_ENTRIES,
+			       sizeof(struct extfuse_io_state),
+			       PERF_METADATA_MAX_ENTRIES,
 			       BPF_F_NO_PREALLOC, "daemon_io") ||
 		       check_map_layout(
 			       perf_state.bpf->data_fd[EXTFUSE_NATIVE_IO_MAP],
 			       BPF_MAP_TYPE_HASH, sizeof(uint64_t),
-			       sizeof(uint64_t), PERF_METADATA_MAX_ENTRIES,
+			       sizeof(struct extfuse_io_state),
+			       PERF_METADATA_MAX_ENTRIES,
 			       BPF_F_NO_PREALLOC, "native_io") ||
 		       check_map_layout(
 			       perf_state.bpf->data_fd[EXTFUSE_MMAP_MAP],
@@ -2588,8 +2854,6 @@ static int configure_bpf_policy(void)
 
 	if (wbcache_passthrough_enabled())
 		flags |= EXTFUSE_POLICY_WBCACHE_PASSTHROUGH;
-	if (paper_wbcache_passthrough_enabled())
-		flags |= EXTFUSE_POLICY_PAPER_READ_ATIME_CACHE;
 	if (perf_state.paper_capability_verified_absent)
 		flags |= EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA;
 	if (perf_state.paper_write_fast &&
@@ -2637,8 +2901,7 @@ static int configure_bpf_policy(void)
 		"BPF_POLICY flags=0x%08x %s=%s %s=%s %s=%s %s=%s %s=%s %s=%s %s=%s\n",
 		flags,
 		"paper_read_atime_cache",
-		(flags & EXTFUSE_POLICY_PAPER_READ_ATIME_CACHE) ?
-			"retained" : "coherent",
+		"coherent",
 		"paper_native_mmap_metadata",
 		(flags & EXTFUSE_POLICY_RELAX_NATIVE_MMAP_METADATA) ?
 			"relaxed" : "strict",
@@ -2735,14 +2998,10 @@ static int force_all_upcalls(void)
 
 static int disable_nonmetadata_hits(void)
 {
-	uint32_t opcodes[] = { FUSE_FLUSH, FUSE_READ };
-	bool remove_read_handler =
-		perf_state.mode == PERF_MODE_HIT &&
-		perf_state.profile == PERF_PROFILE_PAPER_LIKE;
-	size_t opcode_count = remove_read_handler ? 2 : 1;
+	const uint32_t opcodes[] = { FUSE_FLUSH };
 	size_t i;
 
-	for (i = 0; i < opcode_count; i++) {
+	for (i = 0; i < sizeof(opcodes) / sizeof(opcodes[0]); i++) {
 		ebpf_ctrl_key_t key = { .opcode = opcodes[i] };
 
 		if (ebpf_ctrl_delete(perf_state.bpf, &key)) {
@@ -2752,11 +3011,10 @@ static int disable_nonmetadata_hits(void)
 			return -1;
 		}
 	}
-	perf_state.read_handler_removed = remove_read_handler;
+	perf_state.read_handler_removed = false;
 	fprintf(stderr,
 		"HANDLERS mode=hit common_fastpath=LOOKUP,GETATTR,GETXATTR "
-		"forced_upcall=FLUSH paper_read_attr_policy=%s\n",
-		remove_read_handler ? "retain" : "coherent-refresh");
+		"forced_upcall=FLUSH paper_read_attr_policy=coherent-refresh\n");
 	return 0;
 }
 
@@ -2765,7 +3023,7 @@ static void audit_packed_state_map(int map_index, uint64_t *records,
 {
 	uint64_t current_key;
 	uint64_t next_key;
-	uint64_t state;
+	struct extfuse_io_state state;
 	const void *cursor = NULL;
 
 	*records = 0;
@@ -2786,9 +3044,12 @@ static void audit_packed_state_map(int map_index, uint64_t *records,
 			continue;
 		}
 		(*records)++;
-		if (!(state >> EXTFUSE_NATIVE_STATE_ACTIVE_BITS))
+		if (!(state.attr_state >> EXTFUSE_NATIVE_STATE_ACTIVE_BITS) ||
+		    (state.xattr_state &&
+		     !(state.xattr_state >> EXTFUSE_NATIVE_STATE_ACTIVE_BITS)))
 			(*errors)++;
-		if (state & EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
+		if ((state.attr_state | state.xattr_state) &
+		    EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
 			(*active)++;
 	}
 }
@@ -2996,6 +3257,14 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 	perf_state.init_rc = 0;
 	fuse_apply_conn_info_opts(perf_state.conn_opts, conn);
 	lo_init(userdata, conn);
+	perf_state.syncfs_support = fuse_set_feature_flag(
+		conn, FUSE_CAP_SYNCFS_SUPPORT);
+	if (!perf_state.syncfs_support) {
+		if (!perf_state.init_rc)
+			perf_state.init_rc = -EOPNOTSUPP;
+		/* A missing lower-drain protocol must fail INIT, not claim success. */
+		conn->want_ext |= FUSE_CAP_SYNCFS_SUPPORT;
+	}
 	/*
 	 * Original StackFS only exposed READDIR, not READDIRPLUS.  Leaving the
 	 * modern passthrough_ll callback negotiated would let a directory reply
@@ -3076,22 +3345,20 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 				perf_state.init_rc = extfuse_rc;
 		}
 	}
-	if (perf_state.read_upcall_only && perf_state.requested &&
-	    perf_state.read_handler_removed) {
-		if (perf_state.read_upcall_only_capable)
-			perf_state.read_upcall_only_requested =
-				fuse_set_feature_flag(
-					conn,
-					FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY);
-		if (!perf_state.read_upcall_only_requested) {
+	if (perf_state.requested) {
+		perf_state.syncfs_pure = perf_state.syncfs_support &&
+			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE_SYNCFS_PURE);
+		if (!perf_state.syncfs_pure) {
 			if (!perf_state.init_rc)
 				perf_state.init_rc = -EOPNOTSUPP;
-			conn->want_ext |= FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY;
+			conn->want_ext |= FUSE_CAP_EXTFUSE_SYNCFS_PURE;
 		}
 	} else {
-		fuse_unset_feature_flag(conn,
-				FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY);
+		fuse_unset_feature_flag(conn, FUSE_CAP_EXTFUSE_SYNCFS_PURE);
 	}
+	/* READ invalidation is required in every profile, including paper MDOpt. */
+	fuse_unset_feature_flag(conn, FUSE_CAP_EXTFUSE_READ_UPCALL_ONLY);
+	perf_state.read_upcall_only_requested = false;
 	if (perf_state.requested && strict_wbcache_coherence_enabled()) {
 		if (perf_state.coherence_epochs_capable)
 			perf_state.coherence_epochs_requested =
@@ -3172,6 +3439,20 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
 		}
 	}
+	if (paper_wbcache_passthrough_enabled()) {
+		perf_state.paper_read_guard =
+			perf_state.wbcache_passthrough_requested &&
+			perf_state.passthrough_attr_refresh_requested &&
+			fuse_set_feature_flag(conn,
+					      FUSE_CAP_EXTFUSE_PAPER_READ_GUARD);
+		if (!perf_state.paper_read_guard) {
+			if (!perf_state.init_rc)
+				perf_state.init_rc = -EOPNOTSUPP;
+			conn->want_ext |= FUSE_CAP_EXTFUSE_PAPER_READ_GUARD;
+		}
+	} else {
+		fuse_unset_feature_flag(conn, FUSE_CAP_EXTFUSE_PAPER_READ_GUARD);
+	}
 	if (coherence_epochs_enabled()) {
 		/*
 		 * WBCache forwarding uses kernel epochs to bracket lower I/O.  Metadata
@@ -3195,6 +3476,8 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 	}
 	fprintf(stderr,
 		"INIT mode=%s transport=%s coherence_mode=%s capable=%u requested=%u "
+		"syncfs_support=%u syncfs_pure=%u paper_read_guard=%u "
+		"io_state_value_size=%zu "
 		PERF_COHERENCE_EPOCHS_INIT_FMT
 		PERF_MUTATION_METADATA_INIT_FMT
 		PERF_NOTIFY_INVAL_XATTR_INIT_FMT
@@ -3226,6 +3509,8 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		perf_state.mode_name, perf_state.transport,
 		coherence_mode_name(),
 		perf_state.capable, perf_state.requested,
+		perf_state.syncfs_support, perf_state.syncfs_pure,
+		perf_state.paper_read_guard, sizeof(struct extfuse_io_state),
 		perf_state.coherence_epochs_capable,
 		perf_state.coherence_epochs_requested,
 		perf_state.mutation_metadata_capable,
@@ -3252,9 +3537,7 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		perf_state.passthrough_attr_release_barrier_requested,
 		"passthrough_attr_release_barrier_policy",
 		attr_release_barrier_enabled(),
-		(perf_state.bpf_policy_flags &
-		 EXTFUSE_POLICY_PAPER_READ_ATIME_CACHE) ?
-			"retained" : "coherent",
+		"coherent",
 		(perf_state.bpf_policy_flags &
 		 EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA) ?
 			"enabled" : "disabled",
@@ -3279,6 +3562,10 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 
 static void perf_destroy(void *userdata)
 {
+	if (perf_state.syncfs_fd >= 0) {
+		close(perf_state.syncfs_fd);
+		perf_state.syncfs_fd = -1;
+	}
 	if (wbcache_passthrough_enabled())
 		cleanup_wbcache_passthrough_state();
 	audit_coherence_state();
@@ -3416,7 +3703,7 @@ static void prefetch_xattr_serialized(fuse_req_t req, fuse_ino_t ino,
 	ssize_t result;
 	int saved_error;
 
-	cache_snapshot_begin(ino, &snapshot);
+	cache_snapshot_begin_domain(ino, &snapshot, true);
 	required = lo_do_getxattr(req, ino, name, NULL, 0);
 	if (required < 0) {
 		saved_error = errno;
@@ -3493,7 +3780,7 @@ void perf_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 	}
 	xattr_lock = xattr_lock_for_inode(ino);
 	pthread_mutex_lock(xattr_lock);
-	cache_snapshot_begin(ino, &snapshot);
+	cache_snapshot_begin_domain(ino, &snapshot, true);
 	if (size) {
 		result = lo_do_getxattr(req, ino, name, value, size);
 	} else {
@@ -4428,7 +4715,7 @@ static void perf_uring_write_complete(fuse_req_t req, ssize_t result,
 	int reply_result;
 
 	quiescent = cache_mutation_end(&context->mutation);
-	if (quiescent &&
+	if (context->mutation.xattr_quiescent &&
 	    (!context->capability_fast || !paper_capability_is_safe()))
 		refill_capability_after_write(req, context->ino);
 	if (quiescent) {
@@ -4514,7 +4801,7 @@ static void perf_write_uring_zero_copy(fuse_req_t req, fuse_ino_t ino,
 		return;
 
 	quiescent = cache_mutation_end(&context->mutation);
-	if (quiescent &&
+	if (context->mutation.xattr_quiescent &&
 	    (!context->capability_fast || !paper_capability_is_safe()))
 		refill_capability_after_write(req, ino);
 	if (quiescent) {
@@ -4539,71 +4826,70 @@ static void perf_write_uring_zero_copy(fuse_req_t req, fuse_ino_t ino,
 	perf_write_contract_failed("uring-fixed", "write-submit", result);
 }
 
+struct perf_read_context {
+	struct lo_data *lo;
+	struct lo_inode *inode;
+	fuse_ino_t ino;
+	struct perf_cache_mutation mutation;
+};
+
+static void perf_read_prepare(void *opaque, ssize_t read_result)
+{
+	struct perf_read_context *context = opaque;
+	struct stat st;
+	double ignored_reply_timeout;
+	struct perf_cache_snapshot snapshot;
+	int saved_errno = errno;
+
+	/* Even a failed/partial lower read may have changed atime. */
+	(void)read_result;
+	if (cache_mutation_end_with_snapshot(&context->mutation, &snapshot) &&
+	    !extfuse_snapshot_pinned_inode(context->inode->fd,
+					  context->inode->dev,
+					  context->inode->ino, &st))
+		cache_attr(context->ino, &st, context->lo->timeout, &snapshot,
+			   false, &ignored_reply_timeout);
+	/* Cache failure never replaces the lower READ result or its errno. */
+	errno = saved_errno;
+}
+
 __attribute__((noinline, used))
 void perf_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	       off_t offset, struct fuse_file_info *fi)
 {
-	struct lo_data *lo;
-	struct lo_inode *inode;
-	struct perf_cache_mutation mutation = {};
-	struct stat st;
-	double ignored_reply_timeout;
-	struct perf_cache_snapshot snapshot;
-	int inode_fd;
+	struct fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
+	struct perf_read_context context = {
+		.ino = ino,
+		.mutation.attr_only = true,
+	};
 
 	if (perf_state.wbcache_passthrough_requested)
 		counter_increment(
 			&perf_state.counters.wbcache_daemon_read_fallbacks);
 	callback_increment(&perf_state.counters.read);
-	if (!metadata_hits_enabled() ||
-	    (perf_state.mode == PERF_MODE_HIT &&
-	     perf_state.profile == PERF_PROFILE_PAPER_LIKE)) {
-		/*
-		 * The paper's MDOpt cache does not invalidate attributes for
-		 * read-side atime changes.  Preserve that request-count policy only
-		 * in the paper-like metadata cases; the gate and AllOpt fallback
-		 * paths retain the coherence refresh below.
-		 */
+	if (!metadata_hits_enabled()) {
 		lo_read(req, ino, size, offset, fi);
 		return;
 	}
-	lo = lo_data(req);
 	/*
-	 * lo_read() completes the FUSE reply before it returns.  The kernel may
-	 * then dispatch RELEASE on another worker, close fi->fh, and let an
-	 * unrelated open reuse that descriptor while this callback takes its
-	 * post-read attribute snapshot.  Caching that unrelated object's mode
-	 * under @ino makes the next ExtFUSE GETATTR/LOOKUP fail with EIO and can
-	 * mark the kernel inode bad.
-	 *
-	 * Metadata-hit modes deliberately ignore FORGET and pin lo_inode objects
-	 * until destroy, because BPF LOOKUP hits are invisible to passthrough_ll's
-	 * userspace refcount.  Use that inode's O_PATH descriptor: unlike fi->fh,
-	 * it remains tied to exactly this inode after the READ reply and through
-	 * concurrent RELEASE.
+	 * The transport calls prepare after consuming the lower fd and before
+	 * publishing the reply. Pin the O_PATH inode identity independently of
+	 * the open handle. The attr-only token invalidates attrs without making
+	 * an unrelated concurrent GETXATTR snapshot stale.
 	 */
-	inode = lo_inode(req, ino);
-	inode_fd = inode->fd;
-	cache_mutation_add(&mutation, ino);
-	if (!cache_mutation_begin(&mutation)) {
-		cache_mutation_end(&mutation);
+	context.lo = lo_data(req);
+	context.inode = lo_inode(req, ino);
+	cache_mutation_add(&context.mutation, ino);
+	if (!cache_mutation_begin(&context.mutation)) {
+		cache_mutation_end(&context.mutation);
 		fuse_reply_err(req, EIO);
 		return;
 	}
-	invalidate_attr(ino);
-	lo_read(req, ino, size, offset, fi);
-	cache_mutation_end(&mutation);
-
-	/*
-	 * lo_read() has already completed the FUSE reply.  Refresh the cached
-	 * attributes only when this post-read snapshot remains current; neither
-	 * fstat nor map-update failure may replace the completed READ result.
-	 */
-	cache_snapshot_begin(ino, &snapshot);
-	if (!extfuse_snapshot_pinned_inode(inode_fd, inode->dev, inode->ino,
-					    &st))
-		cache_attr(ino, &st, lo->timeout, &snapshot, false,
-			   &ignored_reply_timeout);
+	buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
+	buf.buf[0].fd = fi->fh;
+	buf.buf[0].pos = offset;
+	fuse_reply_data_with_prepare(req, &buf, FUSE_BUF_SPLICE_MOVE,
+				     perf_read_prepare, &context);
 }
 
 __attribute__((noinline, used))
@@ -4675,7 +4961,8 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 			ino, negative_capability_daemon_state);
 	if (xattr_lock)
 		pthread_mutex_unlock(xattr_lock);
-	if (result >= 0 && quiescent && perf_state.paper_write_fast &&
+	if (result >= 0 && mutation.xattr_quiescent &&
+	    perf_state.paper_write_fast &&
 	    !paper_capability_is_safe())
 		refill_capability_after_write(req, ino);
 
@@ -4766,6 +5053,8 @@ void perf_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 		invalidate_xattr_serialized(ino, PERF_POSIX_ACL_ACCESS_XATTR,
 					    false);
 	cache_mutation_end(&mutation);
+	if (!error && (valid & FUSE_SET_ATTR_MODE))
+		prefetch_xattr_serialized(req, ino, PERF_POSIX_ACL_ACCESS_XATTR);
 	pthread_mutex_unlock(xattr_lock);
 	if (error) {
 		fuse_reply_err(req, error);
@@ -5346,17 +5635,39 @@ static void perf_forget_multi(fuse_req_t req, size_t count,
 	fuse_reply_none(req);
 }
 
+static void perf_syncfs(fuse_req_t req, fuse_ino_t ino)
+{
+	int error = 0;
+
+	(void)ino;
+	/* Pure drain: preserve all metadata tokens and report the real error. */
+	if (!perf_state.syncfs_support || perf_state.syncfs_fd < 0)
+		error = EOPNOTSUPP;
+	else if (syncfs(perf_state.syncfs_fd))
+		error = errno;
+	fuse_reply_err(req, error);
+}
+
 static struct fuse_session *
 perf_intercept_session_new(struct fuse_args *args,
 			   const struct fuse_lowlevel_ops *operations,
 			   size_t operation_size, void *userdata)
 {
 	struct fuse_session *session;
+	struct lo_data *lo = userdata;
 	size_t copy_size = operation_size;
 
 	perf_state.conn_opts = fuse_parse_conn_info_opts(args);
 	if (!perf_state.conn_opts)
 		return NULL;
+	/* Fail before mount: syncfs cannot operate on the existing O_PATH fd. */
+	perf_state.syncfs_fd = openat(lo->root.fd, ".",
+				    O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (perf_state.syncfs_fd < 0) {
+		fprintf(stderr, "SYNCFS_FD_ERROR errno=%d error=%s\n",
+			errno, strerror(errno));
+		return NULL;
+	}
 	if (copy_size > sizeof(perf_state.operations))
 		copy_size = sizeof(perf_state.operations);
 	memset(&perf_state.operations, 0, sizeof(perf_state.operations));
@@ -5376,6 +5687,7 @@ perf_intercept_session_new(struct fuse_args *args,
 	perf_state.operations.read = perf_read;
 	perf_state.operations.write_buf = perf_write_buf;
 	perf_state.operations.flush = perf_flush;
+	perf_state.operations.syncfs = perf_syncfs;
 	perf_state.operations.setattr = perf_setattr;
 	perf_state.operations.fallocate = perf_fallocate;
 	perf_state.operations.setxattr = perf_setxattr;
@@ -5400,6 +5712,13 @@ perf_intercept_session_new(struct fuse_args *args,
 
 	session = fuse_session_new_fn(args, &perf_state.operations,
 				      sizeof(perf_state.operations), userdata);
+	if (!session) {
+		int saved_errno = errno;
+
+		close(perf_state.syncfs_fd);
+		perf_state.syncfs_fd = -1;
+		errno = saved_errno;
+	}
 	perf_state.session = session;
 	return session;
 }
@@ -5507,9 +5826,9 @@ static int validate_experiment_toggles(void)
 	bool c1_or_c2 = perf_state.mode == PERF_MODE_HIT && paper_profile;
 	bool c3_or_c4 = perf_state.mode == PERF_MODE_ALLOPT && paper_profile;
 
-	if (perf_state.read_upcall_only && !c1_or_c2) {
+	if (perf_state.read_upcall_only) {
 		fprintf(stderr,
-			"EXTFUSE_READ_UPCALL_ONLY requires hit mode and paper-like profile\n");
+			"EXTFUSE_READ_UPCALL_ONLY=1 is retired; READ must run the BPF policy\n");
 		return -1;
 	}
 	if (perf_state.paper_write_fast && !c1_or_c2) {
@@ -5672,6 +5991,18 @@ int main(int argc, char **argv)
 	    verify_paper_capability_absent(source))
 		return 1;
 	if (metadata_hits_enabled()) {
+		if (perf_state.mode == PERF_MODE_HIT) {
+			if (initialize_cache_locks()) {
+				fprintf(stderr, "cannot initialize cache locks: %s\n",
+					strerror(errno));
+				return 1;
+			}
+			if (atexit(cleanup_cache_locks)) {
+				cleanup_cache_locks();
+				fprintf(stderr, "cannot register cache lock cleanup\n");
+				return 1;
+			}
+		}
 		if (initialize_xattr_locks()) {
 			fprintf(stderr, "cannot initialize xattr locks: %s\n",
 				strerror(errno));
@@ -5775,6 +6106,11 @@ int main(int argc, char **argv)
 			argv[7 + i]);
 	rc = upstream_passthrough_main((int)passthrough_argc,
 				       passthrough_argv);
+	/* Mount/INIT failure may skip the destroy callback. */
+	if (perf_state.syncfs_fd >= 0) {
+		close(perf_state.syncfs_fd);
+		perf_state.syncfs_fd = -1;
+	}
 	free(passthrough_argv);
 	print_counters("exit");
 	free(perf_state.conn_opts);

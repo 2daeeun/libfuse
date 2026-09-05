@@ -100,10 +100,9 @@ def test_extfuse_paper_c2_write_contract():
     assert 'EXTFUSE_PAPER_WRITE_FAST' in daemon_source
     assert 'EXTFUSE_WBCACHE_WRITE_STREAM' in daemon_source
     assert 'prefetch_capability(req, ino);' in daemon_source
-    assert 'perf_state.read_handler_removed = remove_read_handler;' in (
-        daemon_source)
-    assert ('perf_state.read_upcall_only && perf_state.requested &&\n'
-            '\t    perf_state.read_handler_removed') in daemon_source
+    assert 'perf_state.read_handler_removed = false;' in daemon_source
+    assert 'perf_state.read_upcall_only_requested = false;' in daemon_source
+    assert 'EXTFUSE_READ_UPCALL_ONLY=1 is retired' in daemon_source
 
     # The startup scan proves absence but does not publish fast-path safety.
     # Publication follows a successful policy-map update/readback; revocation
@@ -143,3 +142,95 @@ def test_extfuse_paper_c2_write_contract():
     attr_lookup = write_hook.index(
         'bpf_map_lookup_elem(&attr_map, &key)', legacy_invalidation)
     assert fast_policy < legacy_invalidation < attr_lookup
+
+
+def test_reply_data_prepare_source_contract():
+    """Static branch coverage; complements, but does not replace, C tests."""
+    root = Path(__file__).resolve().parents[1]
+    lowlevel = root / 'lib' / 'fuse_lowlevel.c'
+    uring = root / 'lib' / 'fuse_uring.c'
+    source = lowlevel.read_text(encoding='utf-8')
+    once = _source_region(lowlevel, 'static void fuse_data_prepare_once',
+                          'static int fuse_send_data_iov_fallback')
+    fallback = _source_region(lowlevel, 'static int fuse_send_data_iov_fallback',
+                              'struct fuse_ll_pipe {')
+    splice = _source_region(lowlevel, 'static int fuse_send_data_iov(',
+                            '\n#else\nstatic int fuse_send_data_iov(')
+    reply = _source_region(lowlevel, 'int fuse_reply_data_with_prepare(',
+                           'int fuse_reply_statfs(')
+    uring_reply = _source_region(uring,
+                                 'int fuse_reply_data_uring_with_prepare(',
+                                 'int fuse_send_msg_uring(')
+
+    # Nulling the callback before invocation makes every outer error path safe
+    # after a transport failure. Allocation and read failures reach this guard.
+    assert once.index('prepare->callback = NULL') < once.index('callback(')
+    assert 'errno = saved_errno;' in once
+    assert fallback.count('fuse_data_prepare_once(prepare, len);') == 2
+    assert fallback.count('fuse_send_msg(') == 2
+    assert 'if (res != 0)\n\t\treturn res;' in fallback
+    assert 'return -res;' in fallback
+    assert reply.index('fuse_send_data_iov(') < reply.index(
+        'fuse_data_prepare_once(&prepare, res > 0 ? -res : res);')
+    assert reply.index('fuse_data_prepare_once(&prepare,') < reply.index(
+        'fuse_free_req(req);')
+    assert reply.index('fuse_data_prepare_once(&prepare,') < reply.index(
+        'fuse_reply_err(req, res)')
+
+    # Splice pipe allocation can fall back, and vmsplice/header/read-back
+    # errors clear the pipe. No callback is consumed on a retry branch.
+    assert 'if (llp == NULL)\n\t\tgoto fallback;' in splice
+    assert 'res = ENOMEM;\n\t\t\t\tgoto clear_pipe;' in splice
+    assert 'clear_pipe:\n\tfuse_ll_clear_pipe(se);\n\treturn res;' in splice
+    short = splice[splice.index('if (res != 0 && res < len)'):]
+    assert short.index('res = fuse_buf_copy(&mem_buf, buf, 0);') < short.index(
+        'fuse_data_prepare_once(prepare, len);')
+    assert short.index('read_back(llp->pipe[0], mbuf, now_len)') < short.index(
+        'fuse_data_prepare_once(prepare, len);')
+    assert short.index('fuse_data_prepare_once(prepare, len);') < short.index(
+        'fuse_send_msg(')
+    # EOF or a failure after a positive partial copy retains the existing
+    # partial-reply rule; its count is finalized before the splice boundary.
+    assert 'res = now_len;' in short
+    final = short[short.index('len = res;'):]
+    assert final.index('fuse_data_prepare_once(prepare, len);') < final.index(
+        'se->io->splice_send(')
+    assert final.index('fuse_data_prepare_once(prepare, len);') < final.index(
+        'res = splice(')
+
+    # io_uring copy and validation finish before callback, which precedes the
+    # actual common COMMIT boundary; error/zero-byte copies also reach it.
+    assert uring_reply.index('fuse_buf_copy(') < uring_reply.index(
+        'fuse_uring_prepare_reply(') < uring_reply.index('prepare(opaque, res)')
+    assert uring_reply.index('res = out->error;') < uring_reply.index(
+        'prepare(opaque, res)')
+    assert uring_reply.index('prepare(opaque, res)') < uring_reply.index(
+        'fuse_uring_commit_sqe(') < uring_reply.index('fuse_free_req(req)')
+    assert 'fuse_reply_data_with_prepare(req, bufv, flags, NULL, NULL)' in source
+    assert 'fuse_send_data_iov(se, NULL, iov, 2, bufv, flags, req, NULL)' in source
+
+
+def test_syncfs_source_contract():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / 'lib' / 'fuse_lowlevel.c').read_text(encoding='utf-8')
+    assert '[FUSE_SYNCFS]\t   = { do_syncfs,' in source
+    assert '[FUSE_SYNCFS]\t\t= { _do_syncfs,' in source
+    handler = source[source.index('static void _do_syncfs('):
+                     source.index('static bool want_flags_valid(')]
+    assert 'req->se->op.syncfs(req, nodeid)' in handler
+    assert 'fuse_reply_err(req, ENOSYS)' in handler
+    assert 'fuse_reply_err(req, 0)' not in handler
+    assert 'FUSE_CAP_SYNCFS_SUPPORT) && !se->op.syncfs' in source
+
+
+def test_reply_data_prepare_splice_coverage_contract():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / 'test/test_reply_data_prepare.c').read_text()
+    meson = (root / 'test/meson.build').read_text()
+    assert '.init = test_init' in source
+    assert 'conn, FUSE_CAP_SPLICE_WRITE' in source
+    assert 'state->splice_sends++;' in source
+    assert 'state.splice_sends == splice_before + 1' in source
+    assert 'state.splice_requested && !state.splice_sends' in source
+    assert 'result = 77;' in source
+    assert "args: ['--splice']" in meson

@@ -674,6 +674,28 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM (1ULL << 45)
 
 /**
+ * Explicit filesystem-wide synchronization support. Request this only when
+ * fuse_lowlevel_ops.syncfs implements the complete filesystem persistence
+ * barrier. Unlike legacy SYNCFS, ENOSYS is an error when this is negotiated.
+ * This capability does not require ExtFUSE.
+ */
+#define FUSE_CAP_SYNCFS_SUPPORT (1ULL << 46)
+
+/**
+ * SYNCFS is a pure persistence operation: it does not mutate cached metadata.
+ * ExtFUSE policy still runs for the request. Requires ExtFUSE and explicit
+ * SYNCFS support; a filesystem that mutates metadata during sync must not opt in.
+ */
+#define FUSE_CAP_EXTFUSE_SYNCFS_PURE (1ULL << 47)
+
+/**
+ * Guard forwarded buffered reads and refresh their attributes before reply.
+ * Requires ExtFUSE, writeback-cache passthrough and attribute refresh, and
+ * excludes native passthrough. This does not bypass the ExtFUSE BPF policy.
+ */
+#define FUSE_CAP_EXTFUSE_PAPER_READ_GUARD (1ULL << 48)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine

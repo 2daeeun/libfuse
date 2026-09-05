@@ -111,6 +111,9 @@ struct fuse_ring_pool {
 	/* number of queues */
 	size_t nr_queues;
 
+	/* Optional, immutable physical-core identities sampled before workers. */
+	int *cpu_core_ids;
+
 	/* number of per queue entries */
 	size_t queue_depth;
 
@@ -202,7 +205,15 @@ static void fuse_uring_use_payload_pool(struct io_uring_sqe *sqe)
 }
 #endif
 
-static int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
+/* Keep the real preparation/COMMIT boundaries available to opt-in uprobes. */
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 9
+#define FUSE_URING_PROBE __attribute__((noipa, used))
+#else
+#define FUSE_URING_PROBE __attribute__((noinline, used))
+#endif
+
+FUSE_URING_PROBE
+int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 				 struct fuse_ring_queue *queue,
 				 struct fuse_ring_ent *ring_ent)
 {
@@ -458,6 +469,15 @@ int send_reply_uring(fuse_req_t req, int error, const void *arg, size_t argsize)
 int fuse_reply_data_uring(fuse_req_t req, struct fuse_bufvec *bufv,
 		    enum fuse_buf_copy_flags flags)
 {
+	return fuse_reply_data_uring_with_prepare(req, bufv, flags, NULL, NULL);
+}
+
+FUSE_URING_PROBE
+int fuse_reply_data_uring_with_prepare(fuse_req_t req, struct fuse_bufvec *bufv,
+				      enum fuse_buf_copy_flags flags,
+				      fuse_reply_data_prepare_t prepare,
+				      void *opaque)
+{
 	struct fuse_ring_ent *ring_ent =
 		container_of(req, struct fuse_ring_ent, req);
 
@@ -479,10 +499,19 @@ int fuse_reply_data_uring(fuse_req_t req, struct fuse_bufvec *bufv,
 	if (fuse_uring_prepare_reply(out, ent_in_out, req->unique,
 				     res < 0 ? res : 0,
 				     res > 0 ? (size_t)res : 0,
-				     max_payload_sz))
+				     max_payload_sz)) {
+		res = out->error;
 		fuse_log(FUSE_LOG_ERR,
 			 "copied io_uring reply exceeds buffer size %zu",
 			 max_payload_sz);
+	}
+
+	if (prepare) {
+		int saved_errno = errno;
+
+		prepare(opaque, res);
+		errno = saved_errno;
+	}
 
 	res = fuse_uring_commit_sqe(ring_pool, queue, ring_ent);
 
@@ -681,6 +710,25 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 		copied_read_fallbacks += queue->copied_read_fallbacks;
 		copied_write_fallbacks += queue->copied_write_fallbacks;
 
+		/* Reuse existing counters after join: no per-request tracing cost. */
+		if (queue->fixed_read_submitted || queue->fixed_write_submitted)
+			fuse_log(FUSE_LOG_INFO,
+				 "FUSE_URING_QUEUE_STATS qid=%zu"
+				 " read_submitted=%" PRIu64
+				 " read_completed=%" PRIu64
+				 " read_errors=%" PRIu64 " read_bytes=%" PRIu64
+				 " write_submitted=%" PRIu64
+				 " write_completed=%" PRIu64
+				 " write_errors=%" PRIu64 " write_bytes=%" PRIu64
+				 " copied_read_fallbacks=%" PRIu64
+				 " copied_write_fallbacks=%" PRIu64 "\n",
+				 qid, queue->fixed_read_submitted,
+				 queue->fixed_read_completed, queue->fixed_read_errors,
+				 queue->fixed_read_bytes, queue->fixed_write_submitted,
+				 queue->fixed_write_completed, queue->fixed_write_errors,
+				 queue->fixed_write_bytes, queue->copied_read_fallbacks,
+				 queue->copied_write_fallbacks);
+
 		pthread_mutex_destroy(&queue->ring_lock);
 	}
 
@@ -701,6 +749,7 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 		 copied_fallbacks, copied_read_fallbacks,
 		 copied_write_fallbacks);
 
+	free(fuse_ring->cpu_core_ids);
 	free(fuse_ring->queues);
 	pthread_cond_destroy(&fuse_ring->thread_start_cond);
 	pthread_mutex_destroy(&fuse_ring->thread_start_mutex);
@@ -901,6 +950,32 @@ static int fuse_uring_submit_registered_queue(struct fuse_ring_queue *queue)
 	return 0;
 }
 
+static int *fuse_uring_read_cpu_core_ids(size_t nr_cpus)
+{
+	int *core_ids = calloc(nr_cpus, sizeof(*core_ids));
+
+	if (!core_ids)
+		return NULL;
+	for (size_t cpu = 0; cpu < nr_cpus; cpu++) {
+		char path[128];
+		unsigned int first_sibling;
+		FILE *file;
+
+		core_ids[cpu] = -1;
+		snprintf(path, sizeof(path),
+			 "/sys/devices/system/cpu/cpu%zu/topology/thread_siblings_list",
+			 cpu);
+		file = fopen(path, "re");
+		if (!file)
+			continue;
+		if (fscanf(file, "%u", &first_sibling) == 1 &&
+		    first_sibling <= INT_MAX)
+			core_ids[cpu] = (int)first_sibling;
+		fclose(file);
+	}
+	return core_ids;
+}
+
 static struct fuse_ring_pool *fuse_create_ring(struct fuse_session *se)
 {
 	struct fuse_ring_pool *fuse_ring = NULL;
@@ -927,6 +1002,7 @@ static struct fuse_ring_pool *fuse_create_ring(struct fuse_session *se)
 
 	fuse_ring->se = se;
 	fuse_ring->nr_queues = nr_queues;
+	fuse_ring->cpu_core_ids = fuse_uring_read_cpu_core_ids(nr_queues);
 	fuse_ring->queue_depth = se->uring.q_depth;
 	fuse_ring->max_req_payload_sz = payload_sz;
 	fuse_ring->queue_mem_size = queue_sz;
@@ -1226,7 +1302,8 @@ static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
  * Binding that queue's userspace thread to the same CPU makes the request
  * issuer and handler time-share one CPU. Background requests may be balanced
  * independently. Keep each queue on the same NUMA node when possible, but use
- * a different CPU allowed by the daemon's affinity mask.
+ * a different physical core allowed by the daemon's affinity mask. Logical
+ * CPU qid+1 can be qid's SMT sibling, so CPU-number rotation alone is not enough.
  */
 static void fuse_uring_set_thread_cpu(struct fuse_ring_queue *queue)
 {
@@ -1257,8 +1334,9 @@ static void fuse_uring_set_thread_cpu(struct fuse_ring_queue *queue)
 	    numa_node_to_cpus(queue->numa_node, local_cpus) != 0)
 		numa_bitmask_clearall(local_cpus);
 
-	target_cpu = fuse_uring_select_thread_cpu(queue->qid, allowed_cpus,
-						  local_cpus);
+	target_cpu = fuse_uring_select_thread_core(
+		queue->qid, allowed_cpus, local_cpus,
+		queue->ring_pool->cpu_core_ids, queue->ring_pool->nr_queues);
 	if (target_cpu < 0) {
 		fuse_log(FUSE_LOG_ERR, "No allowed CPU for qid=%d\n",
 			 queue->qid);

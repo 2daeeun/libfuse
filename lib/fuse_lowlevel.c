@@ -821,11 +821,30 @@ int fuse_reply_buf(fuse_req_t req, const char *buf, size_t size)
 	return send_reply_ok(req, buf, size);
 }
 
+struct fuse_data_prepare {
+	fuse_reply_data_prepare_t callback;
+	void *opaque;
+};
+
+static void fuse_data_prepare_once(struct fuse_data_prepare *prepare,
+				   ssize_t result)
+{
+	if (prepare && prepare->callback) {
+		fuse_reply_data_prepare_t callback = prepare->callback;
+		int saved_errno = errno;
+
+		prepare->callback = NULL;
+		callback(prepare->opaque, result);
+		errno = saved_errno;
+	}
+}
+
 static int fuse_send_data_iov_fallback(struct fuse_session *se,
 				       struct fuse_chan *ch,
 				       struct iovec *iov, int iov_count,
 				       struct fuse_bufvec *buf,
-				       size_t len, fuse_req_t req)
+				       size_t len, fuse_req_t req,
+				       struct fuse_data_prepare *prepare)
 {
 	struct fuse_bufvec mem_buf = FUSE_BUFVEC_INIT(len);
 	void *mbuf;
@@ -840,6 +859,7 @@ static int fuse_send_data_iov_fallback(struct fuse_session *se,
 		iov[iov_count].iov_base = buf->buf[0].mem;
 		iov[iov_count].iov_len = len;
 		iov_count++;
+		fuse_data_prepare_once(prepare, len);
 		return fuse_send_msg(se, ch, iov, iov_count, req);
 	}
 
@@ -858,6 +878,7 @@ static int fuse_send_data_iov_fallback(struct fuse_session *se,
 	iov[iov_count].iov_base = mbuf;
 	iov[iov_count].iov_len = len;
 	iov_count++;
+	fuse_data_prepare_once(prepare, len);
 	res = fuse_send_msg(se, ch, iov, iov_count, req);
 	free(mbuf);
 
@@ -996,7 +1017,7 @@ static int grow_pipe_to_max(int pipefd)
 static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
 			      struct iovec *iov, int iov_count,
 			      struct fuse_bufvec *buf, unsigned int flags,
-			      fuse_req_t req)
+			      fuse_req_t req, struct fuse_data_prepare *prepare)
 {
 	int res;
 	size_t len = fuse_buf_size(buf);
@@ -1148,6 +1169,7 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
 			iov[iov_count].iov_base = mbuf;
 			iov[iov_count].iov_len = len;
 			iov_count++;
+			fuse_data_prepare_once(prepare, len);
 			res = fuse_send_msg(se, ch, iov, iov_count, req);
 			free(mbuf);
 			return res;
@@ -1169,6 +1191,7 @@ static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
 	    (se->conn.want_ext & FUSE_CAP_SPLICE_MOVE))
 		splice_flags |= SPLICE_F_MOVE;
 
+	fuse_data_prepare_once(prepare, len);
 	if (se->io != NULL && se->io->splice_send != NULL) {
 		res = se->io->splice_send(llp->pipe[0], NULL,
 						  ch ? ch->fd : se->fd, NULL, out->len,
@@ -1195,30 +1218,41 @@ clear_pipe:
 	return res;
 
 fallback:
-	return fuse_send_data_iov_fallback(se, ch, iov, iov_count, buf, len, req);
+	return fuse_send_data_iov_fallback(se, ch, iov, iov_count, buf, len, req,
+					 prepare);
 }
 #else
 static int fuse_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
 			       struct iovec *iov, int iov_count,
 			       struct fuse_bufvec *req_data, unsigned int flags,
-			       fuse_req_t req)
+			       fuse_req_t req, struct fuse_data_prepare *prepare)
 {
 	size_t len = fuse_buf_size(req_data);
 	(void) flags;
 
-	return fuse_send_data_iov_fallback(se, ch, iov, iov_count, req_data, len, req);
+	return fuse_send_data_iov_fallback(se, ch, iov, iov_count, req_data, len,
+					 req, prepare);
 }
 #endif
 
 int fuse_reply_data(fuse_req_t req, struct fuse_bufvec *bufv,
 		    enum fuse_buf_copy_flags flags)
 {
+	return fuse_reply_data_with_prepare(req, bufv, flags, NULL, NULL);
+}
+
+int fuse_reply_data_with_prepare(fuse_req_t req, struct fuse_bufvec *bufv,
+				enum fuse_buf_copy_flags flags,
+				fuse_reply_data_prepare_t callback, void *opaque)
+{
+	struct fuse_data_prepare prepare = { callback, opaque };
 	struct iovec iov[2];
 	struct fuse_out_header out;
 	int res;
 
 	if (req->flags.is_uring)
-		return fuse_reply_data_uring(req, bufv, flags);
+		return fuse_reply_data_uring_with_prepare(req, bufv, flags,
+						  callback, opaque);
 
 	iov[0].iov_base = &out;
 	iov[0].iov_len = sizeof(struct fuse_out_header);
@@ -1226,7 +1260,10 @@ int fuse_reply_data(fuse_req_t req, struct fuse_bufvec *bufv,
 	out.unique = req->unique;
 	out.error = 0;
 
-	res = fuse_send_data_iov(req->se, req->ch, iov, 1, bufv, flags, req);
+	res = fuse_send_data_iov(req->se, req->ch, iov, 1, bufv, flags, req,
+				&prepare);
+	/* Failures before the send boundary still release the caller's guard. */
+	fuse_data_prepare_once(&prepare, res > 0 ? -res : res);
 	if (res <= 0) {
 		fuse_free_req(req);
 		return res;
@@ -2744,6 +2781,22 @@ static void do_statx(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
 	_do_statx(req, nodeid, inarg, NULL);
 }
 
+static void _do_syncfs(fuse_req_t req, const fuse_ino_t nodeid,
+		       const void *op_in, const void *in_payload)
+{
+	(void)op_in;
+	(void)in_payload;
+	if (req->se->op.syncfs)
+		req->se->op.syncfs(req, nodeid);
+	else
+		fuse_reply_err(req, ENOSYS);
+}
+
+static void do_syncfs(fuse_req_t req, fuse_ino_t nodeid, const void *inarg)
+{
+	_do_syncfs(req, nodeid, inarg, NULL);
+}
+
 static bool want_flags_valid(uint64_t capable, uint64_t want)
 {
 	uint64_t unknown_flags = want & (~capable);
@@ -2779,6 +2832,11 @@ static bool want_flag_dependencies_valid(uint64_t want)
 	const uint64_t wbcache_write_stream_dependencies =
 		FUSE_CAP_EXTFUSE | FUSE_CAP_WRITEBACK_CACHE |
 		FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH;
+	const uint64_t syncfs_pure_dependencies =
+		FUSE_CAP_EXTFUSE | FUSE_CAP_SYNCFS_SUPPORT;
+	const uint64_t paper_read_guard_dependencies =
+		wbcache_attr_refresh_dependencies |
+		FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
 
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE) &&
 	    (want & coherence_dependencies) != coherence_dependencies) {
@@ -2857,6 +2915,20 @@ static bool want_flag_dependencies_valid(uint64_t want)
 	     (want & FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS))) {
 		fuse_log(FUSE_LOG_ERR,
 			 "fuse: ExtFUSE writeback-cache write stream requires ExtFUSE writeback-cache passthrough and excludes coherence epochs\n");
+		return false;
+	}
+	if ((want & FUSE_CAP_EXTFUSE_SYNCFS_PURE) &&
+	    (want & syncfs_pure_dependencies) != syncfs_pure_dependencies) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: pure SYNCFS requires ExtFUSE and SYNCFS support\n");
+		return false;
+	}
+	if ((want & FUSE_CAP_EXTFUSE_PAPER_READ_GUARD) &&
+	    ((want & paper_read_guard_dependencies) !=
+		     paper_read_guard_dependencies ||
+	     (want & FUSE_CAP_PASSTHROUGH))) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: guarded reads require ExtFUSE writeback-cache passthrough and attr refresh, and exclude native passthrough\n");
 		return false;
 	}
 	return true;
@@ -3089,6 +3161,16 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		if (inargflags & FUSE_EXTFUSE_WBCACHE_WRITE_STREAM)
 			se->conn.capable_ext |=
 				FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM;
+		if (arg->minor >= 48) {
+			if (inargflags & FUSE_SYNCFS_SUPPORT)
+				se->conn.capable_ext |= FUSE_CAP_SYNCFS_SUPPORT;
+			if (inargflags & FUSE_EXTFUSE_SYNCFS_PURE)
+				se->conn.capable_ext |=
+					FUSE_CAP_EXTFUSE_SYNCFS_PURE;
+			if (inargflags & FUSE_EXTFUSE_PAPER_READ_GUARD)
+				se->conn.capable_ext |=
+					FUSE_CAP_EXTFUSE_PAPER_READ_GUARD;
+		}
 #ifdef HAVE_URING_ZERO_COPY
 		if (arg->minor >= 48 &&
 		    (inargflags & FUSE_HAS_IO_URING_BUFPOOL))
@@ -3165,7 +3247,11 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		(se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL) != 0;
 	if (!want_flags_valid(se->conn.capable_ext, se->conn.want_ext) ||
 	    !want_flag_dependencies_valid(se->conn.want_ext) ||
+	    ((se->conn.want_ext & FUSE_CAP_SYNCFS_SUPPORT) && !se->op.syncfs) ||
 	    (require_io_uring_bufpool && !se->uring.enable)) {
+		if ((se->conn.want_ext & FUSE_CAP_SYNCFS_SUPPORT) && !se->op.syncfs)
+			fuse_log(FUSE_LOG_ERR,
+				 "fuse: SYNCFS support requires a syncfs callback\n");
 		if (require_io_uring_bufpool && !se->uring.enable)
 			fuse_log(FUSE_LOG_ERR,
 				 "fuse: io-uring buffer pools require the io_uring mount option\n");
@@ -3289,6 +3375,12 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_EXTFUSE_READ_UPCALL_ONLY;
 	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM)
 		outargflags |= FUSE_EXTFUSE_WBCACHE_WRITE_STREAM;
+	if (se->conn.want_ext & FUSE_CAP_SYNCFS_SUPPORT)
+		outargflags |= FUSE_SYNCFS_SUPPORT;
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_SYNCFS_PURE)
+		outargflags |= FUSE_EXTFUSE_SYNCFS_PURE;
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_PAPER_READ_GUARD)
+		outargflags |= FUSE_EXTFUSE_PAPER_READ_GUARD;
 
 	if ((inargflags & FUSE_REQUEST_TIMEOUT) && se->conn.request_timeout) {
 		outargflags |= FUSE_REQUEST_TIMEOUT;
@@ -3666,7 +3758,7 @@ int fuse_lowlevel_notify_store(struct fuse_session *se, fuse_ino_t ino,
 	iov[1].iov_base = &outarg;
 	iov[1].iov_len = sizeof(outarg);
 
-	res = fuse_send_data_iov(se, NULL, iov, 2, bufv, flags, req);
+	res = fuse_send_data_iov(se, NULL, iov, 2, bufv, flags, req, NULL);
 	if (res > 0)
 		res = -res;
 
@@ -3892,6 +3984,7 @@ static struct {
 	[FUSE_COPY_FILE_RANGE_64] = { do_copy_file_range_64, "COPY_FILE_RANGE_64" },
 	[FUSE_LSEEK]	   = { do_lseek,       "LSEEK"	     },
 	[FUSE_STATX]	   = { do_statx,       "STATX"	     },
+	[FUSE_SYNCFS]	   = { do_syncfs,      "SYNCFS"	     },
 	[CUSE_INIT]	   = { cuse_lowlevel_init, "CUSE_INIT"   },
 };
 
@@ -3948,6 +4041,7 @@ static struct {
 	[FUSE_COPY_FILE_RANGE_64]	= { _do_copy_file_range_64, "COPY_FILE_RANGE_64" },
 	[FUSE_LSEEK]		= { _do_lseek,		"LSEEK" },
 	[FUSE_STATX]		= { _do_statx,		"STATX" },
+	[FUSE_SYNCFS]		= { _do_syncfs,		"SYNCFS" },
 	[CUSE_INIT]		= { _cuse_lowlevel_init, "CUSE_INIT" },
 };
 

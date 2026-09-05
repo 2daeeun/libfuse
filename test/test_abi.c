@@ -2,10 +2,16 @@
 
 #include "fuse.h"
 #include "fuse_kernel.h"
+#include "fuse_lowlevel.h"
 
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+_Static_assert(offsetof(struct fuse_lowlevel_ops, syncfs) ==
+	       offsetof(struct fuse_lowlevel_ops, statx) +
+	       sizeof(((struct fuse_lowlevel_ops *)0)->statx),
+	       "syncfs must append to the existing lowlevel operations ABI");
 
 int main(void)
 {

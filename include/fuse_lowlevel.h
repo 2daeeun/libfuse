@@ -1341,6 +1341,20 @@ struct fuse_lowlevel_ops {
 	 */
 	void (*statx)(fuse_req_t req, fuse_ino_t ino, int flags, int mask,
 		      struct fuse_file_info *fi);
+
+	/**
+	 * Synchronize the entire filesystem containing ino.
+	 *
+	 * Reply with fuse_reply_err(req, 0) only after all relevant backing
+	 * filesystems have completed their persistence barriers. This optional
+	 * operation defaults to ENOSYS, not success. FUSE_CAP_SYNCFS_SUPPORT
+	 * requires this callback; ENOSYS is then propagated as an error. Legacy
+	 * kernels may instead disable SYNCFS after ENOSYS.
+	 *
+	 * @param req request handle
+	 * @param ino inode number identifying the filesystem
+	 */
+	void (*syncfs)(fuse_req_t req, fuse_ino_t ino);
 };
 
 /**
@@ -1612,6 +1626,35 @@ int fuse_reply_buf(fuse_req_t req, const char *buf, size_t size);
  */
 int fuse_reply_data(fuse_req_t req, struct fuse_bufvec *bufv,
 		    enum fuse_buf_copy_flags flags);
+
+/** Callback used by fuse_reply_data_with_prepare(). */
+typedef void (*fuse_reply_data_prepare_t)(void *opaque, ssize_t read_result);
+
+/**
+ * Reply with data after synchronously preparing associated metadata.
+ *
+ * Behaves like fuse_reply_data(), but calls prepare exactly once after all
+ * reads from bufv have finished and before sending the reply (including an
+ * io_uring COMMIT). read_result is the prepared byte count, or a negative errno
+ * if preparation failed. A later transport failure does not call it again.
+ * Allocation and read failures also invoke prepare before replying with an
+ * error or returning. A NULL callback is equivalent to fuse_reply_data().
+ *
+ * The callback runs before this function returns, so opaque may refer to the
+ * caller's stack. It must not reply, free the request, modify the data vector,
+ * or reenter libfuse. It is suitable for publishing metadata obtained directly
+ * from an already open backing file without issuing a new FUSE request.
+ *
+ * @param req request handle
+ * @param bufv buffer vector
+ * @param flags flags controlling the copy
+ * @param prepare optional synchronous preparation callback
+ * @param opaque callback argument
+ * @return zero for success, -errno for failure to send reply
+ */
+int fuse_reply_data_with_prepare(fuse_req_t req, struct fuse_bufvec *bufv,
+				enum fuse_buf_copy_flags flags,
+				fuse_reply_data_prepare_t prepare, void *opaque);
 
 /**
  * Reply with data vector

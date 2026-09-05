@@ -60,6 +60,18 @@ _Static_assert(FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM == (1ULL << 45),
 	       "unexpected WBCache write-stream capability bit");
 _Static_assert(FUSE_EXTFUSE_WBCACHE_WRITE_STREAM == (1ULL << 54),
 	       "unexpected WBCache write-stream wire bit");
+_Static_assert(FUSE_CAP_SYNCFS_SUPPORT == (1ULL << 46),
+	       "unexpected SYNCFS capability bit");
+_Static_assert(FUSE_SYNCFS_SUPPORT == (1ULL << 55),
+	       "unexpected SYNCFS wire bit");
+_Static_assert(FUSE_CAP_EXTFUSE_SYNCFS_PURE == (1ULL << 47),
+	       "unexpected pure SYNCFS capability bit");
+_Static_assert(FUSE_EXTFUSE_SYNCFS_PURE == (1ULL << 56),
+	       "unexpected pure SYNCFS wire bit");
+_Static_assert(FUSE_CAP_EXTFUSE_PAPER_READ_GUARD == (1ULL << 48),
+	       "unexpected read guard capability bit");
+_Static_assert(FUSE_EXTFUSE_PAPER_READ_GUARD == (1ULL << 57),
+	       "unexpected read guard wire bit");
 _Static_assert(FUSE_IO_URING_CMD_ADD_QUEUE == 3,
 	       "unexpected io-uring add-queue command");
 _Static_assert(FUSE_IO_URING_CMD_ADD_BUFPOOL == 4,

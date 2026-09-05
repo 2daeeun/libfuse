@@ -17,9 +17,9 @@ typedef struct xattr_value {
 	/* Zero for a value, or the positive ENODATA cache result. */
 	__s32 error;
 	__u32 size;
-	/* Exact native-I/O state observed before the lower xattr snapshot. */
+	/* Exact native xattr_state observed before the lower xattr snapshot. */
 	__u64 native_state;
-	/* Exact daemon-mutation state observed before the lower snapshot. */
+	/* Exact daemon xattr_state observed before the lower snapshot. */
 	__u64 daemon_state;
 	__u8 data[EXTFUSE_XATTR_VALUE_MAX];
 } xattr_value_t;

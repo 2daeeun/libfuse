@@ -41,6 +41,19 @@ native_request_counter_test = executable(
 td += native_request_counter_test
 test('native request counter', native_request_counter_test)
 
+syncfs_test = executable('test_syncfs', 'test_syncfs.c',
+                        dependencies: [ libfuse_dep ], install: false)
+td += syncfs_test
+test('SYNCFS negotiation and dispatch', syncfs_test)
+
+reply_data_prepare_test = executable(
+    'test_reply_data_prepare', 'test_reply_data_prepare.c',
+    dependencies: [ libfuse_dep ], install: false)
+td += reply_data_prepare_test
+test('data reply preparation ordering and failures', reply_data_prepare_test)
+test('data reply preparation splice ordering and failures',
+     reply_data_prepare_test, args: ['--splice'])
+
 if private_cfg.get('HAVE_URING', false)
     uring_reply_test = executable(
         'test_uring_reply', 'test_uring_reply.c',

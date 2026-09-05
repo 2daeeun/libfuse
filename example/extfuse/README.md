@@ -35,10 +35,8 @@ hand runner.
 The performance changes in this example are disabled by default and selected
 with strict Boolean environment values (`0` or `1`):
 
-- `EXTFUSE_READ_UPCALL_ONLY=1` is valid only for `hit`, `paper-like` C1/C2. It
-  negotiates a direct daemon route for synchronous READ after this daemon
-  removes the READ BPF handler. Background readahead retains the ordinary
-  ExtFUSE route; GETATTR and GETXATTR remain eligible for ExtFUSE.
+- `EXTFUSE_READ_UPCALL_ONLY=1` is retired and rejected. READ always keeps its
+  BPF policy handler; callers may leave the variable unset or set it to `0`.
 - `EXTFUSE_PAPER_WRITE_FAST=1` is valid only for `hit`, `paper-like` C1/C2. It
   removes the per-write capability lock/map churn while the startup proof that
   `security.capability` is absent remains active. A concurrent policy revoke
@@ -69,6 +67,49 @@ carry the daemon/native generation observed with the lower snapshot. Userspace
 publishes a race-validated row before its daemon reply, while the matching
 POST_DAEMON hook only acknowledges that publication.
 
+The daemon/native I/O maps now contain two independently packed 64-bit states
+(`attr_state`, `xattr_state`), for a 16-byte map value. READ changes only the
+attribute domain, so atime coherence does not invalidate concurrent GETXATTR
+snapshots. Other existing mutations continue to guard both domains. Cached
+attribute and xattr rows still carry the two selected-domain tokens; their
+sizes remain 128 and 280 bytes. Mixed old/new daemon and BPF map layouts are
+rejected before INIT.
+
+Metadata-only (`hit`, C1/C2) mounts serialize generation changes and snapshot
+publication with inode-hashed, cache-line-separated locks, not the backing
+registry lock. Multi-inode mutations acquire distinct stripes in sorted order;
+entry-map invalidation still serializes with entry publication and takes the
+same inode stripe as READ/WRITE. AllOpt retains its backing/coherence locking.
+For overlapping metadata-only I/O, a successfully published active map token
+can cover the active cohort: exact counters/sequences remain in userspace, and
+every transition to/from quiescence in either domain is published. BPF still
+rejects active/stale tokens; READ does not advance the XATTR domain. This is a
+local coherence implementation optimization, not removal of the paper's
+metadata map or permission to serve stale metadata. Errors still disable the
+affected handlers safely or terminate the session if that fails.
+
+The io_uring worker placement also consults physical-core topology once at
+startup. Where the allowed CPUs on the queue's NUMA node admit a distinct-core
+rotation, it avoids pinning workers to the request CPUs' SMT siblings without
+mapping multiple queues onto one CPU. Single-CPU masks, unavailable topology,
+and masks without a suitable rotation retain the previous placement policy.
+This affects C2/C4 daemon transport, not the C3/C4 WBCache data-routing policy.
+WBCache-forwarded I/O does not traverse the daemon ring: enabling that ring
+alone does not guarantee C4 >= C3, or a strict ordering in all workloads.
+
+`python3 -B example/extfuse/test_cache_contract.py` checks state/placement
+models and source contracts (including 32/64/128 workers). The compiled
+`io_uring thread affinity` test checks the actual C placement helper; source
+checks alone do not establish runtime fallback counts or throughput.
+
+All C0-C4 negotiate `SYNCFS_SUPPORT`; metadata-hit C1-C4 additionally negotiate
+`EXTFUSE_SYNCFS_PURE` (C0 keeps ExtFUSE disabled). The daemon
+opens a normal lower-root directory fd (the existing O_PATH fd cannot service
+syncfs), performs the real lower syncfs, and returns its actual error. A pure
+drain does not invalidate attr/xattr tokens. INIT records `syncfs_support`,
+`syncfs_pure`, `paper_read_guard`, and `io_state_value_size`; an unsupported
+required capability fails INIT rather than reporting an incomplete drain.
+
 This no-op StackFS example deliberately makes those metadata results independent
 of the request credential. A filesystem with credential-dependent lookup,
 attribute, or xattr policy must validate that policy in its BPF handler, extend
@@ -91,7 +132,9 @@ policy for every page-backed request.  A PASSTHRU decision then uses the
 kernel's registered backing file and credential to execute lower VFS I/O;
 `FUSE_CAP_PASSTHROUGH` remains disabled for this mode.  Paper-like C3/C4
 negotiate WBCache passthrough and writeback cache without coherence epochs,
-mutation trailers, xattr notification, or private READ/WRITE hooks.  WRITE
+mutation trailers, or xattr notification. The separately negotiated
+`EXTFUSE_PAPER_READ_GUARD` brackets lower READ with attr-only private BEGIN/END
+notifications. WRITE
 marks an existing attribute row stale and invalidates capability state in the
 same ordinary BPF decision; a later real metadata miss is refreshed through
 the daemon.  The `gate` profile additionally negotiates coherence epochs and
@@ -124,6 +167,18 @@ before replying. No pthread mutex is held from submission to completion, and a
 submission or I/O failure is reported without a copied replay. READ never opts
 in to the write-only open flag.
 
+The paired kernel retains a home queue for each open-file stream. Buffered
+writeback can use one representative handle for all writers of an inode, so
+fixed WRITE may use an idle queue if the home queue has no available slot and
+the new offset is not contiguous with the preceding request. Contiguous writes,
+READ, copied I/O and already dispatched requests keep their existing placement.
+This is a local transport optimization, not a change to the paper's metadata
+maps. Teardown emits `FUSE_URING_QUEUE_STATS` for queues with fixed I/O using
+the existing counters after the worker is joined. These per-queue diagnostics
+are not additional requests and must not be added to the aggregate counters.
+The kernel change requires rebuilding and deploying the paired kernel;
+rebuilding this daemon alone only adds queue-level diagnostic logs.
+
 With `EXTFUSE_PAPER_WRITE_FAST=1`, the ordinary FUSE_WRITE BPF hook and daemon
 skip positive-capability lookup and negative-row refresh only while the verified
 global `security.capability=ENODATA` policy is active. Proactive capability
@@ -134,13 +189,32 @@ unstable, missing, or evicted cache state, so diagnostic runs must still verify
 that no daemon metadata callback occurred rather than inferring it from source
 validation.
 
-In the `paper-like` throughput profile C1/C2 do not install the READ cache
-handler.  C3/C4 use the ordinary READ handler to mark an existing atime row
-stale and return PASSTHRU even when no row exists, matching the archived
-ExtFUSE handler without making metadata residency a data-forwarding
-prerequisite.  No private BEGIN/END hook is executed.  WRITE applies its stale
-metadata side effects in the same way; the `gate` profile instead retains
-strict generation and epoch guards.
+All metadata-hit profiles retain the READ handler. C1/C2 daemon READ uses an
+attr-only mutation and the transport's prepare callback to close the mutation
+and publish a validated pinned-inode snapshot after lower data consumption but
+before the reply becomes visible. This includes short reads, EOF and error
+paths; cache errors never replace a completed lower result. C3/C4 READ keeps
+the ordinary BPF forwarding decision and its explicit lower-I/O guard. Before
+completion the kernel may refill only atime, with exact tokens and a current
+seed row, without overwriting writeback size/mtime. Concurrent mutation or
+dirty/writeback state leaves the cache invalid. The `gate` profile retains
+its full epoch guard. These correctness checks do not guarantee zero fallback
+under mutation, eviction or failure, nor a universal C0-C4 throughput ordering.
+
+The daemon captures a quiescent READ snapshot token under its existing END
+lock, avoiding a second acquisition of the connection-wide mutex. The lower
+`fstat` remains outside that lock, and both tokens are revalidated before
+publication. WRITE and namespace mutation callers keep their existing path.
+This removes redundant locking, not all cross-inode contention. An active or
+stale attribute still requires safe fallback; a zero-request acceptance gate
+must not be satisfied by returning an outdated attribute as a cache hit.
+
+The non-mount `test_reply_data_prepare` has separate copy and `--splice`
+variants. The latter explicitly negotiates `FUSE_CAP_SPLICE_WRITE` and
+requires a real `splice_send` callback, including its send-error path. It
+returns Meson's skip code 77 if splice or sufficient pipe capacity is absent;
+such a skip is not splice coverage. Source/model checks do not execute these
+C tests or verify the BPF program with the running kernel.
 
 Xattr payloads through 256 bytes are eligible for coherence epochs caching.
 Larger values, malformed state, persistent writable-mmap markers, and token

@@ -10,9 +10,9 @@ typedef struct lookup_attr_key {
 
 typedef struct lookup_attr_value {
 	__u32 stale;
-	/* Exact native-I/O state observed before the lower attr snapshot. */
+	/* Exact native attr_state observed before the lower attr snapshot. */
 	__u64 native_state;
-	/* Exact daemon-mutation state observed before the lower snapshot. */
+	/* Exact daemon attr_state observed before the lower snapshot. */
 	__u64 daemon_state;
 	/* node attr */
 	struct fuse_attr_out out;

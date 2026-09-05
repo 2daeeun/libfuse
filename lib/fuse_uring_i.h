@@ -30,6 +30,13 @@ void fuse_session_process_uring_cqe(struct fuse_session *se,
 #ifdef HAVE_URING
 
 struct fuse_in_header;
+struct fuse_ring_pool;
+struct fuse_ring_queue;
+struct fuse_ring_ent;
+
+int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
+			  struct fuse_ring_queue *queue,
+			  struct fuse_ring_ent *ring_ent);
 
 int fuse_uring_start(struct fuse_session *se);
 void fuse_uring_wake_ring_threads(struct fuse_session *se);
@@ -39,6 +46,10 @@ int send_reply_uring(fuse_req_t req, int error, const void *arg,
 
 int fuse_reply_data_uring(fuse_req_t req, struct fuse_bufvec *bufv,
 			  enum fuse_buf_copy_flags flags);
+int fuse_reply_data_uring_with_prepare(fuse_req_t req, struct fuse_bufvec *bufv,
+				      enum fuse_buf_copy_flags flags,
+				      fuse_reply_data_prepare_t prepare,
+				      void *opaque);
 int fuse_send_msg_uring(fuse_req_t req, struct iovec *iov, int count);
 
 #else // HAVE_URING
@@ -71,6 +82,20 @@ fuse_reply_data_uring(fuse_req_t req FUSE_VAR_UNUSED,
 		      struct fuse_bufvec *bufv FUSE_VAR_UNUSED,
 		      enum fuse_buf_copy_flags flags FUSE_VAR_UNUSED)
 {
+	return -ENOTSUP;
+}
+
+static inline int fuse_reply_data_uring_with_prepare(
+	fuse_req_t req FUSE_VAR_UNUSED, struct fuse_bufvec *bufv FUSE_VAR_UNUSED,
+	enum fuse_buf_copy_flags flags FUSE_VAR_UNUSED,
+	fuse_reply_data_prepare_t prepare, void *opaque)
+{
+	if (prepare) {
+		int saved_errno = errno;
+
+		prepare(opaque, -ENOTSUP);
+		errno = saved_errno;
+	}
 	return -ENOTSUP;
 }
 

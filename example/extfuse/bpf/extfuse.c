@@ -79,16 +79,16 @@ struct {
 	__uint(max_entries, EXTFUSE_METADATA_MAX_ENTRIES);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, __u64);
-	__type(value, __u64);
+	__type(value, struct extfuse_io_state);
 } daemon_io_map SEC(".maps");
 
-/* BEGIN/END sequence and active-I/O count, packed into one atomic u64. */
+/* Independently atomic attr and xattr BEGIN/END state. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, EXTFUSE_METADATA_MAX_ENTRIES);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, __u64);
-	__type(value, __u64);
+	__type(value, struct extfuse_io_state);
 } native_io_map SEC(".maps");
 
 /* Native mmap page faults may change lower metadata after FUSE RELEASE. */
@@ -267,47 +267,67 @@ static void revoke_paper_capability_policy(void)
 				       EXTFUSE_POLICY_PAPER_WRITE_FAST));
 }
 
-static int daemon_state_inactive(__u64 nodeid, __u64 *current_state)
+static int daemon_domain_inactive(__u64 nodeid, __u64 *current_state,
+				 int xattr)
 {
-	__u64 *state = bpf_map_lookup_elem(&daemon_io_map, &nodeid);
-	__u64 current = state ? *state : 0;
+	struct extfuse_io_state *state =
+		bpf_map_lookup_elem(&daemon_io_map, &nodeid);
+	__u64 current = state ?
+		(xattr ? state->xattr_state : state->attr_state) : 0;
 
 	if (current & EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
 		return 0;
 	*current_state = current;
 	return 1;
+}
+
+static int native_domain_inactive(__u64 nodeid, __u64 *current_state,
+				 int xattr)
+{
+	struct extfuse_io_state *state =
+		bpf_map_lookup_elem(&native_io_map, &nodeid);
+	__u64 current = state ?
+		(xattr ? state->xattr_state : state->attr_state) : 0;
+
+	if (current & EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
+		return 0;
+	*current_state = current;
+	return 1;
+}
+
+static int daemon_state_inactive(__u64 nodeid, __u64 *current_state)
+{
+	return daemon_domain_inactive(nodeid, current_state, 0);
 }
 
 static int native_state_inactive(__u64 nodeid, __u64 *current_state)
 {
-	__u64 *state = bpf_map_lookup_elem(&native_io_map, &nodeid);
-	__u64 current = state ? *state : 0;
-
-	if (current & EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
-		return 0;
-	*current_state = current;
-	return 1;
+	return native_domain_inactive(nodeid, current_state, 0);
 }
 
-static int daemon_cache_token_current(__u64 nodeid, __u64 cached_state)
+static int daemon_cache_token_current(__u64 nodeid, __u64 cached_state,
+				      int xattr)
 {
 	__u64 current;
 
-	return daemon_state_inactive(nodeid, &current) && current == cached_state;
+	return daemon_domain_inactive(nodeid, &current, xattr) &&
+	       current == cached_state;
 }
 
-static int native_cache_token_current(__u64 nodeid, __u64 cached_state)
+static int native_cache_token_current(__u64 nodeid, __u64 cached_state,
+				      int xattr)
 {
 	__u64 current;
 
-	return native_state_inactive(nodeid, &current) && current == cached_state;
+	return native_domain_inactive(nodeid, &current, xattr) &&
+	       current == cached_state;
 }
 
 static int cache_tokens_current(__u64 nodeid, __u64 daemon_state,
 				__u64 native_state)
 {
-	return daemon_cache_token_current(nodeid, daemon_state) &&
-	       native_cache_token_current(nodeid, native_state);
+	return daemon_cache_token_current(nodeid, daemon_state, 0) &&
+	       native_cache_token_current(nodeid, native_state, 0);
 }
 
 /*
@@ -449,9 +469,8 @@ HANDLER(FUSE_GETATTR, 3)(void *ctx)
 /*
  * Native and strict WBCache lower-I/O forwarding use this private policy hook.
  * The kernel epoch protects the lower operation while this explicit BEGIN/END
- * map transition preserves the tokens consumed by metadata handlers.  Paper
- * WBCache forwarding applies its small cache side effects in the ordinary
- * READ/WRITE hook and never enters here.
+ * map transition preserves the tokens consumed by metadata handlers. Paper
+ * READ uses the same attr-only map guard without the full kernel epochs.
  */
 static int mark_passthrough_attr_stale(void *ctx, __u32 mask)
 {
@@ -490,14 +509,17 @@ static int transition_native_state(__u64 *state, __u32 phase)
 	return 0;
 }
 
-static int update_native_state(__u64 nodeid, __u32 phase)
+static int update_native_state(__u64 nodeid, __u32 phase, int write)
 {
-	__u64 initial_state;
-	__u64 *state;
+	struct extfuse_io_state initial_state = {};
+	struct extfuse_io_state *state;
+	int ret;
 
 	state = bpf_map_lookup_elem(&native_io_map, &nodeid);
 	if (!state && phase == EXTFUSE_PASSTHROUGH_PHASE_BEGIN) {
-		initial_state = EXTFUSE_NATIVE_STATE_SEQUENCE_ONE | 1;
+		initial_state.attr_state = EXTFUSE_NATIVE_STATE_SEQUENCE_ONE | 1;
+		if (write)
+			initial_state.xattr_state = initial_state.attr_state;
 		if (!bpf_map_update_elem(&native_io_map, &nodeid,
 					 &initial_state, BPF_NOEXIST))
 			return 0;
@@ -505,12 +527,16 @@ static int update_native_state(__u64 nodeid, __u32 phase)
 	}
 	if (!state) {
 		/* Poison the key so every cached token misses after an invalid END. */
-		initial_state = EXTFUSE_NATIVE_STATE_SEQUENCE_ONE | 1;
+		initial_state.attr_state = EXTFUSE_NATIVE_STATE_SEQUENCE_ONE | 1;
+		initial_state.xattr_state = initial_state.attr_state;
 		bpf_map_update_elem(&native_io_map, &nodeid, &initial_state,
 				    BPF_NOEXIST);
 		return -ESTALE;
 	}
-	return transition_native_state(state, phase);
+	ret = transition_native_state(&state->attr_state, phase);
+	if (!ret && write)
+		ret = transition_native_state(&state->xattr_state, phase);
+	return ret;
 }
 
 static int invalidate_positive_capability(void *ctx)
@@ -533,8 +559,7 @@ static int invalidate_positive_capability(void *ctx)
 	return RETURN;
 }
 
-static int passthrough_notification(void *ctx, __u32 mask, int write,
-				    int relax_metadata)
+static int passthrough_notification(void *ctx, __u32 mask, int write)
 {
 	struct extfuse_passthrough_in in = {};
 	__u64 nodeid = 0;
@@ -548,54 +573,37 @@ static int passthrough_notification(void *ctx, __u32 mask, int write,
 	    (in.phase != EXTFUSE_PASSTHROUGH_PHASE_BEGIN &&
 	     in.phase != EXTFUSE_PASSTHROUGH_PHASE_END))
 		return -EINVAL;
-	if (relax_metadata) {
-		/*
-		 * Signal the kernel only at BEGIN that this READ deliberately excludes
-		 * atime from its coherence domain.  END remains an ordinary successful
-		 * notification; the request keeps the BEGIN-selected policy for its
-		 * complete lifetime.
-		 */
-		return in.phase == EXTFUSE_PASSTHROUGH_PHASE_BEGIN ?
-			PASSTHRU : RETURN;
-	}
 	if (bpf_extfuse_read_args(ctx, NODEID, &nodeid, sizeof(nodeid)) < 0)
 		return -EIO;
 
 	if (in.phase == EXTFUSE_PASSTHROUGH_PHASE_BEGIN) {
-		ret = update_native_state(nodeid, in.phase);
+		ret = update_native_state(nodeid, in.phase, write);
 		if (ret)
 			return ret;
 		if (mark_passthrough_attr_stale(ctx, mask) ||
 		    (write && invalidate_positive_capability(ctx))) {
 			/* BEGIN succeeded, so close it before requesting fallback. */
 			update_native_state(nodeid,
-					    EXTFUSE_PASSTHROUGH_PHASE_END);
+					    EXTFUSE_PASSTHROUGH_PHASE_END, write);
 			return -EIO;
 		}
 		return RETURN;
 	}
 
 	/* BEGIN applied all cache side effects; END only closes the active span. */
-	return update_native_state(nodeid, in.phase);
+	return update_native_state(nodeid, in.phase, write);
 }
 
 HANDLER(EXTFUSE_PASSTHROUGH_READ, 65)(void *ctx)
 {
-	/*
-	 * A native passthrough policy may deliberately exclude read-side atime
-	 * from its coherence domain.  Paper WBCache mode does not use this private
-	 * hook; it follows the archived handler's atime-stale rule in FUSE_READ.
-	 */
-	return passthrough_notification(
-		ctx, FATTR_ATIME, 0,
-		policy_enabled(EXTFUSE_POLICY_PAPER_READ_ATIME_CACHE));
+	return passthrough_notification(ctx, FATTR_ATIME, 0);
 }
 
 HANDLER(EXTFUSE_PASSTHROUGH_WRITE, 66)(void *ctx)
 {
 	return passthrough_notification(
 		ctx, FATTR_ATIME | FATTR_SIZE | FATTR_MTIME | FATTR_CTIME,
-		1, 0);
+		1);
 }
 
 HANDLER(EXTFUSE_PASSTHROUGH_MMAP, 67)(void *ctx)
@@ -693,6 +701,7 @@ HANDLER(EXTFUSE_PASSTHROUGH_ATTR_PREPARE,
 HANDLER(EXTFUSE_PASSTHROUGH_ATTR_COMMIT,
 	EXTFUSE_PASSTHROUGH_ATTR_COMMIT)(void *ctx)
 {
+	struct extfuse_req *args = ctx;
 	struct extfuse_passthrough_attr_cookie cookie = {};
 	struct fuse_attr fresh_attr = {};
 	lookup_attr_key_t key = {};
@@ -701,6 +710,7 @@ HANDLER(EXTFUSE_PASSTHROUGH_ATTR_COMMIT,
 	__u64 daemon_state;
 	__u64 native_state;
 	__u32 daemon_attr_flags;
+	__u32 mask = 0;
 
 	if (gen_attr_key(ctx, IN_PARAM_0_VALUE, "ATTR_COMMIT", &key) < 0)
 		return UPCALL;
@@ -709,6 +719,16 @@ HANDLER(EXTFUSE_PASSTHROUGH_ATTR_COMMIT,
 	    bpf_extfuse_read_args(ctx, IN_PARAM_1_VALUE, &fresh_attr,
 				  sizeof(fresh_attr)) < 0)
 		return UPCALL;
+	/* Optional READ refill must never replace cached writeback size/mtime. */
+	if (args->in.numargs == 3) {
+		if (args->in.args[2].size != sizeof(mask) ||
+		    bpf_extfuse_read_args(ctx, IN_PARAM_2_VALUE, &mask,
+					  sizeof(mask)) < 0 ||
+		    mask != FATTR_ATIME || fresh_attr.atimensec >= 1000000000U)
+			return UPCALL;
+	} else if (args->in.numargs != 2) {
+		return UPCALL;
+	}
 	if (has_passthrough_mmap_marker(key.nodeid))
 		return UPCALL;
 	attr = bpf_map_lookup_elem(&attr_map, &key);
@@ -732,12 +752,22 @@ HANDLER(EXTFUSE_PASSTHROUGH_ATTR_COMMIT,
 		return UPCALL;
 	}
 
-	replacement.stale = 0;
+	if (mask) {
+		/* Only the read-side atime invalidation may be repaired here. */
+		if (replacement.stale != FATTR_ATIME ||
+		    replacement.daemon_state != cookie.daemon_state)
+			return UPCALL;
+		replacement.stale &= ~FATTR_ATIME;
+		replacement.out.attr.atime = fresh_attr.atime;
+		replacement.out.attr.atimensec = fresh_attr.atimensec;
+	} else {
+		replacement.stale = 0;
+		replacement.out.attr = fresh_attr;
+		/* stat cannot reconstruct daemon-only FUSE_ATTR_* flags. */
+		replacement.out.attr.flags = daemon_attr_flags;
+	}
 	replacement.daemon_state = cookie.daemon_state;
 	replacement.native_state = cookie.native_state;
-	replacement.out.attr = fresh_attr;
-	/* stat cannot reconstruct daemon-only FUSE_ATTR_* protocol flags. */
-	replacement.out.attr.flags = daemon_attr_flags;
 	/*
 	 * A BEGIN or daemon mutation after the final checks advances its state map.
 	 * This replacement then carries an old token, so LOOKUP/GETATTR reject it;
@@ -760,12 +790,10 @@ HANDLER(FUSE_READ, 15)(void *ctx)
 		/*
 		 * Paper AllOpt makes its complete decision here: a valid registered
 		 * backing file is checked by the driver before lower I/O.  Match the
-		 * original ExtFUSE request-boundary decision.  Paper mode deliberately
-		 * retains cached atime, matching MDOpt; other profiles stale a resident
-		 * row.  Neither choice makes the row a forwarding prerequisite.
+		 * original ExtFUSE request-boundary decision. A resident attr row is
+		 * invalidated before lower I/O, but is not a forwarding prerequisite.
 		 */
 		if (!args->coherence.target_count &&
-		    !policy_enabled(EXTFUSE_POLICY_PAPER_READ_ATIME_CACHE) &&
 		    mark_passthrough_attr_stale(ctx, FATTR_ATIME))
 			return UPCALL;
 		return PASSTHRU;
@@ -908,10 +936,10 @@ HANDLER(FUSE_GETXATTR, 22)(void *ctx)
 	if (!value)
 		return UPCALL;
 	if (has_passthrough_mmap_marker(key.nodeid) ||
-	    !daemon_cache_token_current(key.nodeid, value->daemon_state))
+	    !daemon_cache_token_current(key.nodeid, value->daemon_state, 1))
 		return UPCALL;
 	if (!native_stable_negative_capability(&key, value) &&
-	    !native_cache_token_current(key.nodeid, value->native_state))
+	    !native_cache_token_current(key.nodeid, value->native_state, 1))
 		return UPCALL;
 	if (value->error == ENODATA) {
 		if (!value->size)

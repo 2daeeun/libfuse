@@ -44,8 +44,14 @@ with strict Boolean environment values (`0` or `1`):
 - `EXTFUSE_C2_FIXED_WRITE=1` is valid only for `hit`, `uring`, `paper-like` C2.
   It also requires `EXTFUSE_PAPER_WRITE_FAST=1`, the negotiated io_uring buffer
   pool, and a single-issuer queue, and marks opens for WRITE-only fixed I/O.
-  READ remains on the ordinary copied daemon path. A fixed-WRITE failure is
-  never replayed through a copied path.
+  This flag leaves READ on the ordinary copied daemon path. A fixed-WRITE
+  failure is never replayed through a copied path.
+- `EXTFUSE_FIXED_READ=1` is valid only for `hit`, `uring`, `paper-like` C2.
+  It requires the negotiated buffer pool and a single-issuer queue, independently
+  of the fixed-WRITE flag. Figure 6 enables it explicitly for new C2 RR/SR cells;
+  leaving it unset or `0` preserves the previous copied READ path. The generic
+  fixed-I/O open flag is set only for `O_RDONLY` handles, so writable handles
+  retain their existing WRITE policy.
 - `EXTFUSE_WBCACHE_WRITE_STREAM=1` is valid only for `allopt`, `paper-like`
   C3/C4. It negotiates bounded, per-open contiguous full-`max_write`
   `FUSE_WRITE_CACHE` runs. One contiguous partial write may terminate a run;
@@ -53,7 +59,9 @@ with strict Boolean environment values (`0` or `1`):
 
 Invalid values or mode/profile/transport combinations are rejected before the
 mount. `START` records the requested toggles; `INIT` separately records the
-capabilities that were actually negotiated.
+capabilities that were actually negotiated. Fixed READ records
+`fixed_read_requested` and `fixed_read_active`; actual use additionally requires
+buffer registration and the teardown READ submission/completion counters.
 
 With the paired protocol-7.48 kernel, the `gate` profile negotiates driver-owned
 ExtFUSE coherence epochs. Native passthrough and strict WBCache passthrough
@@ -166,6 +174,20 @@ recovery, and lets only a quiescent completion publish pinned-inode attributes
 before replying. No pthread mutex is held from submission to completion, and a
 submission or I/O failure is reported without a copied replay. READ never opts
 in to the write-only open flag.
+
+The independent `EXTFUSE_FIXED_READ=1` option submits the READ request's
+registered destination pages to the lower fd with the existing fixed-buffer
+API. READ still enters the daemon and retains its ExtFUSE BPF policy. A heap
+context owns the attr-only mutation until asynchronous completion; the existing
+prepare routine closes that mutation and attempts a validated pinned-inode
+attribute publication before any READ reply, including short reads, EOF and
+errors. No XATTR generation is advanced. Allocation or mutation-BEGIN failure
+replies with an error without submitting lower I/O; an invalid request shape or
+oversized result fails the session. The path does not replay failed I/O through
+the copied transport. `python3 -B example/extfuse/test_fixed_read.py` exercises
+the actual submission/completion code and open flags without mounting. These
+tests and compilation do not establish throughput improvement; runtime
+qualification of this option is pending.
 
 The paired kernel retains a home queue for each open-file stream. Buffered
 writeback can use one representative handle for all writers of an inode, so

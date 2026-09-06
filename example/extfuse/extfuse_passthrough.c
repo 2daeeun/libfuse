@@ -155,11 +155,14 @@ struct xattr_value {
 	"mountpoint=%s debug=%u callback_counting=%u "
 #define PERF_START_WBCACHE_FMT \
 	"wbcache_passthrough=%u native_passthrough=0 "
+#define PERF_START_FIXED_READ_FMT "EXTFUSE_FIXED_READ=%u "
 #define PERF_INIT_CACHE_FMT \
 	"reply_timeout=%.3f cache_mode=%d writeback_requested=%u "
 #define PERF_INIT_BACKING_FMT "max_backing_depth=%u single_issuer=%u "
 #define PERF_INIT_BUFPOOL_FMT \
 	"uring_bufpool_capable=%u uring_bufpool_requested=%u "
+#define PERF_INIT_FIXED_READ_FMT \
+	"fixed_read_requested=%u fixed_read_active=%u "
 #define PERF_INIT_ZERO_COPY_FMT \
 	"uring_fixed_write_required=%u prog_fd=%u rc=%d "
 #define PERF_INIT_STD_CAPS_FMT "capable_std=0x%08x want_std=0x%08x "
@@ -336,6 +339,7 @@ struct perf_state {
 	bool read_upcall_only;
 	bool paper_write_fast;
 	bool c2_fixed_write;
+	bool fixed_read;
 	bool wbcache_write_stream;
 	ebpf_context_t *bpf;
 	struct fuse_conn_info_opts *conn_opts;
@@ -943,9 +947,18 @@ static bool c2_fixed_write_enabled(void)
 	       perf_state.uring_bufpool_requested;
 }
 
-static void enable_c2_fixed_write_for_open(struct fuse_file_info *fi)
+static bool fixed_read_enabled(void)
 {
-	if (c2_fixed_write_enabled())
+	return perf_state.fixed_read && perf_state.uring_bufpool_requested &&
+	       perf_state.single_issuer;
+}
+
+static void enable_uring_fixed_io_for_open(struct fuse_file_info *fi)
+{
+	/* The generic flag covers both directions; use it only for read-only fds. */
+	if (fixed_read_enabled() && (fi->flags & O_ACCMODE) == O_RDONLY)
+		fi->io_uring_zero_copy = 1;
+	else if (c2_fixed_write_enabled())
 		fi->io_uring_zero_copy_write = 1;
 }
 
@@ -3310,7 +3323,8 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 	perf_state.wbcache_write_stream_capable =
 		(conn->capable_ext &
 		 FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM) != 0;
-	perf_state.uring_zero_copy_required = perf_state.c2_fixed_write;
+	perf_state.uring_zero_copy_required = perf_state.c2_fixed_write ||
+		perf_state.fixed_read;
 	if (wbcache_passthrough_enabled()) {
 		/* C3/C4 retain the upper FUSE cache; native passthrough stays off. */
 		lo->writeback = 1;
@@ -3333,7 +3347,7 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		    !perf_state.uring_bufpool_requested) {
 			if (!perf_state.init_rc)
 				perf_state.init_rc = -EOPNOTSUPP;
-			/* Never measure C2 fixed WRITE through a copied fallback. */
+			/* Never measure required fixed I/O through a copied fallback. */
 			conn->want_ext |= FUSE_CAP_IO_URING_BUFPOOL;
 		}
 	} else {
@@ -3502,6 +3516,7 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		"paper_read_atime_cache=%s "
 		"paper_capability_enodata=%s "
 		"paper_write_fast_enabled=%u "
+		PERF_INIT_FIXED_READ_FMT
 		"wbcache_policy_enabled=%u "
 		"readdirplus_policy=stackfs-compatible-disabled "
 		"readdirplus_requested=%u readdirplus_auto_requested=%u "
@@ -3549,6 +3564,8 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 			"enabled" : "disabled",
 		(perf_state.bpf_policy_flags &
 		 EXTFUSE_POLICY_PAPER_WRITE_FAST) != 0,
+		perf_state.fixed_read,
+		fixed_read_enabled() && !perf_state.init_rc,
 		(perf_state.bpf_policy_flags &
 		 EXTFUSE_POLICY_WBCACHE_PASSTHROUGH) != 0,
 		(conn->want_ext & FUSE_CAP_READDIRPLUS) != 0,
@@ -3559,7 +3576,7 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		perf_state.single_issuer,
 		perf_state.uring_bufpool_capable,
 		perf_state.uring_bufpool_requested,
-		perf_state.uring_zero_copy_required,
+		perf_state.c2_fixed_write,
 		conn->extfuse_prog_fd, perf_state.init_rc,
 		conn->capable, conn->want, conn->capable_ext,
 		conn->want_ext, conn->max_write);
@@ -4023,7 +4040,7 @@ static void perf_tmpfile(fuse_req_t req, fuse_ino_t parent, mode_t mode,
 	else if (lo->cache == CACHE_ALWAYS)
 		fi->keep_cache = 1;
 	fi->parallel_direct_writes = 1;
-	enable_c2_fixed_write_for_open(fi);
+	enable_uring_fixed_io_for_open(fi);
 	if (wbcache_passthrough_enabled())
 		attach_wbcache_passthrough(req, entry.ino, fd, fi, candidate,
 					   tombstone_candidate);
@@ -4122,7 +4139,7 @@ void perf_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 	else if (lo->cache == CACHE_ALWAYS)
 		fi->keep_cache = 1;
 	fi->parallel_direct_writes = 1;
-	enable_c2_fixed_write_for_open(fi);
+	enable_uring_fixed_io_for_open(fi);
 
 	error = lo_do_lookup(req, parent, name, &entry);
 	if (error) {
@@ -4463,7 +4480,7 @@ void perf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 		pthread_mutex_unlock(xattr_lock);
 	}
 
-	enable_c2_fixed_write_for_open(fi);
+	enable_uring_fixed_io_for_open(fi);
 	if (wbcache_passthrough_enabled())
 		attach_wbcache_passthrough(req, ino, (int)fi->fh, fi, candidate,
 					   tombstone_candidate);
@@ -4837,6 +4854,7 @@ struct perf_read_context {
 	struct lo_inode *inode;
 	fuse_ino_t ino;
 	struct perf_cache_mutation mutation;
+	size_t requested;
 };
 
 static void perf_read_prepare(void *opaque, ssize_t read_result)
@@ -4859,6 +4877,74 @@ static void perf_read_prepare(void *opaque, ssize_t read_result)
 	errno = saved_errno;
 }
 
+static void perf_read_contract_failed(const char *operation, int result)
+{
+	int error = result < 0 ? -result : result;
+
+	fprintf(stderr,
+		"FUSE_READ_CONTRACT_ERROR path=uring-fixed operation=%s error=%d reason=%s\n",
+		operation, error, strerror(error));
+	if (perf_state.session)
+		fuse_session_exit(perf_state.session);
+}
+
+static void perf_uring_read_complete(fuse_req_t req, ssize_t result,
+				     void *userdata)
+{
+	struct perf_read_context *context = userdata;
+	bool oversized = result >= 0 && (size_t)result > context->requested;
+	int reply_result;
+
+	/* Close the atime mutation and publish before exposing the READ payload. */
+	perf_read_prepare(context, result);
+	if (result < 0)
+		reply_result = fuse_reply_err(req, (int)-result);
+	else if (oversized)
+		reply_result = fuse_reply_err(req, EIO);
+	else
+		reply_result = fuse_reply_uring_zero_copy(req, (size_t)result);
+	free(context);
+	if (oversized)
+		perf_read_contract_failed("read-oversize", EIO);
+	if (reply_result)
+		perf_read_contract_failed("read-reply", reply_result);
+}
+
+static void perf_read_fixed(fuse_req_t req, fuse_ino_t ino, size_t size,
+			    off_t offset, struct fuse_file_info *fi)
+{
+	struct perf_read_context *context;
+	int result;
+
+	if (!fuse_req_is_uring_zero_copy(req)) {
+		fuse_reply_err(req, EOPNOTSUPP);
+		perf_read_contract_failed("read-request", EOPNOTSUPP);
+		return;
+	}
+	context = calloc(1, sizeof(*context));
+	if (!context) {
+		fuse_reply_err(req, ENOMEM);
+		return;
+	}
+	context->ino = ino;
+	context->lo = lo_data(req);
+	context->inode = lo_inode(req, ino);
+	context->requested = size;
+	context->mutation.attr_only = true;
+	cache_mutation_add(&context->mutation, ino);
+	if (!cache_mutation_begin(&context->mutation)) {
+		cache_mutation_end(&context->mutation);
+		free(context);
+		fuse_reply_err(req, EIO);
+		return;
+	}
+	result = fuse_uring_submit_fixed_io(req, (int)fi->fh, offset, size,
+					    false, perf_uring_read_complete,
+					    context);
+	if (result)
+		perf_uring_read_complete(req, result, context);
+}
+
 __attribute__((noinline, used))
 void perf_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	       off_t offset, struct fuse_file_info *fi)
@@ -4875,6 +4961,10 @@ void perf_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	callback_increment(&perf_state.counters.read);
 	if (!metadata_hits_enabled()) {
 		lo_read(req, ino, size, offset, fi);
+		return;
+	}
+	if (fixed_read_enabled() && (fi->flags & O_ACCMODE) == O_RDONLY) {
+		perf_read_fixed(req, ino, size, offset, fi);
 		return;
 	}
 	/*
@@ -5849,6 +5939,12 @@ static int validate_experiment_toggles(void)
 			"EXTFUSE_C2_FIXED_WRITE requires hit mode, uring transport, paper-like profile, and EXTFUSE_PAPER_WRITE_FAST=1\n");
 		return -1;
 	}
+	if (perf_state.fixed_read &&
+	    (!c1_or_c2 || strcmp(perf_state.transport, "uring"))) {
+		fprintf(stderr,
+			"EXTFUSE_FIXED_READ requires hit mode, uring transport, and paper-like profile\n");
+		return -1;
+	}
 	if (perf_state.wbcache_write_stream && !c3_or_c4) {
 		fprintf(stderr,
 			"EXTFUSE_WBCACHE_WRITE_STREAM requires allopt mode and paper-like profile\n");
@@ -5930,6 +6026,8 @@ int main(int argc, char **argv)
 				      &perf_state.paper_write_fast) ||
 	    parse_boolean_environment("EXTFUSE_C2_FIXED_WRITE",
 				      &perf_state.c2_fixed_write) ||
+	    parse_boolean_environment("EXTFUSE_FIXED_READ",
+				      &perf_state.fixed_read) ||
 	    parse_boolean_environment("EXTFUSE_WBCACHE_WRITE_STREAM",
 				      &perf_state.wbcache_write_stream)) {
 		fprintf(stderr,
@@ -6099,13 +6197,15 @@ int main(int argc, char **argv)
 		PERF_START_WBCACHE_FMT
 		"EXTFUSE_READ_UPCALL_ONLY=%u EXTFUSE_PAPER_WRITE_FAST=%u "
 		"EXTFUSE_C2_FIXED_WRITE=%u EXTFUSE_WBCACHE_WRITE_STREAM=%u "
+		PERF_START_FIXED_READ_FMT
 		"xattr_lock_buckets=%u passthrough_extra_args=%zu "
 		"mount_options=%s\n",
 		perf_state.mode_name, perf_state.transport, argv[3],
 		source, mountpoint, debug_enabled, perf_state.count_callbacks,
 		wbcache_passthrough_enabled(), perf_state.read_upcall_only,
 		perf_state.paper_write_fast, perf_state.c2_fixed_write,
-		perf_state.wbcache_write_stream, PERF_XATTR_LOCK_BUCKETS,
+		perf_state.wbcache_write_stream, perf_state.fixed_read,
+		PERF_XATTR_LOCK_BUCKETS,
 		extra_argc, options);
 	for (i = 0; i < extra_argc; i++)
 		fprintf(stderr, "PASSTHROUGH_ARG index=%zu value=%s\n", i,

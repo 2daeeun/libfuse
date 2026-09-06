@@ -147,7 +147,7 @@ class CacheContractTests(unittest.TestCase):
                          r"FUSE_BUF_SPLICE_MOVE,\s*perf_read_prepare, &context\);"
                          r"\s*\}")
         prepare = DAEMON.split("static void perf_read_prepare(", 1)[1]
-        prepare = prepare.split("__attribute__((noinline, used))", 1)[0]
+        prepare = prepare.split("\n}\n", 1)[0]
         self.assertIn("cache_mutation_end_with_snapshot(&context->mutation, &snapshot)",
                       prepare)
         self.assertNotIn("cache_snapshot_begin(", prepare)
@@ -157,6 +157,11 @@ class CacheContractTests(unittest.TestCase):
                         prepare.index("cache_attr("))
         self.assertNotIn("fuse_reply_", prepare)
         self.assertIn("errno = saved_errno;", prepare)
+        complete = DAEMON.split("static void perf_uring_read_complete(", 1)[1]
+        complete = complete.split("\n}\n", 1)[0]
+        for reply in ("fuse_reply_err(", "fuse_reply_uring_zero_copy("):
+            self.assertLess(complete.index("perf_read_prepare(context, result);"),
+                            complete.index(reply))
 
     def test_read_snapshot_reuses_end_lock_and_revalidates(self):
         end = DAEMON.split("static bool cache_mutation_end_with_snapshot(", 1)[1]

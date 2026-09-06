@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import subprocess
+import sys
 from os.path import join as pjoin
 from pathlib import Path
 
@@ -9,6 +10,20 @@ from util import basename
 
 def test_extfuse_init():
     subprocess.check_call([pjoin(basename, 'test', 'test_extfuse_init')])
+
+
+def test_extfuse_stale_mark():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'example/extfuse/test_stale_mark.py'),
+    ])
+
+
+def test_extfuse_fixed_read():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'example/extfuse/test_fixed_read.py'),
+    ])
 
 
 def _source_region(path, start, end):
@@ -33,7 +48,7 @@ def test_extfuse_paper_c2_write_contract():
         'static void perf_write_uring_zero_copy')
     submission = _source_region(
         daemon, 'static void perf_write_uring_zero_copy',
-        '__attribute__((noinline, used))\nvoid perf_read')
+        'struct perf_read_context {')
     write_callback = _source_region(
         daemon, '__attribute__((noinline, used))\nvoid perf_write_buf(fuse_req_t req',
         'static void perf_flush')
@@ -51,9 +66,13 @@ def test_extfuse_paper_c2_write_contract():
         daemon, 'static void revoke_paper_capability_enodata',
         'static int force_all_upcalls')
 
-    assert 'perf_read_uring_zero_copy' not in daemon_source
     assert 'fi->io_uring_zero_copy_write = 1;' in daemon_source
-    assert 'fi->io_uring_zero_copy = 1;' not in daemon_source
+    open_flags = _source_region(
+        daemon, 'static void enable_uring_fixed_io_for_open',
+        'static bool paper_capability_is_safe')
+    assert 'fixed_read_enabled() && (fi->flags & O_ACCMODE) == O_RDONLY' in open_flags
+    assert 'fi->io_uring_zero_copy = 1;' in open_flags
+    assert 'else if (c2_fixed_write_enabled())' in open_flags
     assert 'FOPEN_IO_URING_ZERO_COPY_WRITE' in fill_open
     assert 'fuse_uring_submit_fixed_io' in submission
     assert 'lo_do_write_buf' not in submission
@@ -89,7 +108,7 @@ def test_extfuse_paper_c2_write_contract():
 
     # Keep the legacy aggregate while exposing directional fallbacks.  WRITE
     # must be zero for the fixed-WRITE qualification; copied READs remain
-    # expected because C2 deliberately leaves the READ transport unchanged.
+    # expected when the separate fixed-READ option is disabled.
     assert 'queue->copied_fallbacks++;' in uring_source
     assert 'queue->copied_read_fallbacks++;' in uring_source
     assert 'queue->copied_write_fallbacks++;' in uring_source
@@ -119,6 +138,7 @@ def test_extfuse_paper_c2_write_contract():
             'EXTFUSE_READ_UPCALL_ONLY',
             'EXTFUSE_PAPER_WRITE_FAST',
             'EXTFUSE_C2_FIXED_WRITE',
+            'EXTFUSE_FIXED_READ',
             'EXTFUSE_WBCACHE_WRITE_STREAM'):
         assert f'parse_boolean_environment("{name}"' in daemon_source
         assert f'{name}=%u' in daemon_source
@@ -128,6 +148,8 @@ def test_extfuse_paper_c2_write_contract():
             'read_upcall_only_requested',
             'paper_write_fast_enabled',
             'uring_fixed_write_required',
+            'fixed_read_requested',
+            'fixed_read_active',
             'wbcache_write_stream_requested'):
         assert daemon_source.count(f'{key}=%u') == 1
 

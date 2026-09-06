@@ -480,7 +480,13 @@ static int mark_passthrough_attr_stale(void *ctx, __u32 mask)
 	if (gen_attr_key(ctx, IN_PARAM_0_VALUE, "PASSTHROUGH", &key) < 0)
 		return -EIO;
 	attr = bpf_map_lookup_elem(&attr_map, &key);
-	if (attr)
+	/*
+	 * Bits only accumulate within this HASH element; a refresh replaces the
+	 * complete element. Avoid writing its shared cache line again when the
+	 * requested bits are already set. Keep the atomic OR for missing bits so
+	 * concurrent invalidations preserve one another's additions.
+	 */
+	if (attr && (attr->stale & mask) != mask)
 		__sync_fetch_and_or(&attr->stale, mask);
 	return RETURN;
 }

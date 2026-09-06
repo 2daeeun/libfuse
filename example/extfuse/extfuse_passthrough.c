@@ -5213,6 +5213,8 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 	bool have_attr = false;
 	bool publish_attr;
 	bool quiescent;
+	bool strict_writeback;
+	size_t requested;
 	int reply_result;
 	uint64_t negative_capability_daemon_state;
 	ssize_t result;
@@ -5234,6 +5236,7 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 	inode = lo_inode(req, ino);
 	inode_fd = inode->fd;
 	capability_fast = paper_write_fast_active();
+	strict_writeback = capability_fast && fi->writepage;
 	if (!capability_fast) {
 		xattr_lock = xattr_lock_for_inode(ino);
 		pthread_mutex_lock(xattr_lock);
@@ -5256,6 +5259,7 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 			invalidate_xattr_serialized(
 				ino, PERF_CAPABILITY_XATTR, true);
 	}
+	requested = fuse_buf_size(buffer);
 	result = lo_do_write_buf(req, ino, buffer, offset, fi);
 	quiescent = cache_mutation_end(&mutation);
 	if (!capability_fast && result >= 0 && carry_negative_capability)
@@ -5286,7 +5290,13 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 					    attr_outcome == PERF_CACHE_ATTR_PUBLISHED;
 			}
 		}
-		if (have_attr && mutation_metadata_enabled()) {
+		/* Async writeback cannot replay an unwritten tail after this reply. */
+		if (strict_writeback && (size_t)result != requested) {
+			reply_result = fuse_reply_err(req, EIO);
+			perf_write_contract_failed(
+				"sync", (size_t)result > requested ?
+				"write-oversize" : "write-short", EIO);
+		} else if (have_attr && mutation_metadata_enabled()) {
 			mutation_attr = (struct fuse_mutation_attr) {
 				.ino = ino,
 				.attr = &st,
@@ -5309,6 +5319,8 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 				"sync", "write-reply", reply_result);
 	} else {
 		fuse_reply_err(req, (int)-result);
+		if (strict_writeback)
+			perf_write_contract_failed("sync", "write-io", (int)result);
 	}
 }
 

@@ -40,6 +40,13 @@ def test_uring_taskrun():
     ])
 
 
+def test_uring_cq_priority():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'test/test_uring_cq_priority.py'),
+    ])
+
+
 def test_extfuse_fixed_read():
     root = Path(__file__).resolve().parents[1]
     subprocess.check_call([
@@ -51,6 +58,13 @@ def test_extfuse_write_completion():
     root = Path(__file__).resolve().parents[1]
     subprocess.check_call([
         sys.executable, str(root / 'example/extfuse/test_write_completion.py'),
+    ])
+
+
+def test_extfuse_sync_write_completion():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'example/extfuse/test_sync_write_completion.py'),
     ])
 
 

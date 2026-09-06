@@ -157,7 +157,12 @@ kernel's registered backing file and credential to execute lower VFS I/O;
 negotiate WBCache passthrough and writeback cache without coherence epochs,
 mutation trailers, or xattr notification. The separately negotiated
 `EXTFUSE_PAPER_READ_GUARD` brackets lower READ with attr-only private BEGIN/END
-notifications. WRITE marks an existing attribute row stale in the same
+notifications. Overlapping paper READs share one inode-lifetime guard; the last
+reader performs END and the existing checked atime refresh before replying.
+BEGIN/END boundaries use independent guards instead of waiting. Physical BPF
+ENDs and non-last shared completions are counted separately, and their sum must
+match canonical forwarded READ completions. Native/strict paths are unchanged.
+WRITE marks an existing attribute row stale in the same
 ordinary BPF decision. Paper WBCache never serves a positive
 `security.capability` row from BPF: lower WRITE can remove that xattr after a
 concurrent daemon cache publication. Such values use a real daemon lookup,
@@ -276,3 +281,17 @@ A marked inode also receives zero attribute TTL in daemon and mutation-trailer
 replies so later page-fault metadata cannot hide behind the upper VFS cache.
 Kernels without coherence epochs retain the existing V1/V2 maps and manual
 generation protocol.
+
+
+Paper-fast classic writeback requires a full lower WRITE completion, matching
+fixed-I/O and WBCache forwarding checks. The request's writepage flag selects
+this contract; ordinary synchronous short writes retain their byte-count reply.
+A short/zero/oversized writeback reply fails with EIO after coherence cleanup,
+and the run reports a WRITE contract error rather than accepting incomplete data.
+
+Fixed-I/O queues process a bounded snapshot of already-ready lower completions
+before new request callbacks. This closes completed mutations before a GETATTR
+in the same batch observes them. CQE kinds are snapshotted before callbacks can
+reuse entries; new arrivals remain for the next batch. The copied transport
+keeps its original order. This removes a scheduling window, not all causes of
+metadata cache fallback or the lower buffered WRITE's io-wq cost.

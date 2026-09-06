@@ -1252,69 +1252,115 @@ static int fuse_uring_handle_fixed_io_cqe(struct fuse_ring_queue *queue,
 	return 0;
 }
 
+static bool fuse_uring_cqe_is_fixed_io(struct fuse_ring_queue *queue,
+				      struct io_uring_cqe *cqe)
+{
+	struct fuse_ring_ent *ent = io_uring_cqe_get_data(cqe);
+
+	if ((uintptr_t)ent == (unsigned int)queue->eventfd)
+		return false;
+	return ent && ent->cqe_kind == FUSE_URING_CQE_FIXED_IO;
+}
+
+static int fuse_uring_dispatch_cqe(struct fuse_ring_queue *queue,
+				  struct io_uring_cqe *cqe, bool fixed_io,
+				  bool *stop)
+{
+	struct fuse_session *se = queue->ring_pool->se;
+	struct fuse_ring_ent *ent = io_uring_cqe_get_data(cqe);
+	int err = cqe->res;
+
+	if ((uintptr_t)ent == (unsigned int)queue->eventfd) {
+		if (err > 0) {
+			*stop = true;
+			return -ENOTCONN;
+		}
+		return err < 0 && err != -ECANCELED ? err : 0;
+	}
+	if (fixed_io)
+		return fuse_uring_handle_fixed_io_cqe(queue, ent, err);
+	if (unlikely(err != 0)) {
+		switch (err) {
+		case -EAGAIN:
+			fallthrough;
+		case -EINTR:
+			fuse_uring_resubmit(queue, ent);
+			return 0;
+		default:
+			break;
+		}
+		/* -ENOTCONN is ok on umount */
+		if (err != -ENOTCONN) {
+			se->error = err;
+			return err;
+		}
+		return 0;
+	}
+	return fuse_uring_handle_cqe(queue, cqe);
+}
+
+#define FUSE_URING_CQE_BATCH_MAX 32
+
 static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue)
 {
-	struct fuse_ring_pool *ring_pool = queue->ring_pool;
-	struct fuse_session *se = ring_pool->se;
+	struct {
+		struct io_uring_cqe *cqe;
+		bool fixed_io;
+	} ready[FUSE_URING_CQE_BATCH_MAX];
 	size_t num_completed = 0;
 	struct io_uring_cqe *cqe;
 	unsigned int head;
-	struct fuse_ring_ent *ent;
+	bool stop = false;
 	int ret = 0;
 
-	io_uring_for_each_cqe(&queue->ring, head, cqe) {
-		int err = 0;
-		void *cqe_data = io_uring_cqe_get_data(cqe);
+	if (!queue->ring_pool->zero_copy) {
+		/* Preserve the original order for copied/multi-issuer transport. */
+		io_uring_for_each_cqe(&queue->ring, head, cqe) {
+			int err = fuse_uring_dispatch_cqe(
+				queue, cqe, fuse_uring_cqe_is_fixed_io(queue, cqe),
+				&stop);
 
-		num_completed++;
-
-		err = cqe->res;
-		if ((uintptr_t)cqe_data == (unsigned int)queue->eventfd) {
-			if (err > 0)
-				return -ENOTCONN;
-			if (err < 0 && err != -ECANCELED)
-				ret = err;
-			continue;
-		}
-
-		ent = cqe_data;
-		if (ent && ent->cqe_kind == FUSE_URING_CQE_FIXED_IO) {
-			err = fuse_uring_handle_fixed_io_cqe(queue, ent, err);
+			if (stop)
+				return err;
+			num_completed++;
 			if (err && !ret)
 				ret = err;
-			continue;
 		}
-		if (unlikely(err != 0)) {
-			switch (err) {
-			case -EAGAIN:
-				fallthrough;
-			case -EINTR:
-				ent = cqe_data;
-				fuse_uring_resubmit(queue, ent);
+		goto advance;
+	}
+
+	/*
+	 * A completed lower WRITE can still own a daemon mutation until its
+	 * callback runs. Finish already-ready fixed I/O before admitting new
+	 * request callbacks, so GETATTR need not observe that obsolete ACTIVE
+	 * state. Snapshot kinds too: a completion callback changes its entry
+	 * back to COMMAND and may enqueue the next COMMIT_AND_FETCH.
+	 * CQ storage stays owned until both passes finish; arrivals during the
+	 * callbacks belong to the next batch. No wait or allocation is added.
+	 */
+	io_uring_for_each_cqe(&queue->ring, head, cqe) {
+		ready[num_completed].cqe = cqe;
+		ready[num_completed].fixed_io = fuse_uring_cqe_is_fixed_io(queue, cqe);
+		if (++num_completed == FUSE_URING_CQE_BATCH_MAX)
+			break;
+	}
+	for (unsigned int pass = 0; pass < 2; pass++) {
+		for (size_t index = 0; index < num_completed; index++) {
+			int err;
+
+			if (ready[index].fixed_io != (pass == 0))
 				continue;
-			default:
-				break;
-			}
-
-			/* -ENOTCONN is ok on umount  */
-			if (err != -ENOTCONN) {
-				se->error = cqe->res;
-
-				/* return first error */
-				if (ret == 0)
-					ret = err;
-			}
-
-		} else {
-			err = fuse_uring_handle_cqe(queue, cqe);
+			err = fuse_uring_dispatch_cqe(
+				queue, ready[index].cqe, ready[index].fixed_io, &stop);
+			if (stop)
+				return err;
 			if (err && !ret)
 				ret = err;
 		}
 	}
-
+advance:
 	if (num_completed)
 		io_uring_cq_advance(&queue->ring, num_completed);
-
 	return ret;
 }
 

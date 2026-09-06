@@ -689,7 +689,9 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_EXTFUSE_SYNCFS_PURE (1ULL << 47)
 
 /**
- * Guard forwarded buffered reads and refresh their attributes before reply.
+ * Guard forwarded buffered reads. Overlapping reads may share a guard; its
+ * last reader refreshes atime before reply. Earlier readers keep the shared
+ * guard active so stale attributes cannot become cache hits.
  * Requires ExtFUSE, writeback-cache passthrough and attribute refresh, and
  * excludes native passthrough. This does not bypass the ExtFUSE BPF policy.
  */

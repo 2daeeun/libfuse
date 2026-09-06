@@ -666,8 +666,9 @@ struct fuse_loop_config_v1 {
 
 /**
  * Indicates that ExtFUSE writeback-cache forwarding can execute each per-open
- * FUSE_WRITE_CACHE batch in admission order, including small random writes.
- * Each request retains its own lower I/O and completion. This requires
+ * contiguous FUSE_WRITE_CACHE batch in admission order, including small writes.
+ * Discontinuous writes retain independent worker dispatch. Each request
+ * retains its own lower I/O and completion. This requires
  * ExtFUSE, writeback cache, and ExtFUSE writeback-cache passthrough, and
  * excludes coherence epochs.
  */

@@ -1601,8 +1601,9 @@ out:
 	return counter_value(&perf_state.counters.cache_bypass_errors) == 0;
 }
 
-static bool cache_mutation_end_with_snapshot(
-	struct perf_cache_mutation *mutation, struct perf_cache_snapshot *snapshot)
+static bool cache_mutation_end_capture(
+	struct perf_cache_mutation *mutation, struct perf_cache_snapshot *snapshot,
+	bool *snapshot_valid)
 {
 	struct perf_inode_generation *state;
 	struct perf_cache_lockset locks;
@@ -1611,6 +1612,8 @@ static bool cache_mutation_end_with_snapshot(
 	bool xattr_quiescent = true;
 	size_t index;
 
+	/* Snapshot errors must not hide a quiescent WRITE publication failure. */
+	*snapshot_valid = false;
 	mutation->xattr_quiescent = false;
 	if (!mutation->armed)
 		return false;
@@ -1658,16 +1661,18 @@ static bool cache_mutation_end_with_snapshot(
 	mutation->xattr_quiescent = xattr_quiescent && !invalid_state &&
 				     !perf_state.xattr_cache_bypass;
 	/*
-	 * READ completion already owns the generation lock. Capture its quiescent
+	 * Completion already owns the generation lock. Capture its quiescent
 	 * identity here instead of unlocking and immediately contending for the
 	 * same inode lock again. The lower fstat remains outside this
 	 * lock, and cache_attr() still revalidates both tokens before publication.
-	 * Do not change WRITE/namespace callers or their xattr quiescence result.
+	 * Preserve mutation and xattr quiescence independently of snapshot validity.
 	 */
 	if (snapshot && quiescent && !invalid_state) {
+		bool valid = true;
+
 		memset(snapshot, 0, sizeof(*snapshot));
-		if (!mutation->attr_only || mutation->count != 1) {
-			quiescent = false;
+		if (mutation->count != 1) {
+			valid = false;
 		} else {
 			state = find_inode_generation_locked(mutation->inodes[0]);
 			if (!inode_generation_value_locked(
@@ -1675,19 +1680,31 @@ static bool cache_mutation_end_with_snapshot(
 				counter_increment(
 					&perf_state.counters.passthrough_state_errors);
 				disable_all_caches_locked("daemon-state-snapshot");
-				quiescent = false;
+				valid = false;
 			}
 			if (!native_state_snapshot_locked(
 				    mutation->inodes[0], &snapshot->native_state,
 				    "native-state-snapshot", false))
-				quiescent = false;
-			if ((snapshot->daemon_state | snapshot->native_state) &
-			    EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
-				quiescent = false;
+				valid = false;
 		}
+		*snapshot_valid = valid;
 	}
 	cache_mutation_unlock(&locks);
 	return quiescent && !invalid_state;
+}
+
+static bool cache_mutation_end_with_snapshot(
+	struct perf_cache_mutation *mutation, struct perf_cache_snapshot *snapshot)
+{
+	bool snapshot_valid;
+	bool quiescent;
+
+	quiescent = cache_mutation_end_capture(
+		mutation, mutation->attr_only ? snapshot : NULL, &snapshot_valid);
+	return quiescent && (!snapshot ||
+		(snapshot_valid && !((snapshot->daemon_state |
+				     snapshot->native_state) &
+				    EXTFUSE_NATIVE_STATE_ACTIVE_MASK)));
 }
 
 static bool cache_mutation_end(struct perf_cache_mutation *mutation)
@@ -4711,18 +4728,17 @@ static void refill_capability_after_write(fuse_req_t req, fuse_ino_t ino)
 
 static enum perf_cache_attr_outcome publish_pinned_write_attr(
 	fuse_ino_t ino, int inode_fd, dev_t dev, ino_t lower_ino,
-	struct lo_data *lo, struct stat *st, double *reply_timeout)
+	struct lo_data *lo, struct stat *st, double *reply_timeout,
+	const struct perf_cache_snapshot *snapshot, bool snapshot_valid)
 {
-	struct perf_cache_snapshot snapshot;
-
-	if (!cache_snapshot_begin(ino, &snapshot))
+	if (!snapshot_valid)
 		return PERF_CACHE_ATTR_ERROR;
-	if ((snapshot.daemon_state | snapshot.native_state) &
+	if ((snapshot->daemon_state | snapshot->native_state) &
 	    EXTFUSE_NATIVE_STATE_ACTIVE_MASK)
 		return PERF_CACHE_ATTR_UNSTABLE;
 	if (extfuse_snapshot_pinned_inode(inode_fd, dev, lower_ino, st))
 		return PERF_CACHE_ATTR_ERROR;
-	return cache_attr(ino, st, lo->timeout, &snapshot, false,
+	return cache_attr(ino, st, lo->timeout, snapshot, false,
 			  reply_timeout);
 }
 
@@ -4730,14 +4746,17 @@ static void perf_uring_write_complete(fuse_req_t req, ssize_t result,
 				      void *userdata)
 {
 	struct perf_uring_write_context *context = userdata;
+	struct perf_cache_snapshot snapshot;
 	struct stat st;
 	double ignored_reply_timeout;
 	enum perf_cache_attr_outcome attr_outcome = PERF_CACHE_ATTR_MISSING;
 	bool attr_published = false;
 	bool quiescent;
+	bool snapshot_valid;
 	int reply_result;
 
-	quiescent = cache_mutation_end(&context->mutation);
+	quiescent = cache_mutation_end_capture(&context->mutation, &snapshot,
+					      &snapshot_valid);
 	if (context->mutation.xattr_quiescent &&
 	    (!context->capability_fast || !paper_capability_is_safe()))
 		refill_capability_after_write(req, context->ino);
@@ -4745,7 +4764,7 @@ static void perf_uring_write_complete(fuse_req_t req, ssize_t result,
 		attr_outcome = publish_pinned_write_attr(
 			context->ino, context->inode_fd, context->dev,
 			context->lower_ino, context->lo, &st,
-			&ignored_reply_timeout);
+			&ignored_reply_timeout, &snapshot, snapshot_valid);
 		attr_published = attr_outcome == PERF_CACHE_ATTR_PUBLISHED;
 	}
 
@@ -4780,10 +4799,12 @@ static void perf_write_uring_zero_copy(fuse_req_t req, fuse_ino_t ino,
 				       struct fuse_file_info *fi)
 {
 	struct perf_uring_write_context *context;
+	struct perf_cache_snapshot snapshot;
 	struct lo_inode *inode;
 	enum perf_cache_attr_outcome attr_outcome = PERF_CACHE_ATTR_MISSING;
 	bool attr_published = false;
 	bool quiescent;
+	bool snapshot_valid;
 	int reply_result;
 	int result;
 
@@ -4823,7 +4844,8 @@ static void perf_write_uring_zero_copy(fuse_req_t req, fuse_ino_t ino,
 	if (!result)
 		return;
 
-	quiescent = cache_mutation_end(&context->mutation);
+	quiescent = cache_mutation_end_capture(&context->mutation, &snapshot,
+					      &snapshot_valid);
 	if (context->mutation.xattr_quiescent &&
 	    (!context->capability_fast || !paper_capability_is_safe()))
 		refill_capability_after_write(req, ino);
@@ -4834,7 +4856,7 @@ static void perf_write_uring_zero_copy(fuse_req_t req, fuse_ino_t ino,
 		attr_outcome = publish_pinned_write_attr(
 			ino, context->inode_fd, context->dev,
 			context->lower_ino, context->lo, &st,
-			&ignored_reply_timeout);
+			&ignored_reply_timeout, &snapshot, snapshot_valid);
 		attr_published = attr_outcome == PERF_CACHE_ATTR_PUBLISHED;
 	}
 	free(context);

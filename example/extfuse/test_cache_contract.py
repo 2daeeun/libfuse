@@ -164,13 +164,14 @@ class CacheContractTests(unittest.TestCase):
                             complete.index(reply))
 
     def test_read_snapshot_reuses_end_lock_and_revalidates(self):
-        end = DAEMON.split("static bool cache_mutation_end_with_snapshot(", 1)[1]
+        end = DAEMON.split("static bool cache_mutation_end_capture(", 1)[1]
         end = end.split("static bool cache_mutation_end(", 1)[0]
         self.assertEqual(end.count("cache_mutation_lock(mutation, &locks)"), 1)
         self.assertEqual(end.count("cache_mutation_unlock(&locks)"), 1)
         self.assertNotIn("backing_mutex", end)
         self.assertIn("snapshot && quiescent && !invalid_state", end)
-        self.assertIn("!mutation->attr_only || mutation->count != 1", end)
+        self.assertIn("mutation->count != 1", end)
+        self.assertIn("mutation->attr_only ? snapshot : NULL", end)
         self.assertIn("EXTFUSE_NATIVE_STATE_ACTIVE_MASK", end)
         self.assertNotIn("extfuse_snapshot_pinned_inode(", end)
         self.assertIn("cache_mutation_end_with_snapshot(mutation, NULL)", DAEMON)

@@ -26,6 +26,13 @@ def test_extfuse_fixed_read():
     ])
 
 
+def test_extfuse_write_completion():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'example/extfuse/test_write_completion.py'),
+    ])
+
+
 def _source_region(path, start, end):
     source = path.read_text(encoding='utf-8')
     begin = source.index(start)

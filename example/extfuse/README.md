@@ -175,6 +175,16 @@ before replying. No pthread mutex is held from submission to completion, and a
 submission or I/O failure is reported without a copied replay. READ never opts
 in to the write-only open flag.
 
+Quiescent C2 fixed-WRITE completions capture the ATTR snapshot token while
+ending the mutation, then reuse it for pinned-inode publication. This removes
+one repeated inode-stripe lock acquisition per quiescent completion. The lower
+snapshot stays outside the lock; capability revocation/refill and token
+revalidation still precede the reply. Failed token retrieval remains a
+publication error, while a captured active token remains an unstable snapshot.
+Submission failures use the same completion ordering. The C1 synchronous WRITE
+path is unchanged. `python3 -B example/extfuse/test_write_completion.py` tests
+the actual helpers without mounting; throughput improvement is unmeasured.
+
 The independent `EXTFUSE_FIXED_READ=1` option submits the READ request's
 registered destination pages to the lower fd with the existing fixed-buffer
 API. READ still enters the daemon and retains its ExtFUSE BPF policy. A heap

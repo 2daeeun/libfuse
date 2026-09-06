@@ -28,6 +28,11 @@ td += executable('test_abi', 'test_abi.c',
 td += executable('test_extfuse_init', 'test_extfuse_init.c',
                  dependencies: [ libfuse_dep ],
                  install: false)
+extfuse_background_limits_test = executable(
+    'test_extfuse_background_limits', 'test_extfuse_background_limits.c',
+    dependencies: [ libfuse_dep ], install: false)
+td += extfuse_background_limits_test
+test('ExtFUSE background limits', extfuse_background_limits_test)
 extfuse_coherence_epochs_test = executable(
     'test_extfuse_coherence_epochs', 'test_extfuse_coherence_epochs.c',
     dependencies: [ libfuse_dep ],

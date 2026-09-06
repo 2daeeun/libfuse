@@ -40,6 +40,7 @@ int upstream_passthrough_main(int argc, char *argv[]);
 #include <sys/xattr.h>
 #include <time.h>
 
+#include "background_limits.h"
 #include "read_cache_fd.h"
 
 void perf_lookup(fuse_req_t req, fuse_ino_t parent, const char *name);
@@ -3252,10 +3253,15 @@ static void print_counters(const char *phase)
 static void perf_init(void *userdata, struct fuse_conn_info *conn)
 {
 	struct lo_data *lo = userdata;
+	unsigned int allowed_cpus = perf_background_allowed_cpus();
 	int extfuse_rc = 0;
 
 	perf_state.init_rc = 0;
-	fuse_apply_conn_info_opts(perf_state.conn_opts, conn);
+	perf_background_apply(conn, perf_state.conn_opts, allowed_cpus);
+	/* Requested values precede wire normalization and kernel-side limits. */
+	fprintf(stderr,
+		"BACKGROUND_LIMITS policy=affinity-v1 allowed_cpus=%u max_background_requested=%u congestion_threshold_requested=%u\n",
+		allowed_cpus, conn->max_background, conn->congestion_threshold);
 	lo_init(userdata, conn);
 	perf_state.syncfs_support = fuse_set_feature_flag(
 		conn, FUSE_CAP_SYNCFS_SUPPORT);

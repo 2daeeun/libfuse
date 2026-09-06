@@ -79,6 +79,8 @@ struct fuse_session_uring {
 #define FUSE_NATIVE_REQUEST_COUNTER_SLOTS 64U
 
 struct fuse_native_request_counter {
+	/* Serialize window control without touching the request hot path. */
+	atomic_bool control_busy;
 	/* Even epochs are stopped, odd epochs are armed. */
 	atomic_uint_fast64_t epoch;
 	atomic_uint_fast64_t writers;

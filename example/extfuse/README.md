@@ -142,10 +142,14 @@ kernel's registered backing file and credential to execute lower VFS I/O;
 negotiate WBCache passthrough and writeback cache without coherence epochs,
 mutation trailers, or xattr notification. The separately negotiated
 `EXTFUSE_PAPER_READ_GUARD` brackets lower READ with attr-only private BEGIN/END
-notifications. WRITE
-marks an existing attribute row stale and invalidates capability state in the
-same ordinary BPF decision; a later real metadata miss is refreshed through
-the daemon.  The `gate` profile additionally negotiates coherence epochs and
+notifications. WRITE marks an existing attribute row stale in the same
+ordinary BPF decision. Paper WBCache never serves a positive
+`security.capability` row from BPF: lower WRITE can remove that xattr after a
+concurrent daemon cache publication. Such values use a real daemon lookup,
+which lets paper WRITE avoid a redundant capability-key lookup/delete on every
+request. Verified-absent and generation-valid cached ENODATA replies remain
+local; other xattrs and strict/native invalidation retain their existing policy.
+A later real attribute miss is refreshed from the lower inode.  The `gate` profile additionally negotiates coherence epochs and
 attribute refresh for strict race validation.  `DAEMON_COUNTS` reports
 `wbcache_daemon_read_fallbacks` and `wbcache_daemon_write_fallbacks` even when
 ordinary callback counting is disabled, so a performance run can reject any

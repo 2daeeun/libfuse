@@ -104,6 +104,35 @@ static void trace_request_reply(uint64_t unique, unsigned int len,
 }
 #endif
 
+static void native_request_counter_init(struct fuse_session *se)
+{
+	struct fuse_native_request_counter *counter =
+		&se->native_request_counter;
+	unsigned int opcode;
+
+	atomic_init(&counter->control_busy, false);
+	atomic_init(&counter->epoch, 0);
+	atomic_init(&counter->writers, 0);
+	for (opcode = 0; opcode < FUSE_NATIVE_REQUEST_COUNTER_SLOTS; opcode++)
+		atomic_init(&counter->values[opcode], 0);
+}
+
+static bool native_request_counter_control_begin(
+	struct fuse_native_request_counter *counter)
+{
+	bool expected = false;
+
+	return atomic_compare_exchange_strong_explicit(
+		&counter->control_busy, &expected, true,
+		memory_order_acquire, memory_order_relaxed);
+}
+
+static void native_request_counter_control_end(
+	struct fuse_native_request_counter *counter)
+{
+	atomic_store_explicit(&counter->control_busy, false, memory_order_release);
+}
+
 static void native_request_counter_increment(struct fuse_session *se,
 					     uint32_t opcode)
 {
@@ -135,13 +164,18 @@ int fuse_session_native_request_counter_start(struct fuse_session *se)
 	struct fuse_native_request_counter *counter;
 	uint_fast64_t epoch;
 	unsigned int opcode;
+	int result = 0;
 
 	if (!se)
 		return -EINVAL;
 	counter = &se->native_request_counter;
-	epoch = atomic_load_explicit(&counter->epoch, memory_order_acquire);
-	if (epoch & 1)
+	if (!native_request_counter_control_begin(counter))
 		return -EBUSY;
+	epoch = atomic_load_explicit(&counter->epoch, memory_order_acquire);
+	if (epoch & 1) {
+		result = -EBUSY;
+		goto out;
+	}
 
 	while (atomic_load_explicit(&counter->writers, memory_order_acquire))
 		sched_yield();
@@ -152,28 +186,39 @@ int fuse_session_native_request_counter_start(struct fuse_session *se)
 	if (!atomic_compare_exchange_strong_explicit(
 			&counter->epoch, &epoch, epoch + 1,
 			memory_order_release, memory_order_acquire))
-		return -EBUSY;
-	return 0;
+		result = -EBUSY;
+out:
+	native_request_counter_control_end(counter);
+	return result;
 }
 
 int fuse_session_native_request_counter_stop(struct fuse_session *se)
 {
 	struct fuse_native_request_counter *counter;
 	uint_fast64_t epoch;
+	int result = 0;
 
 	if (!se)
 		return -EINVAL;
 	counter = &se->native_request_counter;
+	if (!native_request_counter_control_begin(counter))
+		return -EBUSY;
 	epoch = atomic_load_explicit(&counter->epoch, memory_order_acquire);
-	if (!(epoch & 1))
-		return -EINVAL;
+	if (!(epoch & 1)) {
+		result = -EINVAL;
+		goto out;
+	}
 	if (!atomic_compare_exchange_strong_explicit(
 			&counter->epoch, &epoch, epoch + 1,
-			memory_order_release, memory_order_acquire))
-		return -EBUSY;
+			memory_order_release, memory_order_acquire)) {
+		result = -EBUSY;
+		goto out;
+	}
 	while (atomic_load_explicit(&counter->writers, memory_order_acquire))
 		sched_yield();
-	return 0;
+out:
+	native_request_counter_control_end(counter);
+	return result;
 }
 
 int fuse_session_native_request_counter_read(struct fuse_session *se,
@@ -181,17 +226,23 @@ int fuse_session_native_request_counter_read(struct fuse_session *se,
 					     uint64_t *value)
 {
 	struct fuse_native_request_counter *counter;
+	int result = 0;
 
 	if (!se || !value || opcode >= FUSE_NATIVE_REQUEST_COUNTER_SLOTS)
 		return -EINVAL;
 	counter = &se->native_request_counter;
-	if (atomic_load_explicit(&counter->epoch, memory_order_acquire) & 1)
+	if (!native_request_counter_control_begin(counter))
 		return -EBUSY;
-	if (atomic_load_explicit(&counter->writers, memory_order_acquire))
-		return -EBUSY;
+	if ((atomic_load_explicit(&counter->epoch, memory_order_acquire) & 1) ||
+	    atomic_load_explicit(&counter->writers, memory_order_acquire)) {
+		result = -EBUSY;
+		goto out;
+	}
 	*value = atomic_load_explicit(&counter->values[opcode],
 				      memory_order_relaxed);
-	return 0;
+out:
+	native_request_counter_control_end(counter);
+	return result;
 }
 
 static void convert_stat(const struct stat *stbuf, struct fuse_attr *attr)
@@ -4690,6 +4741,7 @@ fuse_session_new_versioned(struct fuse_args *args,
 		fuse_log(FUSE_LOG_ERR, "fuse: failed to allocate fuse object\n");
 		goto out1;
 	}
+	native_request_counter_init(se);
 	se->fd = -1;
 	se->conn.max_write = FUSE_DEFAULT_MAX_PAGES_LIMIT * getpagesize();
 	se->bufsize = se->conn.max_write + FUSE_BUFFER_HEADER_SIZE;

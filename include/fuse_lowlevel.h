@@ -2482,16 +2482,20 @@ void fuse_session_process_buf(struct fuse_session *se,
  * both classic /dev/fuse and FUSE-over-io_uring transports.  Requests handled
  * entirely in the kernel do not reach this boundary and are therefore not
  * counted.  This API is intended for controlled benchmarking.
+ * Start, stop and read control operations are mutually exclusive; a concurrent
+ * control operation returns -EBUSY without changing the window or its counts.
  *
  * @param se the session
  * @return zero on success, -EINVAL for an invalid session, or -EBUSY if an
- *         accounting window is already active
+ *         accounting window is already active or another control operation
+ *         is in progress
  */
 int fuse_session_native_request_counter_start(struct fuse_session *se);
 
 /**
  * Stop the active native request-counting window and wait for in-flight
  * counter updates to finish.
+ * Returns -EBUSY if another start, stop or read control operation is in progress.
  *
  * @param se the session
  * @return zero on success, or a negative errno value
@@ -2501,6 +2505,8 @@ int fuse_session_native_request_counter_stop(struct fuse_session *se);
 /**
  * Read one raw FUSE opcode count after the accounting window has stopped.
  * Opcodes 0 through 63 are supported.
+ * Returns -EBUSY while a window is active, a counter update is pending, or
+ * another start, stop or read control operation is in progress.
  *
  * @param se the session
  * @param opcode raw FUSE opcode

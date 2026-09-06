@@ -238,12 +238,17 @@ static int has_passthrough_mmap_marker(__u64 nodeid)
 	return bpf_map_lookup_elem(&mmap_map, &nodeid) != NULL;
 }
 
-static int policy_enabled(__u32 flag)
+static __u32 policy_flags(void)
 {
 	__u32 key = 0;
 	__u32 *flags = bpf_map_lookup_elem(&policy_map, &key);
 
-	return flags && (*flags & flag);
+	return flags ? *flags : 0;
+}
+
+static int policy_enabled(__u32 flag)
+{
+	return !!(policy_flags() & flag);
 }
 
 static int capability_name(void *ctx)
@@ -837,15 +842,24 @@ HANDLER(FUSE_WRITE, 16)(void *ctx)
 {
 	struct extfuse_req *args = (struct extfuse_req *)ctx;
 	lookup_attr_key_t key = {0};
+	__u32 flags = 0;
 
 	/* Legacy C1/C2 requests keep version zero and avoid a policy-map lookup. */
-	if (args->coherence.version == EXTFUSE_COHERENCE_VERSION &&
-	    policy_enabled(EXTFUSE_POLICY_WBCACHE_PASSTHROUGH)) {
+	if (args->coherence.version == EXTFUSE_COHERENCE_VERSION)
+		flags = policy_flags();
+	if (flags & EXTFUSE_POLICY_WBCACHE_PASSTHROUGH) {
+		/*
+		 * Paper GETXATTR never serves positive capability rows. A later
+		 * daemon publication therefore cannot resurrect a stale BPF hit,
+		 * even if SETXATTR revokes the absent-capability proof during WRITE.
+		 * The strict path retains its original invalidation contract.
+		 */
 		if (!args->coherence.target_count &&
 		    (mark_passthrough_attr_stale(
 			     ctx, FATTR_ATIME | FATTR_SIZE | FATTR_MTIME |
 				  FATTR_CTIME) ||
-		     invalidate_positive_capability(ctx)))
+		     ((flags & EXTFUSE_POLICY_COHERENCE_EPOCHS) &&
+		      invalidate_positive_capability(ctx))))
 			return UPCALL;
 		/*
 		 * The paper path applies cache side effects in this one standard hook.
@@ -913,6 +927,8 @@ HANDLER(FUSE_GETXATTR, 22)(void *ctx)
 	struct fuse_getxattr_out out = {};
 	xattr_key_t key = {};
 	xattr_value_t *value;
+	__u32 flags;
+	int capability;
 	__s64 ret;
 
 	ret = bpf_extfuse_read_args(ctx, NODEID, &key.nodeid,
@@ -930,9 +946,10 @@ HANDLER(FUSE_GETXATTR, 22)(void *ctx)
 	 * REMOVEXATTR revoke the global proof before their daemon upcall, so a
 	 * concurrent lookup fails closed into the ordinary cache/daemon path.
 	 */
-	if (policy_enabled(EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA) &&
-	    !__builtin_memcmp(key.name, "security.capability",
-			     sizeof("security.capability")))
+	flags = policy_flags();
+	capability = !__builtin_memcmp(key.name, "security.capability",
+				      sizeof("security.capability"));
+	if ((flags & EXTFUSE_POLICY_PAPER_CAPABILITY_ENODATA) && capability)
 		return -ENODATA;
 	ret = bpf_extfuse_read_args(ctx, IN_PARAM_0_VALUE, &in, sizeof(in));
 	if (ret < 0)
@@ -940,6 +957,16 @@ HANDLER(FUSE_GETXATTR, 22)(void *ctx)
 
 	value = bpf_map_lookup_elem(&xattr_map, &key);
 	if (!value)
+		return UPCALL;
+	/*
+	 * Paper WRITE has no native xattr BEGIN/END token. A capability row can
+	 * be published after its routing hook and then removed by lower killpriv.
+	 * Keep only exact negative capability replies cacheable in this mode;
+	 * every positive value is read from the daemon's lower inode instead.
+	 */
+	if (capability && (flags & EXTFUSE_POLICY_WBCACHE_PASSTHROUGH) &&
+	    !(flags & EXTFUSE_POLICY_COHERENCE_EPOCHS) &&
+	    value->error != ENODATA)
 		return UPCALL;
 	if (has_passthrough_mmap_marker(key.nodeid) ||
 	    !daemon_cache_token_current(key.nodeid, value->daemon_state, 1))

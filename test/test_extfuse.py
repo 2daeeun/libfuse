@@ -19,6 +19,20 @@ def test_extfuse_stale_mark():
     ])
 
 
+def test_extfuse_wbcache_capability():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'example/extfuse/test_wbcache_capability.py'),
+    ])
+
+
+def test_native_counter_control_race():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'test/test_native_counter_race.py'),
+    ])
+
+
 def test_extfuse_fixed_read():
     root = Path(__file__).resolve().parents[1]
     subprocess.check_call([

@@ -33,6 +33,13 @@ def test_native_counter_control_race():
     ])
 
 
+def test_uring_taskrun():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'test/test_uring_taskrun.py'),
+    ])
+
+
 def test_extfuse_fixed_read():
     root = Path(__file__).resolve().parents[1]
     subprocess.check_call([

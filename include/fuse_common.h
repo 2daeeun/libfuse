@@ -666,10 +666,10 @@ struct fuse_loop_config_v1 {
 
 /**
  * Indicates that ExtFUSE writeback-cache forwarding can execute each per-open
- * contiguous max_write FUSE_WRITE_CACHE run in bounded batches. A run may end
- * with one contiguous partial write; a partial write cannot start or extend a
- * run. This requires ExtFUSE, writeback cache, and ExtFUSE writeback-cache
- * passthrough, and excludes coherence epochs.
+ * FUSE_WRITE_CACHE batch in admission order, including small random writes.
+ * Each request retains its own lower I/O and completion. This requires
+ * ExtFUSE, writeback cache, and ExtFUSE writeback-cache passthrough, and
+ * excludes coherence epochs.
  */
 #define FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM (1ULL << 45)
 

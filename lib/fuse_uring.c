@@ -212,6 +212,19 @@ static void fuse_uring_use_payload_pool(struct io_uring_sqe *sqe)
 #define FUSE_URING_PROBE __attribute__((noinline, used))
 #endif
 
+static int fuse_uring_check_queue_owner(struct fuse_ring_queue *queue)
+{
+	if (!queue->ring_pool->single_issuer ||
+	    pthread_equal(pthread_self(), queue->tid))
+		return 0;
+
+	queue->ring_pool->se->error = -EINVAL;
+	fuse_log(FUSE_LOG_ERR,
+		 "qid=%d single-issuer reply came from a different thread\n",
+		 queue->qid);
+	return -EINVAL;
+}
+
 FUSE_URING_PROBE
 int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 				 struct fuse_ring_queue *queue,
@@ -224,6 +237,10 @@ int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 	struct fuse_uring_ent_in_out *ent_in_out =
 		(struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
 	struct io_uring_sqe *sqe;
+
+	/* The public single-issuer contract excludes deferred foreign replies. */
+	if (fuse_uring_check_queue_owner(queue))
+		return -EINVAL;
 
 	/*
 	 * Multi-issuer: serialise every submission-side SQ access under
@@ -604,19 +621,15 @@ static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
 	params.flags |= IORING_SETUP_CQSIZE;
 	params.cq_entries = depth * 2;
 
-	/* These flags should help to increase performance, but actually
-	 * make it a bit slower - reason should get investigated.
+	/*
+	 * This queue's creator also receives and replies to every request.
+	 * Its existing submit_and_wait() loop runs completion task-work; no
+	 * off-thread submitter or additional wait is needed. Multi-issuer queues
+	 * retain immediate task-work and their locked foreign-reply submissions.
 	 */
-	if (0) {
-		/* Has the main slow down effect */
-		params.flags |= IORING_SETUP_SINGLE_ISSUER;
-
-		// params.flags |= IORING_SETUP_DEFER_TASKRUN;
-		params.flags |= IORING_SETUP_TASKRUN_FLAG;
-
-		/* Second main effect to make it slower */
-		params.flags |= IORING_SETUP_COOP_TASKRUN;
-	}
+	if (single_issuer)
+		params.flags |= IORING_SETUP_SINGLE_ISSUER |
+				IORING_SETUP_DEFER_TASKRUN;
 
 	rc = io_uring_queue_init_params(depth, ring, &params);
 	if (rc != 0) {
@@ -646,6 +659,11 @@ static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
 				 qid, strerror(-rc));
 	}
 
+	fuse_log(FUSE_LOG_INFO,
+		 "FUSE_URING_TASKRUN qid=%zu setup_flags=0x%08x single_issuer=%u defer_taskrun=%u\n",
+		 qid, params.flags,
+		 !!(params.flags & IORING_SETUP_SINGLE_ISSUER),
+		 !!(params.flags & IORING_SETUP_DEFER_TASKRUN));
 	return 0;
 }
 
@@ -1045,6 +1063,9 @@ static void fuse_uring_resubmit(struct fuse_ring_queue *queue,
 {
 	const bool locked = !queue->ring_pool->single_issuer;
 	struct io_uring_sqe *sqe;
+
+	if (fuse_uring_check_queue_owner(queue))
+		return;
 
 	if (locked)
 		pthread_mutex_lock(&queue->ring_lock);

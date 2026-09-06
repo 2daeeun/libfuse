@@ -225,6 +225,7 @@ struct perf_inode_generation {
 	bool published_valid;
 	_Atomic uint64_t read_cohort_refs;
 	atomic_bool read_cohort_armed;
+	uint64_t read_cohort_generation;
 };
 
 struct perf_cache_mutation {
@@ -234,6 +235,7 @@ struct perf_cache_mutation {
 	bool armed;
 	bool attr_only;
 	bool xattr_quiescent;
+	uint64_t read_generation;
 };
 
 struct perf_cache_snapshot {
@@ -1553,6 +1555,7 @@ static bool cache_mutation_begin(struct perf_cache_mutation *mutation)
 	struct perf_cache_lockset locks;
 	size_t index;
 
+	mutation->read_generation = 0;
 	if (!metadata_hits_enabled() || !mutation->count)
 		return true;
 	cache_mutation_lock(mutation, &locks);
@@ -1597,6 +1600,9 @@ static bool cache_mutation_begin(struct perf_cache_mutation *mutation)
 		}
 	}
 	mutation->armed = true;
+	if (mutation->attr_only && mutation->count == 1 &&
+	    states[0]->active == 1)
+		mutation->read_generation = states[0]->generation;
 	for (index = 0; index < mutation->count; index++)
 		publish_inode_generation_locked(mutation->inodes[index],
 						 states[index],
@@ -1606,12 +1612,11 @@ out:
 	return counter_value(&perf_state.counters.cache_bypass_errors) == 0;
 }
 
-static bool cache_mutation_end_capture(
+static bool cache_mutation_end_capture_locked(
 	struct perf_cache_mutation *mutation, struct perf_cache_snapshot *snapshot,
 	bool *snapshot_valid)
 {
 	struct perf_inode_generation *state;
-	struct perf_cache_lockset locks;
 	bool invalid_state = false;
 	bool quiescent = true;
 	bool xattr_quiescent = true;
@@ -1622,7 +1627,6 @@ static bool cache_mutation_end_capture(
 	mutation->xattr_quiescent = false;
 	if (!mutation->armed)
 		return false;
-	cache_mutation_lock(mutation, &locks);
 	for (index = 0; index < mutation->count; index++) {
 		state = find_inode_generation_locked(mutation->inodes[index]);
 		if (!state || !state->active ||
@@ -1668,8 +1672,9 @@ static bool cache_mutation_end_capture(
 	/*
 	 * Completion already owns the generation lock. Capture its quiescent
 	 * identity here instead of unlocking and immediately contending for the
-	 * same inode lock again. The lower fstat remains outside this
-	 * lock, and cache_attr() still revalidates both tokens before publication.
+	 * same inode lock again. The lower fstat remains outside this lock.
+	 * Ordinary callers revalidate both tokens before publication; a READ may
+	 * instead publish its verified prefetched snapshot before releasing it.
 	 * Preserve mutation and xattr quiescence independently of snapshot validity.
 	 */
 	if (snapshot && quiescent && !invalid_state) {
@@ -1694,8 +1699,26 @@ static bool cache_mutation_end_capture(
 		}
 		*snapshot_valid = valid;
 	}
-	cache_mutation_unlock(&locks);
 	return quiescent && !invalid_state;
+}
+
+static bool cache_mutation_end_capture(
+	struct perf_cache_mutation *mutation, struct perf_cache_snapshot *snapshot,
+	bool *snapshot_valid)
+{
+	struct perf_cache_lockset locks;
+	bool quiescent;
+
+	if (!mutation->armed) {
+		*snapshot_valid = false;
+		mutation->xattr_quiescent = false;
+		return false;
+	}
+	cache_mutation_lock(mutation, &locks);
+	quiescent = cache_mutation_end_capture_locked(
+		mutation, snapshot, snapshot_valid);
+	cache_mutation_unlock(&locks);
+	return quiescent;
 }
 
 static bool cache_mutation_end_with_snapshot(
@@ -4891,6 +4914,7 @@ static void perf_write_uring_zero_copy(fuse_req_t req, fuse_ino_t ino,
 
 /* BUSY excludes joins while the first BEGIN or the last publication runs. */
 #define PERF_READ_COHORT_BUSY UINT64_MAX
+#define PERF_READ_COHORT_JOIN_ATTEMPTS 4
 
 static bool cache_read_begin(struct perf_cache_mutation *mutation,
 			    struct perf_inode_generation **cohort)
@@ -4912,14 +4936,18 @@ static bool cache_read_begin(struct perf_cache_mutation *mutation,
 	if (!state)
 		return cache_mutation_begin(mutation);
 	refs = atomic_load_explicit(&state->read_cohort_refs, memory_order_acquire);
-	if (refs && refs < PERF_READ_COHORT_BUSY - 1) {
+	/* A changing active count is not a boundary: retry without a stripe. */
+	for (unsigned int attempt = 0;
+	     refs && refs < PERF_READ_COHORT_BUSY - 1 &&
+	     attempt < PERF_READ_COHORT_JOIN_ATTEMPTS; attempt++) {
 		if (atomic_compare_exchange_strong_explicit(
 			    &state->read_cohort_refs, &refs, refs + 1,
 			    memory_order_acq_rel, memory_order_acquire)) {
 			*cohort = state;
 			return true;
 		}
-	} else if (!refs && atomic_compare_exchange_strong_explicit(
+	}
+	if (!refs && atomic_compare_exchange_strong_explicit(
 			   &state->read_cohort_refs, &refs, PERF_READ_COHORT_BUSY,
 			   memory_order_acq_rel, memory_order_acquire)) {
 		if (!cache_mutation_begin(mutation)) {
@@ -4930,13 +4958,14 @@ static bool cache_read_begin(struct perf_cache_mutation *mutation,
 		}
 		/* The first request may finish before another cohort member. */
 		state->read_cohort_armed = mutation->armed;
+		state->read_cohort_generation = mutation->read_generation;
 		mutation->armed = false;
 		*cohort = state;
 		atomic_store_explicit(&state->read_cohort_refs, 1,
 				      memory_order_release);
 		return true;
 	}
-	/* A boundary or failed join uses the original path without spinning. */
+	/* Boundaries and exhausted retries use the original admission path. */
 	return cache_mutation_begin(mutation);
 }
 
@@ -4969,6 +4998,7 @@ static bool cache_read_cohort_last(struct perf_cache_mutation *mutation,
 		return false;
 	/* Reconstruct the first member's attr-only guard in the last context. */
 	mutation->armed = cohort->read_cohort_armed;
+	mutation->read_generation = cohort->read_cohort_generation;
 	cohort->read_cohort_armed = false;
 	return true;
 }
@@ -4981,6 +5011,37 @@ struct perf_read_context {
 	struct perf_inode_generation *cohort;
 	size_t requested;
 };
+
+/* Keep the READ active through fstat, then end and refill under one stripe. */
+static bool cache_read_end_prefetched(struct perf_read_context *context,
+				      const struct stat *st)
+{
+	struct perf_cache_mutation *mutation = &context->mutation;
+	struct perf_cache_snapshot snapshot;
+	struct perf_cache_lockset locks;
+	struct perf_inode_generation *state;
+	bool snapshot_valid;
+	bool quiescent;
+
+	cache_mutation_lock(mutation, &locks);
+	state = find_inode_generation_locked(context->ino);
+	/* A BEGIN/END during fstat invalidates the prefetched snapshot. */
+	if (!state || state->active != 1 || perf_state.cache_bypass ||
+	    state->generation != mutation->read_generation) {
+		cache_mutation_unlock(&locks);
+		return false;
+	}
+	quiescent = cache_mutation_end_capture_locked(
+		mutation, &snapshot, &snapshot_valid);
+	if (quiescent && snapshot_valid &&
+	    !((snapshot.daemon_state | snapshot.native_state) &
+	      EXTFUSE_NATIVE_STATE_ACTIVE_MASK))
+		cache_attr_locked(context->ino, st, context->lo->timeout,
+				  snapshot.daemon_state, snapshot.native_state,
+				  false, NULL);
+	cache_mutation_unlock(&locks);
+	return true;
+}
 
 static void perf_read_prepare(void *opaque, ssize_t read_result)
 {
@@ -4996,12 +5057,24 @@ static void perf_read_prepare(void *opaque, ssize_t read_result)
 		goto out;
 	/* Even a failed/partial lower read may have changed atime. */
 	(void)read_result;
+	if (perf_state.mode == PERF_MODE_HIT &&
+	    !perf_state.passthrough_coherence_v2_requested &&
+	    !perf_state.wbcache_passthrough_requested &&
+	    context->mutation.armed && context->mutation.attr_only &&
+	    context->mutation.count == 1 && context->mutation.read_generation &&
+	    !extfuse_snapshot_pinned_inode(context->inode->fd,
+					  context->inode->dev,
+					  context->inode->ino, &st) &&
+	    cache_read_end_prefetched(context, &st))
+		goto release_cohort;
+	/* A concurrent mutation retains the original post-END snapshot path. */
 	if (cache_mutation_end_with_snapshot(&context->mutation, &snapshot) &&
 	    !extfuse_snapshot_pinned_inode(context->inode->fd,
 					  context->inode->dev,
 					  context->inode->ino, &st))
 		cache_attr(context->ino, &st, context->lo->timeout, &snapshot,
 			   false, &ignored_reply_timeout);
+release_cohort:
 	if (cohort)
 		atomic_store_explicit(&cohort->read_cohort_refs, 0,
 				      memory_order_release);

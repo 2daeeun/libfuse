@@ -162,8 +162,8 @@ class WriteCompletionTests(unittest.TestCase):
         cls.temporary = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.temporary.cleanup)
         root = Path(cls.temporary.name)
-        end = SOURCE.split("static bool cache_mutation_end_capture(", 1)[1]
-        end = "static bool cache_mutation_end_capture(" + end.split("static uint64_t timeout_seconds", 1)[0]
+        end = SOURCE.split("static bool cache_mutation_end_capture_locked(", 1)[1]
+        end = "static bool cache_mutation_end_capture_locked(" + end.split("static uint64_t timeout_seconds", 1)[0]
         write = SOURCE.split("struct perf_uring_write_context {", 1)[1]
         write = "struct perf_uring_write_context {" + write.split("#define PERF_READ_COHORT_BUSY", 1)[0]
         source = root / "completion.c"

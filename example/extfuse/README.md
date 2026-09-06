@@ -53,15 +53,30 @@ with strict Boolean environment values (`0` or `1`):
   fixed-I/O open flag is set only for `O_RDONLY` handles, so writable handles
   retain their existing WRITE policy.
 - `EXTFUSE_WBCACHE_WRITE_STREAM=1` is valid only for `allopt`, `paper-like`
-  C3/C4. It negotiates bounded, per-open contiguous full-`max_write`
-  `FUSE_WRITE_CACHE` runs. One contiguous partial write may terminate a run;
-  it cannot lead or extend one. The mode is incompatible with coherence epochs.
+  C3/C4. It negotiates bounded per-open `FUSE_WRITE_CACHE` dispatch batches,
+  including small and noncontiguous writes. Requests retain their individual
+  lower I/O, error handling and completion, and the worker yields after 32
+  requests. Different sync classes close admission to the current batch;
+  different open handles remain independent. The mode is incompatible with
+  coherence epochs. This avoids a separate worker dispatch for each small
+  request when several requests are already pending; it does not wait for
+  extra requests or merge their bytes.
 
 Invalid values or mode/profile/transport combinations are rejected before the
 mount. `START` records the requested toggles; `INIT` separately records the
 capabilities that were actually negotiated. Fixed READ records
 `fixed_read_requested` and `fixed_read_active`; actual use additionally requires
 buffer registration and the teardown READ submission/completion counters.
+
+Single-issuer io_uring queues request kernel `SINGLE_ISSUER | DEFER_TASKRUN`.
+The existing owner thread's `submit_and_wait()` loop flushes replies and runs
+completion task-work, including fixed-I/O completions. Multi-issuer queues keep
+their previous flags and support replies from other threads under the ring lock.
+Single-issuer callers must honor the existing same-thread reply contract; a
+foreign reply is rejected before it can change the submission queue. Each
+successfully initialized queue logs `FUSE_URING_TASKRUN` with its accepted setup
+flags. Unsupported flags fail initialization instead of silently selecting a
+different mode. The performance effect requires matched runtime measurements.
 
 With the paired protocol-7.48 kernel, the `gate` profile negotiates driver-owned
 ExtFUSE coherence epochs. Native passthrough and strict WBCache passthrough

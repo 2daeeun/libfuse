@@ -156,10 +156,31 @@ class CacheContractTests(unittest.TestCase):
         self.assertLess(prepare.index("cache_attr("),
                         prepare.index("atomic_store_explicit(&cohort->read_cohort_refs, 0"))
         self.assertNotIn("cache_snapshot_begin(", prepare)
-        self.assertLess(prepare.index("cache_mutation_end_with_snapshot("),
-                        prepare.index("extfuse_snapshot_pinned_inode("))
-        self.assertLess(prepare.index("extfuse_snapshot_pinned_inode("),
-                        prepare.index("cache_attr("))
+        prefetch, fallback = prepare.split(
+            "/* A concurrent mutation retains the original post-END snapshot path. */", 1)
+        for guard in ("perf_state.mode == PERF_MODE_HIT",
+                      "!perf_state.passthrough_coherence_v2_requested",
+                      "!perf_state.wbcache_passthrough_requested",
+                      "context->mutation.armed && context->mutation.attr_only",
+                      "context->mutation.count == 1 && context->mutation.read_generation"):
+            self.assertIn(guard, prefetch)
+        self.assertLess(prefetch.index("extfuse_snapshot_pinned_inode("),
+                        prefetch.index("cache_read_end_prefetched("))
+        self.assertLess(fallback.index("cache_mutation_end_with_snapshot("),
+                        fallback.index("extfuse_snapshot_pinned_inode("))
+        self.assertLess(fallback.index("extfuse_snapshot_pinned_inode("),
+                        fallback.index("cache_attr("))
+        merged = DAEMON.split("static bool cache_read_end_prefetched(", 1)[1]
+        merged = merged.split("static void perf_read_prepare(", 1)[0]
+        self.assertIn("state->active != 1", merged)
+        self.assertIn("state->generation != mutation->read_generation", merged)
+        self.assertIn("perf_state.cache_bypass", merged)
+        self.assertLess(merged.index("cache_mutation_lock("),
+                        merged.index("cache_mutation_end_capture_locked("))
+        self.assertLess(merged.index("cache_mutation_end_capture_locked("),
+                        merged.index("cache_attr_locked("))
+        self.assertLess(merged.index("cache_attr_locked("),
+                        merged.rindex("cache_mutation_unlock("))
         self.assertNotIn("fuse_reply_", prepare)
         self.assertIn("errno = saved_errno;", prepare)
         complete = DAEMON.split("static void perf_uring_read_complete(", 1)[1]
@@ -174,8 +195,13 @@ class CacheContractTests(unittest.TestCase):
         self.assertEqual(end.count("cache_mutation_lock(mutation, &locks)"), 1)
         self.assertEqual(end.count("cache_mutation_unlock(&locks)"), 1)
         self.assertNotIn("backing_mutex", end)
-        self.assertIn("snapshot && quiescent && !invalid_state", end)
-        self.assertIn("mutation->count != 1", end)
+        core = DAEMON.split("static bool cache_mutation_end_capture_locked(", 1)[1]
+        core = core.split("static bool cache_mutation_end_capture(", 1)[0]
+        self.assertNotIn("cache_mutation_lock(", core)
+        self.assertNotIn("cache_mutation_unlock(", core)
+        self.assertIn("snapshot && quiescent && !invalid_state", core)
+        self.assertIn("mutation->count != 1", core)
+        self.assertIn("cache_mutation_end_capture_locked(", end)
         self.assertIn("mutation->attr_only ? snapshot : NULL", end)
         self.assertIn("EXTFUSE_NATIVE_STATE_ACTIVE_MASK", end)
         self.assertNotIn("extfuse_snapshot_pinned_inode(", end)

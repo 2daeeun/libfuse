@@ -29,7 +29,7 @@ struct request { bool fixed; };
 typedef struct request *fuse_req_t;
 struct lo_data { double timeout; };
 struct lo_inode { int fd; dev_t dev; ino_t ino; };
-struct perf_cache_mutation { bool attr_only; bool active; };
+struct perf_cache_mutation { bool attr_only, active, armed; size_t count; uint64_t read_generation; };
 struct perf_inode_generation { _Atomic uint64_t read_cohort_refs; };
 struct perf_cache_snapshot { int token; };
 struct fuse_file_info {
@@ -37,7 +37,10 @@ struct fuse_file_info {
     uint64_t fh;
     unsigned int io_uring_zero_copy, io_uring_zero_copy_write;
 };
+#define PERF_MODE_HIT 1
 static struct {
+    int mode;
+    bool passthrough_coherence_v2_requested, wbcache_passthrough_requested;
     bool fixed_read, c2_fixed_write, uring_bufpool_requested, single_issuer;
     void *session;
 } perf_state;
@@ -243,12 +246,21 @@ class FixedReadTests(unittest.TestCase):
         helpers = source[start:end]
         start = source.index("struct perf_read_context {")
         end = source.index("__attribute__((noinline, used))\nvoid perf_read(", start)
+        read_helpers = source[start:end]
+        prefetch_start = read_helpers.index("static bool cache_read_end_prefetched(")
+        prefetch_end = read_helpers.index("static void perf_read_prepare(", prefetch_start)
+        # The actual publication helper is covered by test_read_cohort.py.
+        # This fixture retains the transport callback and original fallback.
+        read_helpers = (read_helpers[:prefetch_start] +
+                        "static bool cache_read_end_prefetched(struct perf_read_context *context, "
+                        "const struct stat *st) { (void)context; (void)st; return false; }\n" +
+                        read_helpers[prefetch_end:])
         cls.directory = tempfile.TemporaryDirectory(prefix="extfuse-fixed-read-")
         cls.addClassCleanup(cls.directory.cleanup)
         path = Path(cls.directory.name)
         harness = path / "read.c"
         harness.write_text(HARNESS.replace("@OPEN_HELPERS@", helpers).replace(
-            "@READ_HELPERS@", source[start:end]))
+            "@READ_HELPERS@", read_helpers))
         cls.binary = path / "read"
         subprocess.run([
             *shlex.split(os.environ.get("CC", "cc")), "-std=c11", "-O2",

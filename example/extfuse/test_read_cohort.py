@@ -52,6 +52,7 @@ HARNESS = r"""
 #define EXTFUSE_DAEMON_IO_MAP 1
 #define EXTFUSE_NATIVE_IO_MAP 2
 #define PERF_READ_COHORT_BUSY UINT64_MAX
+#define PERF_READ_COHORT_JOIN_ATTEMPTS 4
 typedef uint64_t fuse_ino_t;
 struct extfuse_io_state { uint64_t attr_state, xattr_state; };
 @STRUCTS@
@@ -75,6 +76,8 @@ static _Thread_local bool held;
 static atomic_uint locks, attempts, map_updates, attrs, stats, lower_done;
 static atomic_uint hold_begin, begin_entered, hold_stat, stat_entered;
 static atomic_bool allow_begin, allow_stat, fail_map, fatal_map, fail_stat;
+static atomic_bool fail_attr;
+static bool expect_active_stat;
 static atomic_uint_fast64_t map_attr, map_xattr, attr_token, attr_atime;
 static struct lo_data lo = { 1.0 };
 static struct lo_inode inode = { 77, 3, 19 };
@@ -122,16 +125,53 @@ static bool native_state_snapshot_locked(fuse_ino_t ino, uint64_t *value,
  const char *why, bool xattr)
 { (void)ino; (void)why; (void)xattr; assert(held); *value = 0; return true; }
 @MUTATION@
+static unsigned cas_failures, cas_calls;
+static bool compare_join(_Atomic uint64_t *object, uint64_t *expected,
+                         uint64_t desired, memory_order success, memory_order failure)
+{
+ if (*expected && *expected < PERF_READ_COHORT_BUSY - 1) {
+  cas_calls++;
+  if (cas_failures) {
+   cas_failures--;
+   /* A peer joins and leaves before our retry; count returns to the same value. */
+   atomic_fetch_add(object, 1);
+   uint64_t changed = atomic_load(object);
+   atomic_fetch_sub(object, 1);
+   *expected = changed;
+   return false;
+  }
+ }
+ return atomic_compare_exchange_strong_explicit(object, expected, desired,
+                                                success, failure);
+}
+#undef atomic_compare_exchange_strong_explicit
+#define atomic_compare_exchange_strong_explicit compare_join
 @COHORT@
+#undef atomic_compare_exchange_strong_explicit
 static int extfuse_snapshot_pinned_inode(int fd, dev_t dev, ino_t ino, struct stat *st)
 {
  assert(!held && fd == 77 && dev == 3 && ino == 19);
+ if (expect_active_stat) assert(atomic_load(&map_attr) & 255);
  atomic_fetch_add(&stats, 1); st->st_atim.tv_sec = atomic_load(&lower_done);
  if (atomic_exchange(&hold_stat, 0)) {
   atomic_store(&stat_entered, 1);
   while (!atomic_load(&allow_stat)) sched_yield();
  }
  return atomic_load(&fail_stat) ? -EIO : 0;
+}
+static int cache_attr_locked(fuse_ino_t ino, const struct stat *st, double timeout,
+ uint64_t daemon_state, uint64_t native_state, bool existing, bool *missing)
+{
+ struct perf_inode_generation *state = find_inode_generation_locked(ino);
+ uint64_t token;
+ assert(held && !existing && !missing && !native_state && timeout == 1.0);
+ assert(inode_generation_value_locked(state, &token, false));
+ assert(!state->active && token == daemon_state);
+ if (atomic_exchange(&fail_attr, false)) {
+  disable_all_caches_locked("attr-failure"); return -EIO;
+ }
+ atomic_fetch_add(&attrs, 1); atomic_store(&attr_token, token);
+ atomic_store(&attr_atime, st->st_atim.tv_sec); return 0;
 }
 static int cache_attr(fuse_ino_t ino, struct stat *st, double timeout,
  const struct perf_cache_snapshot *snapshot, bool existing, double *reply_timeout)
@@ -207,7 +247,7 @@ static void parallel(bool concurrent)
  if (concurrent) { lower_read(); finish(first); }
  pthread_barrier_destroy(&gate); clean(state);
  assert(atomic_load(&attr_atime) == N + 1);
- if (!concurrent) { assert(atomic_load(&locks) - baseline == 3);
+ if (!concurrent) { assert(atomic_load(&locks) - baseline == 2);
   assert(atomic_load(&map_updates) == 2 && atomic_load(&stats) == 1); }
 }
 int main(int argc, char **argv)
@@ -245,14 +285,67 @@ int main(int argc, char **argv)
   free(b); clean(state); assert(!atomic_load(&attrs)); return 0;
  }
  if (!strcmp(name, "ordinary-mode")) perf_state.mode = 2;
+ unsigned boundary_locks = atomic_load(&locks);
  begin(a);
+ if (!strcmp(name, "single-boundary") || !strcmp(name, "end-map-failure") ||
+     !strcmp(name, "attr-map-failure")) {
+  expect_active_stat = true;
+  atomic_store(&fail_map, !strcmp(name, "end-map-failure"));
+  atomic_store(&fail_attr, !strcmp(name, "attr-map-failure"));
+  lower_read(); finish(a); free(b);
+  if (!strcmp(name, "end-map-failure")) {
+   assert(perf_state.cache_bypass && !state->active);
+   assert(!atomic_load(&state->read_cohort_refs) && !state->read_cohort_armed);
+   /* A failed END map update deliberately leaves its old ACTIVE token. */
+   assert(atomic_load(&map_attr) & 255);
+  } else {
+   clean(state);
+  }
+  assert(atomic_load(&locks) - boundary_locks == 2);
+  assert(atomic_load(&stats) == 1);
+  assert(atomic_load(&attrs) == !strcmp(name, "single-boundary"));
+  return 0;
+ }
+ if (!strcmp(name, "join-retry") || !strcmp(name, "join-bounded")) {
+  unsigned baseline = atomic_load(&locks);
+  cas_failures = !strcmp(name, "join-retry") ? 1 : 8;
+  cas_calls = 0; begin(b);
+  if (!strcmp(name, "join-retry")) {
+   assert(b->cohort == state && atomic_load(&locks) == baseline);
+   assert(cas_calls == 3); /* injected conflict, refreshed expected, success */
+  } else {
+   assert(!b->cohort && atomic_load(&locks) == baseline + 1);
+   assert(cas_calls == PERF_READ_COHORT_JOIN_ATTEMPTS);
+  }
+  lower_read(); finish(b); lower_read(); finish(a); clean(state); return 0;
+ }
  if (!strcmp(name, "busy-end")) {
   pthread_t thread; lower_read(); atomic_store(&hold_stat, 1);
   pthread_create(&thread, NULL, finish_worker, a); wait_for(&stat_entered, 1);
-  begin(b); assert(!b->cohort && b->mutation.armed); lower_read(); finish(b);
+  begin(b); assert(!b->cohort && b->mutation.armed && !b->mutation.read_generation);
+  lower_read(); finish(b);
   atomic_store(&allow_stat, true); pthread_join(thread, NULL); clean(state);
   assert(atomic_load(&stats) == 2 && atomic_load(&attrs) == 1);
   assert(atomic_load(&attr_atime) == 2); return 0;
+ }
+ if (!strcmp(name, "writer-during-stat")) {
+  pthread_t thread;
+  struct perf_cache_mutation write = { .inodes = {17}, .count = 1 };
+  lower_read(); atomic_store(&hold_stat, 1);
+  pthread_create(&thread, NULL, finish_worker, a); wait_for(&stat_entered, 1);
+  assert(cache_mutation_begin(&write)); lower_read();
+  assert(!cache_mutation_end(&write) && write.xattr_quiescent);
+  assert(!atomic_load(&attrs) && (atomic_load(&map_attr) & 255));
+  atomic_store(&allow_stat, true); pthread_join(thread, NULL); free(b); clean(state);
+  assert(atomic_load(&stats) == 2 && atomic_load(&attrs) == 1);
+  assert(atomic_load(&attr_atime) == 2); return 0;
+ }
+ if (!strcmp(name, "native-fallback") || !strcmp(name, "wbcache-fallback")) {
+  perf_state.passthrough_coherence_v2_requested = !strcmp(name, "native-fallback");
+  perf_state.wbcache_passthrough_requested = !strcmp(name, "wbcache-fallback");
+  lower_read(); finish(a); free(b); clean(state);
+  assert(atomic_load(&locks) - boundary_locks == 3);
+  assert(atomic_load(&stats) == 1 && atomic_load(&attrs) == 1); return 0;
  }
  if (!strcmp(name, "fatal-admission")) {
   perf_state.counters.cache_bypass_errors = 1;
@@ -291,7 +384,8 @@ class ReadCohortTests(unittest.TestCase):
         names = {
             "LOOKUP": ("find_inode_generation_locked", "get_inode_generation_locked",
                        "inode_generation_value_locked"),
-            "MUTATION": ("cache_mutation_begin", "cache_mutation_end_capture",
+            "MUTATION": ("cache_mutation_begin", "cache_mutation_end_capture_locked",
+                         "cache_mutation_end_capture",
                          "cache_mutation_end_with_snapshot", "cache_mutation_end"),
             "COHORT": ("cache_read_begin", "cache_read_cohort_last"),
             "AUDIT": ("audit_coherence_state",),
@@ -306,6 +400,7 @@ class ReadCohortTests(unittest.TestCase):
                 bodies.append(extract(source, match.group()))
             code = code.replace(f"@{tag}@", "\n".join(bodies))
         code = code.replace("@READ@", extract(source, "struct perf_read_context {") +
+                            "\n" + extract(source, "static bool cache_read_end_prefetched(") +
                             "\n" + extract(source, "static void perf_read_prepare("))
         cls.directory = tempfile.TemporaryDirectory(prefix="extfuse-read-cohort-")
         cls.addClassCleanup(cls.directory.cleanup)
@@ -327,6 +422,19 @@ class ReadCohortTests(unittest.TestCase):
     def test_first_context_can_finish_before_parallel_last_member(self):
         self.check("shared-lifetime")
 
+    def test_single_boundary_keeps_active_stat_and_uses_one_completion_lock(self):
+        self.check("single-boundary")
+
+    def test_prefetched_publication_failure_keeps_cache_disabled(self):
+        for name in ("end-map-failure", "attr-map-failure"):
+            with self.subTest(name=name):
+                self.check(name)
+
+    def test_active_join_retries_are_bounded_and_avoid_unnecessary_stripe(self):
+        for name in ("join-retry", "join-bounded"):
+            with self.subTest(name=name):
+                self.check(name)
+
     def test_concurrent_admission_and_completion(self):
         self.check("cold-publication")
         for _ in range(8):
@@ -339,6 +447,14 @@ class ReadCohortTests(unittest.TestCase):
 
     def test_writer_xattr_boundary_survives_read_cohort(self):
         self.check("writer-overlap")
+
+    def test_writer_during_prefetched_stat_requires_fresh_post_end_snapshot(self):
+        self.check("writer-during-stat")
+
+    def test_native_and_wbcache_modes_keep_original_completion(self):
+        for name in ("native-fallback", "wbcache-fallback"):
+            with self.subTest(name=name):
+                self.check(name)
 
     def test_map_failure_fatal_admission_and_stat_failure(self):
         for name in ("map-failure", "fatal-first", "fatal-admission", "stat-error"):

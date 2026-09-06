@@ -16,6 +16,7 @@ HARNESS = r"""
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@ typedef struct request *fuse_req_t;
 struct lo_data { double timeout; };
 struct lo_inode { int fd; dev_t dev; ino_t ino; };
 struct perf_cache_mutation { bool attr_only; bool active; };
+struct perf_inode_generation { _Atomic uint64_t read_cohort_refs; };
 struct perf_cache_snapshot { int token; };
 struct fuse_file_info {
     int flags;
@@ -92,6 +94,21 @@ static bool cache_mutation_begin(struct perf_cache_mutation *mutation)
     mutation->active = true;
     active++;
     return !begin_failure;
+}
+/* Cohort synchronization is exercised by test_read_cohort.py's actual code. */
+static bool cache_read_begin(struct perf_cache_mutation *mutation,
+                              struct perf_inode_generation **cohort)
+{
+    *cohort = NULL;
+    return cache_mutation_begin(mutation);
+}
+static bool cache_read_cohort_last(struct perf_cache_mutation *mutation,
+                                   struct perf_inode_generation *cohort)
+{
+    (void)mutation;
+    (void)cohort;
+    assert(!"unexpected cohort in the transport-ownership fixture");
+    return false;
 }
 static bool cache_mutation_end(struct perf_cache_mutation *mutation)
 {

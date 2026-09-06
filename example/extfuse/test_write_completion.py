@@ -165,7 +165,7 @@ class WriteCompletionTests(unittest.TestCase):
         end = SOURCE.split("static bool cache_mutation_end_capture(", 1)[1]
         end = "static bool cache_mutation_end_capture(" + end.split("static uint64_t timeout_seconds", 1)[0]
         write = SOURCE.split("struct perf_uring_write_context {", 1)[1]
-        write = "struct perf_uring_write_context {" + write.split("struct perf_read_context {", 1)[0]
+        write = "struct perf_uring_write_context {" + write.split("#define PERF_READ_COHORT_BUSY", 1)[0]
         source = root / "completion.c"
         source.write_text(HARNESS.replace("@END@", end).replace("@WRITE@", write))
         cls.binary = root / "completion"

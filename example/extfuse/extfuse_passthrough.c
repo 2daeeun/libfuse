@@ -223,6 +223,8 @@ struct perf_inode_generation {
 	uint64_t xattr_active;
 	struct extfuse_io_state published;
 	bool published_valid;
+	_Atomic uint64_t read_cohort_refs;
+	atomic_bool read_cohort_armed;
 };
 
 struct perf_cache_mutation {
@@ -391,8 +393,8 @@ struct perf_state {
 	size_t xattr_locks_initialized;
 	struct perf_backing *backings;
 	struct perf_tombstone *tombstones[PERF_TOMBSTONE_BUCKETS];
-	struct perf_inode_generation
-		*inode_generations[PERF_INODE_GENERATION_BUCKETS];
+	_Atomic(struct perf_inode_generation *)
+		inode_generations[PERF_INODE_GENERATION_BUCKETS];
 	atomic_bool cache_bypass;
 	atomic_bool xattr_cache_bypass;
 	bool paper_capability_verified_absent;
@@ -1326,8 +1328,11 @@ get_inode_generation_locked(fuse_ino_t ino)
 		return NULL;
 	bucket = inode_generation_bucket(ino);
 	state->ino = ino;
+	atomic_init(&state->read_cohort_refs, 0);
+	atomic_init(&state->read_cohort_armed, false);
 	state->next = perf_state.inode_generations[bucket];
-	perf_state.inode_generations[bucket] = state;
+	atomic_store_explicit(&perf_state.inode_generations[bucket], state,
+			      memory_order_release);
 	return state;
 }
 
@@ -3087,6 +3092,8 @@ static void audit_packed_state_map(int map_index, uint64_t *records,
 
 static void audit_coherence_state(void)
 {
+	struct perf_inode_generation *state;
+	size_t bucket;
 	uint64_t daemon_records = 0;
 	uint64_t daemon_active = 0;
 	uint64_t daemon_errors = 0;
@@ -3098,6 +3105,17 @@ static void audit_coherence_state(void)
 		return;
 	audit_packed_state_map(EXTFUSE_DAEMON_IO_MAP, &daemon_records,
 			       &daemon_active, &daemon_errors);
+	for (bucket = 0; bucket < PERF_INODE_GENERATION_BUCKETS; bucket++) {
+		state = atomic_load_explicit(&perf_state.inode_generations[bucket],
+					     memory_order_acquire);
+		for (; state; state = state->next) {
+			if (atomic_load_explicit(&state->read_cohort_refs,
+						 memory_order_acquire) ||
+			    atomic_load_explicit(&state->read_cohort_armed,
+						 memory_order_acquire))
+				daemon_errors++;
+		}
+	}
 	if (perf_state.passthrough_coherence_v2_requested ||
 	    perf_state.wbcache_passthrough_requested)
 		audit_packed_state_map(EXTFUSE_NATIVE_IO_MAP, &native_records,
@@ -4871,11 +4889,96 @@ static void perf_write_uring_zero_copy(fuse_req_t req, fuse_ino_t ino,
 	perf_write_contract_failed("uring-fixed", "write-submit", result);
 }
 
+/* BUSY excludes joins while the first BEGIN or the last publication runs. */
+#define PERF_READ_COHORT_BUSY UINT64_MAX
+
+static bool cache_read_begin(struct perf_cache_mutation *mutation,
+			    struct perf_inode_generation **cohort)
+{
+	struct perf_inode_generation *state;
+	uint64_t refs;
+
+	*cohort = NULL;
+	if (perf_state.mode != PERF_MODE_HIT || !mutation->attr_only ||
+	    mutation->count != 1 ||
+	    counter_value(&perf_state.counters.cache_bypass_errors))
+		return cache_mutation_begin(mutation);
+	/* next is immutable; these records and their nodeids live until destroy. */
+	state = atomic_load_explicit(&perf_state.inode_generations[
+		inode_generation_bucket(mutation->inodes[0])],
+		memory_order_acquire);
+	while (state && state->ino != mutation->inodes[0])
+		state = state->next;
+	if (!state)
+		return cache_mutation_begin(mutation);
+	refs = atomic_load_explicit(&state->read_cohort_refs, memory_order_acquire);
+	if (refs && refs < PERF_READ_COHORT_BUSY - 1) {
+		if (atomic_compare_exchange_strong_explicit(
+			    &state->read_cohort_refs, &refs, refs + 1,
+			    memory_order_acq_rel, memory_order_acquire)) {
+			*cohort = state;
+			return true;
+		}
+	} else if (!refs && atomic_compare_exchange_strong_explicit(
+			   &state->read_cohort_refs, &refs, PERF_READ_COHORT_BUSY,
+			   memory_order_acq_rel, memory_order_acquire)) {
+		if (!cache_mutation_begin(mutation)) {
+			cache_mutation_end(mutation);
+			atomic_store_explicit(&state->read_cohort_refs, 0,
+					      memory_order_release);
+			return false;
+		}
+		/* The first request may finish before another cohort member. */
+		state->read_cohort_armed = mutation->armed;
+		mutation->armed = false;
+		*cohort = state;
+		atomic_store_explicit(&state->read_cohort_refs, 1,
+				      memory_order_release);
+		return true;
+	}
+	/* A boundary or failed join uses the original path without spinning. */
+	return cache_mutation_begin(mutation);
+}
+
+static bool cache_read_cohort_last(struct perf_cache_mutation *mutation,
+				   struct perf_inode_generation *cohort)
+{
+	uint64_t refs = atomic_load_explicit(&cohort->read_cohort_refs,
+					    memory_order_acquire);
+
+	for (;;) {
+		uint64_t replacement;
+
+		if (!refs || refs == PERF_READ_COHORT_BUSY) {
+			pthread_mutex_t *lock = cache_lock_for_inode(cohort->ino);
+
+			pthread_mutex_lock(lock);
+			counter_increment(
+				&perf_state.counters.passthrough_state_errors);
+			disable_all_caches_locked("read-cohort-state");
+			pthread_mutex_unlock(lock);
+			return false;
+		}
+		replacement = refs == 1 ? PERF_READ_COHORT_BUSY : refs - 1;
+		if (atomic_compare_exchange_weak_explicit(
+			    &cohort->read_cohort_refs, &refs, replacement,
+			    memory_order_acq_rel, memory_order_acquire))
+			break;
+	}
+	if (refs != 1)
+		return false;
+	/* Reconstruct the first member's attr-only guard in the last context. */
+	mutation->armed = cohort->read_cohort_armed;
+	cohort->read_cohort_armed = false;
+	return true;
+}
+
 struct perf_read_context {
 	struct lo_data *lo;
 	struct lo_inode *inode;
 	fuse_ino_t ino;
 	struct perf_cache_mutation mutation;
+	struct perf_inode_generation *cohort;
 	size_t requested;
 };
 
@@ -4885,8 +4988,12 @@ static void perf_read_prepare(void *opaque, ssize_t read_result)
 	struct stat st;
 	double ignored_reply_timeout;
 	struct perf_cache_snapshot snapshot;
+	struct perf_inode_generation *cohort = context->cohort;
 	int saved_errno = errno;
 
+	context->cohort = NULL;
+	if (cohort && !cache_read_cohort_last(&context->mutation, cohort))
+		goto out;
 	/* Even a failed/partial lower read may have changed atime. */
 	(void)read_result;
 	if (cache_mutation_end_with_snapshot(&context->mutation, &snapshot) &&
@@ -4895,6 +5002,10 @@ static void perf_read_prepare(void *opaque, ssize_t read_result)
 					  context->inode->ino, &st))
 		cache_attr(context->ino, &st, context->lo->timeout, &snapshot,
 			   false, &ignored_reply_timeout);
+	if (cohort)
+		atomic_store_explicit(&cohort->read_cohort_refs, 0,
+				      memory_order_release);
+out:
 	/* Cache failure never replaces the lower READ result or its errno. */
 	errno = saved_errno;
 }
@@ -4954,7 +5065,7 @@ static void perf_read_fixed(fuse_req_t req, fuse_ino_t ino, size_t size,
 	context->requested = size;
 	context->mutation.attr_only = true;
 	cache_mutation_add(&context->mutation, ino);
-	if (!cache_mutation_begin(&context->mutation)) {
+	if (!cache_read_begin(&context->mutation, &context->cohort)) {
 		cache_mutation_end(&context->mutation);
 		free(context);
 		fuse_reply_err(req, EIO);
@@ -4998,7 +5109,7 @@ void perf_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	context.lo = lo_data(req);
 	context.inode = lo_inode(req, ino);
 	cache_mutation_add(&context.mutation, ino);
-	if (!cache_mutation_begin(&context.mutation)) {
+	if (!cache_read_begin(&context.mutation, &context.cohort)) {
 		cache_mutation_end(&context.mutation);
 		fuse_reply_err(req, EIO);
 		return;

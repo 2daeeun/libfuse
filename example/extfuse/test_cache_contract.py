@@ -140,6 +140,7 @@ class CacheContractTests(unittest.TestCase):
         self.assertIn(".mutation.attr_only = true", read)
         self.assertNotIn("invalidate_attr(", read)
         self.assertIn("context.inode = lo_inode(req, ino);", read)
+        self.assertIn("cache_read_begin(&context.mutation, &context.cohort)", read)
         self.assertIn("FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK", read)
         self.assertIn("buf.buf[0].fd = fi->fh;", read)
         self.assertIn("buf.buf[0].pos = offset;", read)
@@ -150,6 +151,10 @@ class CacheContractTests(unittest.TestCase):
         prepare = prepare.split("\n}\n", 1)[0]
         self.assertIn("cache_mutation_end_with_snapshot(&context->mutation, &snapshot)",
                       prepare)
+        self.assertLess(prepare.index("cache_read_cohort_last("),
+                        prepare.index("cache_mutation_end_with_snapshot("))
+        self.assertLess(prepare.index("cache_attr("),
+                        prepare.index("atomic_store_explicit(&cohort->read_cohort_refs, 0"))
         self.assertNotIn("cache_snapshot_begin(", prepare)
         self.assertLess(prepare.index("cache_mutation_end_with_snapshot("),
                         prepare.index("extfuse_snapshot_pinned_inode("))

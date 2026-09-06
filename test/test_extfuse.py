@@ -33,6 +33,13 @@ def test_extfuse_write_completion():
     ])
 
 
+def test_extfuse_read_cohort():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'example/extfuse/test_read_cohort.py'),
+    ])
+
+
 def _source_region(path, start, end):
     source = path.read_text(encoding='utf-8')
     begin = source.index(start)
@@ -55,7 +62,7 @@ def test_extfuse_paper_c2_write_contract():
         'static void perf_write_uring_zero_copy')
     submission = _source_region(
         daemon, 'static void perf_write_uring_zero_copy',
-        'struct perf_read_context {')
+        '#define PERF_READ_COHORT_BUSY')
     write_callback = _source_region(
         daemon, '__attribute__((noinline, used))\nvoid perf_write_buf(fuse_req_t req',
         'static void perf_flush')

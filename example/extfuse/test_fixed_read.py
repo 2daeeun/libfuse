@@ -99,13 +99,19 @@ static bool cache_mutation_begin(struct perf_cache_mutation *mutation)
     return !begin_failure;
 }
 /* Cohort synchronization is exercised by test_read_cohort.py's actual code. */
-static bool cache_read_begin(struct perf_cache_mutation *mutation,
+static bool cache_io_begin(struct perf_cache_mutation *mutation,
                               struct perf_inode_generation **cohort)
 {
     *cohort = NULL;
     return cache_mutation_begin(mutation);
 }
-static bool cache_read_cohort_last(struct perf_cache_mutation *mutation,
+static void cache_io_cohort_release(struct perf_inode_generation *cohort, bool attr_only)
+{
+    (void)cohort;
+    (void)attr_only;
+    assert(!"unexpected cohort in the transport-ownership fixture");
+}
+static bool cache_io_cohort_last(struct perf_cache_mutation *mutation,
                                    struct perf_inode_generation *cohort)
 {
     (void)mutation;

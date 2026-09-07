@@ -32,8 +32,49 @@ The hand runner consumes only these libfuse-tree artifacts:
 No file under `fuse_exp/fig9_mo/runtime/` is a build or runtime input for the
 hand runner.
 
-The performance changes in this example are disabled by default and selected
-with strict Boolean environment values (`0` or `1`):
+AllOpt defaults to Linux native FUSE passthrough. It requires passthrough,
+ExtFUSE coherence V2, lazy attribute refresh, and the RELEASE barrier at INIT.
+It disables the upper writeback cache and returns native passthrough OPEN
+flags. READ/WRITE and mmap use the kernel's backing-file path; remaining daemon
+requests use the selected classic or io_uring transport. Native BEGIN/END
+notifications guard the same metadata maps. Native mmap guards survive FUSE
+RELEASE while a mapping or another reference keeps the backing file alive.
+When `FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE` is negotiated, final backing
+file destruction retires its counted guards after lower close, invalidating
+old attribute and xattr tokens first. The log reports
+`NATIVE_MMAP_RELEASE capable=... requested=...`. Older kernels keep persistent
+markers. A lower mmap that substitutes another file also stays guarded
+persistently because its lifetime is no longer the registered backing file's.
+
+Read-only native RELEASE refreshes an idle, stale or missing attribute row
+through the pinned inode after closing the handle. A current row avoids that
+snapshot, and active I/O or a live mmap guard still blocks publication. The
+`passthrough_release_readonly_attr_refreshes` counter records attempts, not
+GETATTR hits. This repairs the stale atime token left after native READ when
+the last backing registration disappears before a subsequent GETATTR.
+
+The paired kernel also lets synchronous buffered overwrites share the upper
+inode lock when the size is unchanged and no privilege removal is needed.
+It rechecks the range and privileges under the lock. Truncation, extension,
+append, direct/async I/O and privilege changes retain exclusive locking;
+the lower filesystem still controls its write serialization. Each I/O keeps
+its own BPF BEGIN/END, lower operation and attribute completion. This targets
+shared-file RW contention without changing the C3/C4 native data path.
+`test_native_overwrite.py` and `test_native_mmap_lifetime.py` compile extracted
+production functions into userspace fixtures. They check locking, lifetime,
+stale-token rejection, conservative failure handling and one count per mmap;
+they do not build Linux or establish performance on a booted kernel.
+
+`EXTFUSE_ALLOPT_DATA_PATH=wbcache` explicitly selects the existing upper-cache
+forwarding alternative; `native` or an unset variable selects native I/O.
+Registration, per-inode open accounting, quarantine, and final deregistration
+are shared by both routes. A registration failure exits the session.
+Existing experiment runners that require WBCache forwarding and write streams
+need an explicit WBCache selection or a separate native configuration and
+activation check. Their current results do not describe the native default.
+
+The following experimental options are disabled by default and selected with
+strict Boolean environment values (`0` or `1`):
 
 - `EXTFUSE_READ_UPCALL_ONLY=1` is retired and rejected. READ always keeps its
   BPF policy handler; callers may leave the variable unset or set it to `0`.
@@ -52,10 +93,10 @@ with strict Boolean environment values (`0` or `1`):
   leaving it unset or `0` preserves the previous copied READ path. The generic
   fixed-I/O open flag is set only for `O_RDONLY` handles, so writable handles
   retain their existing WRITE policy.
-- `EXTFUSE_WBCACHE_WRITE_STREAM=1` is valid only for `allopt`, `paper-like`
-  C3/C4. It negotiates bounded per-open contiguous `FUSE_WRITE_CACHE` dispatch
-  batches, including small writes. Requests retain their individual
-  lower I/O, error handling and completion, and the worker yields after 32
+- `EXTFUSE_WBCACHE_WRITE_STREAM=1` requires `allopt`, `paper-like`, and
+  `EXTFUSE_ALLOPT_DATA_PATH=wbcache`. It negotiates bounded per-open contiguous
+  `FUSE_WRITE_CACHE` dispatch batches, including small writes. Requests retain
+  their individual lower I/O, error handling and completion, and the worker yields after 32
   requests. A gap, overlap or different sync class closes the current batch;
   discontinuous writes use the ordinary parallel worker dispatch. Buffered
   writeback uses one representative open for a shared inode, so arbitrary
@@ -81,10 +122,49 @@ successfully initialized queue logs `FUSE_URING_TASKRUN` with its accepted setup
 flags. Unsupported flags fail initialization instead of silently selecting a
 different mode. The performance effect requires matched runtime measurements.
 
-With the paired protocol-7.48 kernel, the `gate` profile negotiates driver-owned
-ExtFUSE coherence epochs. Native passthrough and strict WBCache passthrough
-bracket lower READ/WRITE with explicit BPF BEGIN/END policy hooks and a matching
-driver-owned epoch. Like the
+Zero-copy single-issuer queues also request `FUSE_URING_WRITE_IN_TASK` by
+default. Set `FUSE_URING_WRITE_IN_TASK=0` to retain io-wq scheduling, or `1` to
+request it explicitly; other values fail initialization. A paired kernel accepts
+this ADD_QUEUE flag only with `FUSE_URING_ZERO_COPY`. Older kernels that reject
+the flag with EINVAL/EOPNOTSUPP are retried once without it during queue setup,
+before any lower I/O. Each created queue logs
+`FUSE_URING_WRITE_IN_TASK qid=... requested=... negotiated=...`; negotiation
+alone does not prove that a lower WRITE used the new path.
+
+The kernel marks only registered source buffers from `FUSE_WRITE_CACHE`
+requests. A fresh buffered `WRITE_FIXED` using such a buffer can run directly
+in its owning `SINGLE_ISSUER | DEFER_TASKRUN` submission task when the regular
+lower file lacks native asynchronous buffered WRITE support. This avoids the
+io-wq enqueue/worker handoff and, for a full synchronous completion, the worker
+completion task-work handoff. The kernel drops the ring mutex around VFS
+permission checks, freeze waits and lower I/O, and reacquires it before handling
+the result. The request retains its file and buffer references throughout;
+single-issuer ownership also prevents another task from reconfiguring the ring.
+Explicit ASYNC, NOWAIT, DIRECT, linked and metadata requests retain their prior
+execution paths, as do READ and ordinary user-registered buffers. Short writes,
+errors and queued lower completions keep the existing result/retry rules.
+
+This is a local transport extension. It retains the lower write, CQE, daemon
+completion callback, metadata guard cleanup and FUSE reply for every request.
+It trades worker parallelism within one queue for fewer scheduling handoffs:
+a slow or throttled lower WRITE blocks that queue's submitting thread and can
+delay other requests and replies. Other queue threads remain independent.
+Disable this mode if the lower filesystem's progress depends on the same
+daemon queue being able to process more requests while the WRITE is pending.
+Use the opt-out for comparison; improvement and the appropriate setting require
+paired measurements on the intended lower filesystem. The optional
+`io_uring:io_uring_write_in_task` trace event records actual lower calls with
+ring/request identity, user data, buffer index, requested bytes and return value.
+A short/error/queued result is not proof of a fully inline completion.
+`test_write_in_task_contract.py` checks source-derived eligibility and ordering
+without compiling. `test_write_in_task.py` extracts actual kernel helpers for
+separate C regression tests; neither source checks nor fixture generation
+establish runtime activation or throughput.
+
+With the paired protocol-7.48 kernel, the WBCache `gate` profile negotiates
+driver-owned ExtFUSE coherence epochs. Native passthrough uses the V2
+generation-map bracket and RELEASE barrier; strict WBCache additionally uses
+driver-owned epochs around lower READ/WRITE. Like the
 archived ExtFUSE example, LOOKUP rows use the parent/name key, GETATTR rows use
 the inode key, and GETXATTR rows use the inode/name key. A positive LOOKUP is
 served only while both its entry row and the child's attribute row are current;
@@ -101,14 +181,23 @@ attribute and xattr rows still carry the two selected-domain tokens; their
 sizes remain 128 and 280 bytes. Mixed old/new daemon and BPF map layouts are
 rejected before INIT.
 
+Pinned lower-inode snapshots use `fstat` on the retained `O_PATH` descriptor,
+with the same device/inode identity check. Symlinks are observed as the pinned
+object and unlinked inodes remain accessible. On current Linux, empty-path
+`fstatat` already resolves to the same fd operation; the direct call removes
+only its empty-path/flags handling. This does not establish a throughput gain
+without repeated measurements. The non-mount `test_read_cache_fd.py` checks
+descriptor identity and error behavior.
+
 Metadata-only (`hit`, C1/C2) mounts serialize generation changes and snapshot
 publication with inode-hashed, cache-line-separated locks, not the backing
 registry lock. Multi-inode mutations acquire distinct stripes in sorted order;
 entry-map invalidation still serializes with entry publication and takes the
 same inode stripe as READ/WRITE. AllOpt retains its backing/coherence locking.
 For overlapping metadata-only I/O, a successfully published active map token
-can cover the active cohort: exact counters/sequences remain in userspace, and
-every transition to/from quiescence in either domain is published. BPF still
+can cover several active guards. Userspace tracks guards and their sequences;
+cohort reference counts separately track the requests sharing each guard.
+Every transition to/from quiescence in either domain is published. BPF still
 rejects active/stale tokens; READ does not advance the XATTR domain. This is a
 local coherence implementation optimization, not removal of the paper's
 metadata map or permission to serve stale metadata. Errors still disable the
@@ -119,8 +208,8 @@ startup. Where the allowed CPUs on the queue's NUMA node admit a distinct-core
 rotation, it avoids pinning workers to the request CPUs' SMT siblings without
 mapping multiple queues onto one CPU. Single-CPU masks, unavailable topology,
 and masks without a suitable rotation retain the previous placement policy.
-This affects C2/C4 daemon transport, not the C3/C4 WBCache data-routing policy.
-WBCache-forwarded I/O does not traverse the daemon ring: enabling that ring
+This affects C2/C4 daemon transport. Neither native nor WBCache-forwarded data
+I/O traverses the daemon ring: enabling that ring
 alone does not guarantee C4 >= C3, or a strict ordering in all workloads.
 
 `python3 -B example/extfuse/test_cache_contract.py` checks state/placement
@@ -152,11 +241,11 @@ Node-wide xattr notification support is negotiated independently as well; both
 optional features require the coherence epochs core bit but do not require one
 another.
 
-The C3/C4 paper-like data path is distinct from native per-open passthrough.
+The explicitly selected WBCache paper-like path differs from native passthrough.
 It keeps the upper FUSE writeback cache and invokes the ExtFUSE READ/WRITE BPF
 policy for every page-backed request.  A PASSTHRU decision then uses the
 kernel's registered backing file and credential to execute lower VFS I/O;
-`FUSE_CAP_PASSTHROUGH` remains disabled for this mode.  Paper-like C3/C4
+`FUSE_CAP_PASSTHROUGH` remains disabled for this mode. WBCache paper-like mounts
 negotiate WBCache passthrough and writeback cache without coherence epochs,
 mutation trailers, or xattr notification. The separately negotiated
 `EXTFUSE_PAPER_READ_GUARD` brackets lower READ with attr-only private BEGIN/END
@@ -195,22 +284,63 @@ their existing epoch or tombstone safeguards.
 By default paper-like C2 keeps logical READ/WRITE callbacks in the daemon and
 uses the ordinary io_uring payload path. `EXTFUSE_C2_FIXED_WRITE=1` changes only
 WRITE: the request's registered pages are submitted directly to the lower fd.
-The async context owns the mutation token and pinned lower identity until the
-completion. It closes the mutation, performs any capability-policy revoke
-recovery, and lets only a quiescent completion publish pinned-inode attributes
-before replying. No pthread mutex is held from submission to completion, and a
+The async context owns its cohort membership and pinned lower identity until
+completion. The last member closes the mutation, performs any capability-policy
+revoke recovery, and publishes pinned-inode attributes if the inode is quiescent.
+Earlier members reply while the shared guard still makes cached metadata
+ineligible. No pthread mutex is held from submission to completion, and a
 submission or I/O failure is reported without a copied replay. READ never opts
 in to the write-only open flag.
 
-Quiescent C2 fixed-WRITE completions capture the ATTR snapshot token while
+Paper-fast C1/C2 share WRITE BEGIN, completion, and error handling. Quiescent
+completions capture the ATTR snapshot token while
 ending the mutation, then reuse it for pinned-inode publication. This removes
 one repeated inode-stripe lock acquisition per quiescent completion. The lower
 snapshot stays outside the lock; capability revocation/refill and token
 revalidation still precede the reply. Failed token retrieval remains a
 publication error, while a captured active token remains an unstable snapshot.
-Submission failures use the same completion ordering. The C1 synchronous WRITE
-path is unchanged. `python3 -B example/extfuse/test_write_completion.py` tests
-the actual helpers without mounting; throughput improvement is unmeasured.
+Submission failures use the same completion ordering. Failed lower writes also
+refresh the last stable snapshot because an error may follow partial changes.
+`test_write_completion.py` and `test_sync_write_completion.py` compile and run
+the actual helpers without mounting; source inspection does not run these tests
+or establish throughput improvement.
+
+Overlapping paper-fast WRITEs to the same inode now share one attr/xattr guard
+in `hit` mode, using the bounded atomic admission already used by READ. Only the
+first member acquires the BEGIN stripe, and only the last completes the guard
+and attempts publication. Busy boundaries and exhausted retries retain ordinary
+locked admission. Each lower I/O, byte count, error and reply stays independent;
+neither READ nor WRITE requests are merged. READ and WRITE cohorts are separate,
+so the last WRITE can refill revoked capability xattr while READ remains active.
+The first context may be freed before the last member completes. Teardown audits
+both cohort kinds. `test_read_cohort.py` compiles actual shared helpers and WRITE
+completion for overlapping, failed and racing requests. The source/model-only
+`test_cache_contract.py` also compares cache validity over 40,320 mixed
+READ/WRITE/fallback schedules; this is not a kernel concurrency test.
+
+The paired kernel avoids a separate retained FUSE bvec allocation for fixed
+READ and WRITE. Up to 32 folio descriptors (128 KiB with 4 KiB folios) use stack
+scratch; larger descriptor arrays use temporary heap scratch. The registered
+io_uring copy takes folio references
+before publication and releases them after its final user, even if the sparse
+slot or original request has already gone away. All descriptor, cropped-tail,
+direction and slot checks remain. The existing custom-release API and ublk
+registration are unchanged. `test_fixed_buffer_lifetime.py` compiles the paired
+kernel helpers against allocation/ownership fixtures; set `EXTFUSE_KERNEL_SOURCE`
+if the Linux tree is not a sibling of libfuse. Its C tests are a separate step
+from source inspection.
+
+These changes target per-request costs across request sizes and worker counts;
+they do not depend on a fio workload name. Small fixed I/O avoids an allocation,
+and overlapping writes can avoid repeated inode-stripe acquisitions. Fixed READ
+benefits only when `EXTFUSE_FIXED_READ=1` is selected. Copied READ retains its
+existing direct lower-fd-to-ring-payload copy and atime guards. Native/WBCache
+attribute refresh rejects ineligible tokens before acquiring backing references.
+No throughput ranking is established by these source changes. WRITEs outside
+the negotiated write-in-task path, and retries, may still require io-wq; lower
+inode serialization remains in every mode. Paired runtime
+measurements of RW/RR/SR and SW remain necessary; preserve foreground IOPS for
+the former and completion IOPS for SW, and distinguish native from WBCache runs.
 
 The independent `EXTFUSE_FIXED_READ=1` option submits the READ request's
 registered destination pages to the lower fd with the existing fixed-buffer
@@ -277,11 +407,11 @@ such a skip is not splice coverage. Source/model checks do not execute these
 C tests or verify the BPF program with the running kernel.
 
 Xattr payloads through 256 bytes are eligible for coherence epochs caching.
-Larger values, malformed state, persistent writable-mmap markers, and token
-mismatches always use the daemon path. Native mappings install their marker at
+Larger values, malformed state, live or persistent mmap guards, and token
+mismatches always use the daemon path. Native mappings install their guard at
 mmap time; ordinary cached shared mappings install it only on the first write
 fault, so read-only cached compilation mappings do not suppress GETATTR hits.
-A marked inode also receives zero attribute TTL in daemon and mutation-trailer
+A guarded inode also receives zero attribute TTL in daemon and mutation-trailer
 replies so later page-fault metadata cannot hide behind the upper VFS cache.
 Kernels without coherence epochs retain the existing V1/V2 maps and manual
 generation protocol.
@@ -297,5 +427,6 @@ Fixed-I/O queues process a bounded snapshot of already-ready lower completions
 before new request callbacks. This closes completed mutations before a GETATTR
 in the same batch observes them. CQE kinds are snapshotted before callbacks can
 reuse entries; new arrivals remain for the next batch. The copied transport
-keeps its original order. This removes a scheduling window, not all causes of
-metadata cache fallback or the lower buffered WRITE's io-wq cost.
+keeps its original order. This closes one metadata-publication scheduling
+window. The negotiated write-in-task path described above separately addresses
+io-wq handoffs for eligible lower WRITEs.

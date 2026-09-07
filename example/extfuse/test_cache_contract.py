@@ -121,6 +121,57 @@ class CacheContractTests(unittest.TestCase):
         self.assertIn("snapshot->xattr", DAEMON)
         self.assertNotIn("PAPER_READ_ATIME_CACHE", DAEMON + BPF)
 
+    def test_shared_guards_preserve_hits_with_independent_fallbacks(self):
+        # Compare per-I/O guards with shared READ/WRITE guards. Numerical
+        # generations may differ; every row captured at the same instant must
+        # still have the same validity after every possible later completion.
+        checked = 0
+        for order in itertools.permutations(range(8)):
+            if any(order.index(i) > order.index(i + 1)
+                   for i in range(0, 8, 2)):
+                continue
+            for joined in range(16):
+                reference = shared = (0, 0)
+                refs = [0, 0]
+                seen = [{(0, 0)}, {(0, 0)}]
+                for event in order:
+                    begin = event % 2 == 0
+                    write = event >= 4
+                    reference = domain_transition(reference, begin, write)
+                    if joined & (1 << (event // 2)):
+                        refs[write] += 1 if begin else -1
+                        boundary = refs[write] == (1 if begin else 0)
+                    else:
+                        boundary = True  # BUSY/retry exhaustion uses a guard.
+                    if boundary:
+                        shared = domain_transition(shared, begin, write)
+                    for domain in (0, 1):
+                        seen[domain].add((reference[domain], shared[domain]))
+                        for old_reference, old_shared in seen[domain]:
+                            self.assertEqual(
+                                current(reference, old_reference, domain),
+                                current(shared, old_shared, domain))
+                self.assertEqual(refs, [0, 0])
+                self.assertFalse((shared[0] | shared[1]) & ACTIVE_MASK)
+                checked += 1
+        self.assertEqual(checked, 2520 * 16)
+
+    def test_write_cohort_transfers_end_before_publication_and_reply(self):
+        completion = DAEMON.split("static void perf_write_complete(", 1)[1]
+        completion = completion.split("static bool perf_write_begin(", 1)[0]
+        self.assertIn("quiescent = last && cache_mutation_end_capture(", completion)
+        self.assertLess(completion.index("cache_io_cohort_last("),
+                        completion.index("cache_mutation_end_capture("))
+        self.assertLess(completion.index("publish_pinned_write_attr("),
+                        completion.index("cache_io_cohort_release(cohort, false)"))
+        self.assertLess(completion.index("cache_io_cohort_release(cohort, false)"),
+                        completion.index("fuse_reply_write("))
+        audit = DAEMON.split("static void audit_coherence_state(", 1)[1]
+        audit = audit.split("static void print_counters(", 1)[0]
+        for kind in ("read", "write"):
+            for field in ("refs", "armed"):
+                self.assertIn(f"&state->{kind}_cohort_{field}", audit)
+
     def test_write_xattr_refill_does_not_wait_for_read(self):
         state = domain_transition((0, 0), True)  # READ still in progress.
         state = domain_transition(state, True, True)
@@ -129,8 +180,9 @@ class CacheContractTests(unittest.TestCase):
         self.assertTrue(current(state, state[1], 1))
         self.assertEqual(DAEMON.count(
             "if (context->mutation.xattr_quiescent &&"
-        ), 2)
-        self.assertIn("result >= 0 && mutation.xattr_quiescent &&", DAEMON)
+        ), 1)
+        self.assertIn('perf_write_complete(req, result, &context, "sync")', DAEMON)
+        self.assertIn('perf_write_complete(req, result, context, "uring-fixed")', DAEMON)
         self.assertIn("mutation->xattr_quiescent = xattr_quiescent && "
                       "!invalid_state &&", DAEMON)
 
@@ -140,7 +192,7 @@ class CacheContractTests(unittest.TestCase):
         self.assertIn(".mutation.attr_only = true", read)
         self.assertNotIn("invalidate_attr(", read)
         self.assertIn("context.inode = lo_inode(req, ino);", read)
-        self.assertIn("cache_read_begin(&context.mutation, &context.cohort)", read)
+        self.assertIn("cache_io_begin(&context.mutation, &context.cohort)", read)
         self.assertIn("FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK", read)
         self.assertIn("buf.buf[0].fd = fi->fh;", read)
         self.assertIn("buf.buf[0].pos = offset;", read)
@@ -151,10 +203,10 @@ class CacheContractTests(unittest.TestCase):
         prepare = prepare.split("\n}\n", 1)[0]
         self.assertIn("cache_mutation_end_with_snapshot(&context->mutation, &snapshot)",
                       prepare)
-        self.assertLess(prepare.index("cache_read_cohort_last("),
+        self.assertLess(prepare.index("cache_io_cohort_last("),
                         prepare.index("cache_mutation_end_with_snapshot("))
         self.assertLess(prepare.index("cache_attr("),
-                        prepare.index("atomic_store_explicit(&cohort->read_cohort_refs, 0"))
+                        prepare.index("cache_io_cohort_release(cohort, true)"))
         self.assertNotIn("cache_snapshot_begin(", prepare)
         prefetch, fallback = prepare.split(
             "/* A concurrent mutation retains the original post-END snapshot path. */", 1)

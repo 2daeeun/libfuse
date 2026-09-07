@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
+import os
 import subprocess
 import sys
 from os.path import join as pjoin
 from pathlib import Path
+
+import pytest
 
 from util import basename
 
@@ -54,6 +57,20 @@ def test_extfuse_fixed_read():
     ])
 
 
+def test_extfuse_pinned_inode_snapshot():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'example/extfuse/test_read_cache_fd.py'),
+    ])
+
+
+def test_extfuse_readonly_release():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'example/extfuse/test_readonly_release.py'),
+    ])
+
+
 def test_extfuse_write_completion():
     root = Path(__file__).resolve().parents[1]
     subprocess.check_call([
@@ -75,6 +92,35 @@ def test_extfuse_read_cohort():
     ])
 
 
+def _run_kernel_source_test(script):
+    root = Path(__file__).resolve().parents[1]
+    if 'EXTFUSE_KERNEL_SOURCE' not in os.environ and not (root.parent / 'linux/io_uring/rw.c').is_file():
+        pytest.skip('paired Linux sources unavailable; set EXTFUSE_KERNEL_SOURCE')
+    subprocess.check_call([
+        sys.executable, str(root / 'example/extfuse' / script),
+    ])
+
+
+def test_extfuse_fixed_buffer_lifetime():
+    _run_kernel_source_test('test_fixed_buffer_lifetime.py')
+
+
+def test_extfuse_native_overwrite():
+    _run_kernel_source_test('test_native_overwrite.py')
+
+
+def test_extfuse_native_mmap_lifetime():
+    _run_kernel_source_test('test_native_mmap_lifetime.py')
+
+
+def test_extfuse_write_in_task():
+    _run_kernel_source_test('test_write_in_task.py')
+
+
+def test_extfuse_write_in_task_source_contract():
+    _run_kernel_source_test('test_write_in_task_contract.py')
+
+
 def _source_region(path, start, end):
     source = path.read_text(encoding='utf-8')
     begin = source.index(start)
@@ -93,11 +139,14 @@ def test_extfuse_paper_c2_write_contract():
     daemon_source = daemon.read_text(encoding='utf-8')
     uring_source = uring.read_text(encoding='utf-8')
     completion = _source_region(
-        daemon, 'static void perf_uring_write_complete',
-        'static void perf_write_uring_zero_copy')
+        daemon, 'static void perf_write_complete', 'static bool perf_write_begin')
+    begin = _source_region(
+        daemon, 'static bool perf_write_begin', 'static void perf_uring_write_complete')
+    fixed_completion = _source_region(
+        daemon, 'static void perf_uring_write_complete', 'static void perf_write_uring_zero_copy')
     submission = _source_region(
         daemon, 'static void perf_write_uring_zero_copy',
-        '#define PERF_READ_COHORT_BUSY')
+        '#define PERF_IO_COHORT_BUSY')
     write_callback = _source_region(
         daemon, '__attribute__((noinline, used))\nvoid perf_write_buf(fuse_req_t req',
         'static void perf_flush')
@@ -126,34 +175,34 @@ def test_extfuse_paper_c2_write_contract():
     assert 'fuse_uring_submit_fixed_io' in submission
     assert 'lo_do_write_buf' not in submission
     assert 'pthread_mutex_lock' not in submission
-    assert 'context->capability_fast = paper_write_fast_active();' in submission
-    assert 'cache_mutation_begin' in submission
-    assert submission.index('cache_mutation_begin') < submission.index(
+    assert '.capability_fast = paper_write_fast_active(),' in begin
+    assert 'cache_io_begin' in begin
+    assert submission.index('perf_write_begin') < submission.index(
         'fuse_uring_submit_fixed_io')
     assert completion.index('cache_mutation_end') < completion.index(
         'publish_pinned_write_attr')
     assert completion.index('publish_pinned_write_attr') < completion.index(
         'fuse_reply_write')
     assert 'attr_outcome != PERF_CACHE_ATTR_UNSTABLE' in completion
-    assert 'attr_outcome != PERF_CACHE_ATTR_UNSTABLE' in submission
+    assert completion.count('cache_mutation_end_capture(') == 1
+    assert 'perf_uring_write_complete(req, result, context);' in submission
+    assert 'cache_mutation_end_capture(' not in submission
+    assert 'perf_write_complete(req, result, context, "uring-fixed");' in fixed_completion
     assert 'lo_do_write_buf(req, ino, buffer, offset, fi);' in write_callback
-    assert 'attr_outcome = cache_attr(' in write_callback
-    assert 'attr_outcome == PERF_CACHE_ATTR_PUBLISHED' in write_callback
-    assert 'if (!capability_fast) {' in write_callback
+    assert 'perf_write_complete(req, result, &context, "sync");' in write_callback
+    assert '.writeback = fi->writepage,' in begin
+    assert 'context->writeback && (size_t)result != context->requested' in completion
     conditional_invalidation = write_callback.index('invalidate_attr(ino);')
-    fast_branch = write_callback.index('if (!capability_fast) {')
+    fast_branch = write_callback.index('if (perf_state.paper_write_fast) {')
     lower_write = write_callback.index(
         'lo_do_write_buf(req, ino, buffer, offset, fi);')
-    assert fast_branch < conditional_invalidation < lower_write
-    assert 'publish_attr = !capability_fast || quiescent;' in write_callback
-    assert 'have_attr = !capability_fast ||' in write_callback
-    assert 'attr_outcome == PERF_CACHE_ATTR_PUBLISHED;' in write_callback
-    sync_reply = write_callback.index(
+    common_completion = write_callback.index('perf_write_complete(req, result, &context')
+    assert fast_branch < lower_write < common_completion < conditional_invalidation
+    assert 'attr_outcome == PERF_CACHE_ATTR_PUBLISHED;' in completion
+    sync_reply = completion.index(
         'reply_result = fuse_reply_write(req, (size_t)result);')
-    sync_attr_failure = write_callback.index(
-        '"sync", "write-attr-publication", EIO')
+    sync_attr_failure = completion.index('path, "write-attr-publication", EIO')
     assert sync_reply < sync_attr_failure
-    assert 'attr_outcome != PERF_CACHE_ATTR_UNSTABLE' in write_callback
 
     # Keep the legacy aggregate while exposing directional fallbacks.  WRITE
     # must be zero for the fixed-WRITE qualification; copied READs remain
@@ -203,7 +252,7 @@ def test_extfuse_paper_c2_write_contract():
         assert daemon_source.count(f'{key}=%u') == 1
 
     # Paper C1/C2 skip the positive capability lookup only under the explicit
-    # policy bit. C3/C4 retain their existing WBCache invalidation contract.
+    # policy bit. Optional WBCache retains its existing invalidation contract.
     assert write_hook.count('invalidate_positive_capability(ctx)') == 2
     legacy_invalidation = write_hook.rfind(
         'invalidate_positive_capability(ctx)')

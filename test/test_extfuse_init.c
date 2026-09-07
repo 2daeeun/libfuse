@@ -97,12 +97,19 @@ _Static_assert(offsetof(struct fuse_init_out, extfuse_prog_fd) == 44,
 _Static_assert(offsetof(struct fuse_init_out, unused) == 48,
 	       "fuse_init_out reserved tail offset changed");
 
+_Static_assert(FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE == (1ULL << 49),
+	       "unexpected mmap release capability bit");
+_Static_assert(FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE == (1ULL << 58),
+	       "unexpected mmap release wire bit");
+
 enum test_mode {
 	MODE_NOT_WANTED,
 	MODE_WANTED,
 	MODE_WANTED_COHERENCE,
 	MODE_WANTED_COHERENCE_V2,
 	MODE_WANTED_ATTR_REFRESH,
+	MODE_WANTED_MMAP_RELEASE,
+	MODE_FORCE_MMAP_RELEASE_WANT,
 	MODE_WANTED_ATTR_RELEASE_BARRIER,
 	MODE_WANTED_WBCACHE_PASSTHROUGH,
 	MODE_WANTED_WBCACHE_ATTR_REFRESH,
@@ -121,6 +128,8 @@ struct test_state {
 	bool saw_coherence_capability;
 	bool saw_coherence_v2_capability;
 	bool saw_attr_refresh_capability;
+	bool saw_mmap_release_capability;
+	bool mmap_release_helper_enabled;
 	bool saw_attr_release_barrier_capability;
 	bool saw_read_upcall_only_capability;
 	bool saw_wbcache_write_stream_capability;
@@ -151,6 +160,8 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE);
 	state->saw_coherence_v2_capability = fuse_get_feature_flag(
 		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2);
+	state->saw_mmap_release_capability = fuse_get_feature_flag(
+		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE);
 	state->saw_attr_refresh_capability = fuse_get_feature_flag(
 		conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH);
 	state->saw_attr_release_barrier_capability = fuse_get_feature_flag(
@@ -203,12 +214,14 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 	} else if (state->mode == MODE_WANTED ||
 	    state->mode == MODE_WANTED_COHERENCE ||
 	    state->mode == MODE_WANTED_COHERENCE_V2 ||
+	    state->mode == MODE_WANTED_MMAP_RELEASE ||
 	    state->mode == MODE_WANTED_ATTR_REFRESH ||
 	    state->mode == MODE_WANTED_ATTR_RELEASE_BARRIER) {
 		state->helper_enabled =
 			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE);
 		if (state->mode == MODE_WANTED_COHERENCE ||
 		    state->mode == MODE_WANTED_COHERENCE_V2 ||
+		    state->mode == MODE_WANTED_MMAP_RELEASE ||
 		    state->mode == MODE_WANTED_ATTR_REFRESH ||
 		    state->mode == MODE_WANTED_ATTR_RELEASE_BARRIER) {
 			state->passthrough_helper_enabled = fuse_set_feature_flag(
@@ -218,22 +231,29 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE);
 		}
 		if (state->mode == MODE_WANTED_COHERENCE_V2 ||
+		    state->mode == MODE_WANTED_MMAP_RELEASE ||
 		    state->mode == MODE_WANTED_ATTR_REFRESH ||
 		    state->mode == MODE_WANTED_ATTR_RELEASE_BARRIER)
 			state->coherence_v2_helper_enabled = fuse_set_feature_flag(
 				conn,
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2);
-		if (state->mode == MODE_WANTED_ATTR_REFRESH ||
+		if (state->mode == MODE_WANTED_MMAP_RELEASE ||
+		    state->mode == MODE_WANTED_ATTR_REFRESH ||
 		    state->mode == MODE_WANTED_ATTR_RELEASE_BARRIER)
 			state->attr_refresh_helper_enabled = fuse_set_feature_flag(
 				conn,
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH);
+		if (state->mode == MODE_WANTED_MMAP_RELEASE)
+			state->mmap_release_helper_enabled = fuse_set_feature_flag(
+				conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE);
 		if (state->mode == MODE_WANTED_ATTR_RELEASE_BARRIER)
 			state->attr_release_barrier_helper_enabled =
 				fuse_set_feature_flag(
 					conn,
 					FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
 		conn->extfuse_prog_fd = TEST_PROG_FD;
+	} else if (state->mode == MODE_FORCE_MMAP_RELEASE_WANT) {
+		conn->want_ext |= FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE;
 	} else if (state->mode == MODE_FORCE_INVALID_WANT) {
 		conn->want_ext |= FUSE_CAP_EXTFUSE;
 		conn->extfuse_prog_fd = TEST_PROG_FD;
@@ -457,6 +477,14 @@ static int run_case_flags(bool advertise, bool advertise_uring,
 			name);
 		goto out_session;
 	}
+	if (state.saw_mmap_release_capability !=
+	    !!(additional_flags & FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE) ||
+	    !!(reply_flags & FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE) !=
+	    (mode == MODE_WANTED_MMAP_RELEASE &&
+	     state.mmap_release_helper_enabled)) {
+		fprintf(stderr, "%s: mmap release capability mapping mismatch\n", name);
+		goto out_session;
+	}
 	if (reply_flags & FUSE_OVER_IO_URING) {
 		fprintf(stderr, "%s: io_uring enabled without mount option\n",
 			name);
@@ -464,6 +492,7 @@ static int run_case_flags(bool advertise, bool advertise_uring,
 	}
 	if ((mode == MODE_WANTED || mode == MODE_WANTED_COHERENCE ||
 	     mode == MODE_WANTED_COHERENCE_V2 ||
+	     mode == MODE_WANTED_MMAP_RELEASE ||
 	     mode == MODE_WANTED_ATTR_REFRESH ||
 	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER ||
 	     mode == MODE_WANTED_WBCACHE_PASSTHROUGH ||
@@ -485,6 +514,7 @@ static int run_case_flags(bool advertise, bool advertise_uring,
 	}
 	if ((mode == MODE_WANTED_COHERENCE ||
 	     mode == MODE_WANTED_COHERENCE_V2 ||
+	     mode == MODE_WANTED_MMAP_RELEASE ||
 	     mode == MODE_WANTED_ATTR_REFRESH ||
 	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER) &&
 	    advertise_coherence) {
@@ -501,6 +531,7 @@ static int run_case_flags(bool advertise, bool advertise_uring,
 		goto out_session;
 	}
 	if ((mode == MODE_WANTED_COHERENCE_V2 ||
+	     mode == MODE_WANTED_MMAP_RELEASE ||
 	     mode == MODE_WANTED_ATTR_REFRESH ||
 	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER) &&
 	    advertise_coherence_v2) {
@@ -516,7 +547,8 @@ static int run_case_flags(bool advertise, bool advertise_uring,
 			"%s: coherence-v2 was enabled without opt-in\n", name);
 		goto out_session;
 	}
-	if ((mode == MODE_WANTED_ATTR_REFRESH ||
+	if ((mode == MODE_WANTED_MMAP_RELEASE ||
+	     mode == MODE_WANTED_ATTR_REFRESH ||
 	     mode == MODE_WANTED_ATTR_RELEASE_BARRIER ||
 	     mode == MODE_WANTED_WBCACHE_ATTR_REFRESH) &&
 	    advertise_attr_refresh) {
@@ -716,6 +748,24 @@ int main(void)
 	failed |= run_case(false, false, false, false, false, false,
 			   MODE_FORCE_INVALID_WANT, true,
 			   "not-advertised-forced-want");
+
+	failed |= run_case_flags(true, false, true, true, true, false,
+		FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE, MODE_NOT_WANTED, false,
+		"mmap-release-advertised-not-wanted");
+	failed |= run_case_flags(true, false, true, true, true, false,
+		FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE, MODE_WANTED_MMAP_RELEASE,
+		false, "mmap-release-advertised-wanted");
+	failed |= run_case_flags(true, false, true, true, true, false,
+		0, MODE_WANTED_MMAP_RELEASE, false, "mmap-release-old-kernel");
+	failed |= run_case_flags(true, false, true, false, true, false,
+		FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE, MODE_WANTED_MMAP_RELEASE,
+		true, "mmap-release-without-v2-rejected");
+	failed |= run_case_flags(true, false, true, true, false, false,
+		FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE, MODE_WANTED_MMAP_RELEASE,
+		true, "mmap-release-without-attr-refresh-rejected");
+	failed |= run_case_flags(true, false, true, true, true, false,
+		0, MODE_FORCE_MMAP_RELEASE_WANT, true,
+		"mmap-release-forced-unadvertised-want-rejected");
 
 	return failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }

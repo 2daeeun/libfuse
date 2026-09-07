@@ -82,6 +82,7 @@ struct fuse_ring_queue {
 	void *payload_pool;
 	size_t payload_pool_sz;
 	bool sparse_buffers_registered;
+	bool write_in_task;
 	uint64_t fixed_read_submitted;
 	uint64_t fixed_read_completed;
 	uint64_t fixed_read_errors;
@@ -107,6 +108,7 @@ struct fuse_ring_pool {
 	/* mirror of se->conn.io_uring_single_issuer, fixed at ring creation */
 	bool single_issuer;
 	bool zero_copy;
+	bool write_in_task;
 
 	/* number of queues */
 	size_t nr_queues;
@@ -794,6 +796,8 @@ static int fuse_uring_submit_control(struct fuse_ring_queue *queue,
 	switch (command) {
 	case FUSE_IO_URING_CMD_ADD_QUEUE:
 		cmd->flags = FUSE_URING_ZERO_COPY;
+		if (queue->write_in_task)
+			cmd->flags |= FUSE_URING_WRITE_IN_TASK;
 		break;
 	case FUSE_IO_URING_CMD_ADD_BUFPOOL:
 		cmd->bufpool.uaddr = (uintptr_t)queue->payload_pool;
@@ -827,13 +831,22 @@ static int fuse_uring_setup_zero_copy_queue(struct fuse_ring_queue *queue)
 	if (!queue->sparse_buffers_registered || !queue->payload_pool ||
 	    !queue->payload_pool_sz)
 		return -EINVAL;
+	queue->write_in_task = queue->ring_pool->write_in_task;
 	res = fuse_uring_submit_control(queue, FUSE_IO_URING_CMD_ADD_QUEUE);
+	if (queue->write_in_task && (res == -EINVAL || res == -EOPNOTSUPP)) {
+		/* Older paired kernels reject the new flag before creating a queue. */
+		queue->write_in_task = false;
+		res = fuse_uring_submit_control(queue, FUSE_IO_URING_CMD_ADD_QUEUE);
+	}
 	if (res) {
 		fuse_log(FUSE_LOG_ERR,
 			 "qid=%d FUSE_IO_URING_CMD_ADD_QUEUE failed: %s\n",
 			 queue->qid, strerror(-res));
 		return res;
 	}
+	fuse_log(FUSE_LOG_INFO,
+		 "FUSE_URING_WRITE_IN_TASK qid=%d requested=%u negotiated=%u\n",
+		 queue->qid, queue->ring_pool->write_in_task, queue->write_in_task);
 	res = fuse_uring_submit_control(queue, FUSE_IO_URING_CMD_ADD_BUFPOOL);
 	if (res) {
 		fuse_log(FUSE_LOG_ERR,
@@ -997,10 +1010,16 @@ static int *fuse_uring_read_cpu_core_ids(size_t nr_cpus)
 static struct fuse_ring_pool *fuse_create_ring(struct fuse_session *se)
 {
 	struct fuse_ring_pool *fuse_ring = NULL;
+	const char *write_in_task = getenv("FUSE_URING_WRITE_IN_TASK");
 	const size_t nr_queues = get_nprocs_conf();
 	size_t payload_sz = se->bufsize - FUSE_BUFFER_HEADER_SIZE;
 	size_t queue_sz;
 
+	if (write_in_task && strcmp(write_in_task, "0") &&
+	    strcmp(write_in_task, "1")) {
+		fuse_log(FUSE_LOG_ERR, "FUSE_URING_WRITE_IN_TASK must be 0 or 1\n");
+		return NULL;
+	}
 	if (se->debug)
 		fuse_log(FUSE_LOG_DEBUG, "starting io-uring q-depth=%d\n",
 			 se->uring.q_depth);
@@ -1027,6 +1046,8 @@ static struct fuse_ring_pool *fuse_create_ring(struct fuse_session *se)
 	fuse_ring->single_issuer = se->conn.io_uring_single_issuer;
 	fuse_ring->zero_copy =
 		(se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL) != 0;
+	fuse_ring->write_in_task = fuse_ring->zero_copy && fuse_ring->single_issuer &&
+		(!write_in_task || !strcmp(write_in_task, "1"));
 
 	/*
 	 * very basic queue initialization, that cannot fail and will

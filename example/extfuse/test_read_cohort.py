@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the production READ cohort and generation functions with pthreads.
+"""Run the production READ/WRITE cohort and completion functions with pthreads.
 
 Only BPF-map, pinned-stat and reply boundaries are mocked. No mount or daemon
 artifact is built. EXTFUSE_READ_COHORT_SOURCE can select an isolated candidate.
@@ -51,9 +51,16 @@ HARNESS = r"""
 #define EXTFUSE_NATIVE_STATE_SEQUENCE_MAX (UINT64_MAX >> 8)
 #define EXTFUSE_DAEMON_IO_MAP 1
 #define EXTFUSE_NATIVE_IO_MAP 2
-#define PERF_READ_COHORT_BUSY UINT64_MAX
-#define PERF_READ_COHORT_JOIN_ATTEMPTS 4
+#define PERF_CAPABILITY_XATTR "security.capability"
+#define PERF_IO_COHORT_BUSY UINT64_MAX
+#define PERF_IO_COHORT_JOIN_ATTEMPTS 4
 typedef uint64_t fuse_ino_t;
+struct request { unsigned replies; int error; size_t size; };
+typedef struct request *fuse_req_t;
+struct fuse_file_info { bool writepage; };
+enum perf_cache_attr_outcome { PERF_CACHE_ATTR_DISABLED, PERF_CACHE_ATTR_PUBLISHED,
+ PERF_CACHE_ATTR_UNSTABLE, PERF_CACHE_ATTR_SUPPRESSED, PERF_CACHE_ATTR_MISSING,
+ PERF_CACHE_ATTR_ERROR };
 struct extfuse_io_state { uint64_t attr_state, xattr_state; };
 @STRUCTS@
 struct perf_cache_lockset { int unused; };
@@ -61,6 +68,7 @@ struct lo_data { double timeout; };
 struct lo_inode { int fd; dev_t dev; ino_t ino; };
 static struct {
  int mode;
+ void *session;
  atomic_bool cache_bypass, xattr_cache_bypass;
  bool passthrough_coherence_v2_requested, wbcache_passthrough_requested;
  _Atomic(struct perf_inode_generation *) inode_generations[2];
@@ -72,8 +80,12 @@ static struct {
  } counters;
 } perf_state = { .mode = PERF_MODE_HIT };
 static pthread_mutex_t stripe = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t xstripe = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local bool held;
+static _Thread_local bool xheld;
 static atomic_uint locks, attempts, map_updates, attrs, stats, lower_done;
+static atomic_uint refills, exits;
+static bool revoke;
 static atomic_uint hold_begin, begin_entered, hold_stat, stat_entered;
 static atomic_bool allow_begin, allow_stat, fail_map, fatal_map, fail_stat;
 static atomic_bool fail_attr;
@@ -82,10 +94,16 @@ static atomic_uint_fast64_t map_attr, map_xattr, attr_token, attr_atime;
 static struct lo_data lo = { 1.0 };
 static struct lo_inode inode = { 77, 3, 19 };
 static void test_lock(pthread_mutex_t *lock)
-{ assert(lock == &stripe && !held); atomic_fetch_add(&attempts, 1);
+{ if (lock == &xstripe) {
+   assert(!held && !xheld); pthread_mutex_lock(lock); xheld = true; return;
+  }
+  assert(lock == &stripe && !held); atomic_fetch_add(&attempts, 1);
   pthread_mutex_lock(lock); held = true; atomic_fetch_add(&locks, 1); }
 static void test_unlock(pthread_mutex_t *lock)
-{ assert(lock == &stripe && held); held = false; pthread_mutex_unlock(lock); }
+{ if (lock == &xstripe) {
+   assert(xheld); xheld = false; pthread_mutex_unlock(lock); return;
+  }
+  assert(lock == &stripe && held); held = false; pthread_mutex_unlock(lock); }
 #define pthread_mutex_lock test_lock
 #define pthread_mutex_unlock test_unlock
 static pthread_mutex_t *cache_lock_for_inode(fuse_ino_t ino)
@@ -125,11 +143,11 @@ static bool native_state_snapshot_locked(fuse_ino_t ino, uint64_t *value,
  const char *why, bool xattr)
 { (void)ino; (void)why; (void)xattr; assert(held); *value = 0; return true; }
 @MUTATION@
-static unsigned cas_failures, cas_calls;
+static atomic_uint cas_failures, cas_calls;
 static bool compare_join(_Atomic uint64_t *object, uint64_t *expected,
                          uint64_t desired, memory_order success, memory_order failure)
 {
- if (*expected && *expected < PERF_READ_COHORT_BUSY - 1) {
+ if (*expected && *expected < PERF_IO_COHORT_BUSY - 1) {
   cas_calls++;
   if (cas_failures) {
    cas_failures--;
@@ -173,20 +191,41 @@ static int cache_attr_locked(fuse_ino_t ino, const struct stat *st, double timeo
  atomic_fetch_add(&attrs, 1); atomic_store(&attr_token, token);
  atomic_store(&attr_atime, st->st_atim.tv_sec); return 0;
 }
-static int cache_attr(fuse_ino_t ino, struct stat *st, double timeout,
+static enum perf_cache_attr_outcome cache_attr(fuse_ino_t ino, struct stat *st, double timeout,
  const struct perf_cache_snapshot *snapshot, bool existing, double *reply_timeout)
 {
  struct perf_inode_generation *state; uint64_t token;
+ enum perf_cache_attr_outcome result = PERF_CACHE_ATTR_UNSTABLE;
  assert(!held && !existing && timeout == 1.0); *reply_timeout = timeout;
  pthread_mutex_lock(&stripe); state = find_inode_generation_locked(ino);
  assert(inode_generation_value_locked(state, &token, false));
  if (!perf_state.cache_bypass && !state->active && token == snapshot->daemon_state) {
   atomic_fetch_add(&attrs, 1); atomic_store(&attr_token, token);
   atomic_store(&attr_atime, st->st_atim.tv_sec);
+  result = PERF_CACHE_ATTR_PUBLISHED;
  }
- pthread_mutex_unlock(&stripe); return 0;
+ pthread_mutex_unlock(&stripe); return result;
 }
 @READ@
+static struct lo_data *lo_data(fuse_req_t req) { (void)req; return &lo; }
+static struct lo_inode *lo_inode(fuse_req_t req, fuse_ino_t ino)
+{ (void)req; assert(ino == 17); return &inode; }
+static bool paper_write_fast_active(void) { return !revoke; }
+static bool paper_capability_is_safe(void) { return !revoke; }
+static pthread_mutex_t *xattr_lock_for_inode(fuse_ino_t ino)
+{ assert(ino == 17); return &xstripe; }
+static void invalidate_xattr_serialized(fuse_ino_t ino, const char *name, bool all)
+{ assert(ino == 17 && !strcmp(name, PERF_CAPABILITY_XATTR) && all && xheld); }
+static void prefetch_xattr_serialized(fuse_req_t req, fuse_ino_t ino, const char *name)
+{ assert(req && !req->replies && ino == 17 && !strcmp(name, PERF_CAPABILITY_XATTR));
+  assert(xheld && !(atomic_load(&map_xattr) & 255)); atomic_fetch_add(&refills, 1); }
+static int fuse_reply_err(fuse_req_t req, int error)
+{ assert(!held && !xheld && !req->replies); req->replies++; req->error = error; return 0; }
+static int fuse_reply_write(fuse_req_t req, size_t size)
+{ assert(!held && !xheld && !req->replies); req->replies++; req->size = size; return 0; }
+static void fuse_session_exit(void *session)
+{ assert(session == &perf_state); atomic_fetch_add(&exits, 1); }
+@WRITE@
 static void audit_packed_state_map(int map, uint64_t *records,
  uint64_t *active, uint64_t *errors)
 { (void)map; *records = 1; *active = !!(atomic_load(&map_attr) & 255); *errors = 0; }
@@ -205,7 +244,7 @@ static struct perf_inode_generation *record(void)
  pthread_mutex_unlock(&stripe); assert(state); return state;
 }
 static void begin(struct perf_read_context *c)
-{ assert(cache_read_begin(&c->mutation, &c->cohort)); }
+{ assert(cache_io_begin(&c->mutation, &c->cohort)); }
 static void lower_read(void)
 { assert((atomic_load(&map_attr) & 255) || perf_state.cache_bypass);
   atomic_fetch_add(&lower_done, 1); }
@@ -217,6 +256,7 @@ static void clean(struct perf_inode_generation *state)
 {
  assert(!state->active && !state->xattr_active);
  assert(!atomic_load(&state->read_cohort_refs) && !state->read_cohort_armed);
+ assert(!atomic_load(&state->write_cohort_refs) && !state->write_cohort_armed);
  audit_coherence_state(); assert(!perf_state.counters.daemon_io_active_residuals);
  assert(!perf_state.counters.daemon_io_state_audit_errors);
 }
@@ -250,10 +290,121 @@ static void parallel(bool concurrent)
  if (!concurrent) { assert(atomic_load(&locks) - baseline == 2);
   assert(atomic_load(&map_updates) == 2 && atomic_load(&stats) == 1); }
 }
+struct write_worker {
+ struct perf_write_context *context;
+ struct request request;
+ bool admit, rendezvous;
+};
+static void write_begin(struct write_worker *w)
+{
+ struct fuse_file_info fi = { .writepage = true };
+ w->context = calloc(1, sizeof(*w->context)); assert(w->context);
+ assert(perf_write_begin(&w->request, 17, 4096, &fi, w->context, "cohort-test"));
+}
+static void lower_write(void)
+{
+ assert(!held && !xheld);
+ assert(((atomic_load(&map_attr) & 255) && (atomic_load(&map_xattr) & 255)) ||
+        perf_state.cache_bypass);
+ atomic_fetch_add(&lower_done, 1);
+}
+static void write_finish(struct write_worker *w, ssize_t result)
+{
+ perf_write_complete(&w->request, result, w->context, "cohort-test");
+ assert(w->request.replies == 1); free(w->context); w->context = NULL;
+}
+static void *write_worker(void *opaque)
+{
+ struct write_worker *w = opaque;
+ if (w->rendezvous) pthread_barrier_wait(&gate);
+ if (w->admit) write_begin(w);
+ if (w->rendezvous) pthread_barrier_wait(&gate);
+ lower_write(); write_finish(w, 4096); return NULL;
+}
+static void write_case(const char *name)
+{
+ struct perf_inode_generation *state = record();
+ struct write_worker a = {0}, b = {0};
+ unsigned baseline = atomic_load(&locks);
+ perf_state.session = &perf_state;
+ if (!strcmp(name, "write-busy-begin")) {
+  pthread_t ta, tb; a.admit = b.admit = true;
+  unsigned before = atomic_load(&attempts); atomic_store(&hold_begin, 1);
+  assert(!pthread_create(&ta, NULL, write_worker, &a)); wait_for(&begin_entered, 1);
+  assert(!pthread_create(&tb, NULL, write_worker, &b)); wait_for(&attempts, before + 2);
+  assert(!atomic_load(&lower_done)); atomic_store(&allow_begin, true);
+  pthread_join(ta, NULL); pthread_join(tb, NULL); clean(state); return;
+ }
+ if (!strcmp(name, "write-fatal-first")) {
+  struct perf_write_context c; struct request req = {0};
+  struct fuse_file_info fi = { .writepage = true };
+  atomic_store(&fail_map, true); atomic_store(&fatal_map, true);
+  assert(!perf_write_begin(&req, 17, 4096, &fi, &c, "cohort-test"));
+  assert(req.replies == 1 && req.error == EIO && !atomic_load(&lower_done));
+  clean(state); return;
+ }
+ write_begin(&a);
+ if (!strcmp(name, "write-shared-lifetime") || !strcmp(name, "write-concurrent")) {
+  enum { N = 16 }; pthread_t threads[N]; struct write_worker workers[N] = {0};
+  bool concurrent = !strcmp(name, "write-concurrent");
+  for (int i = 0; i < N; i++) {
+   workers[i].admit = workers[i].rendezvous = concurrent;
+   if (!concurrent) { write_begin(&workers[i]); assert(workers[i].context->cohort == state); }
+  }
+  if (!concurrent) { lower_write(); write_finish(&a, 4096); }
+  pthread_barrier_init(&gate, NULL, N);
+  for (int i = 0; i < N; i++) assert(!pthread_create(&threads[i], NULL, write_worker, &workers[i]));
+  for (int i = 0; i < N; i++) {
+   assert(!pthread_join(threads[i], NULL));
+   assert(workers[i].request.size == 4096 && !workers[i].request.error);
+  }
+  if (concurrent) { lower_write(); write_finish(&a, 4096); }
+  pthread_barrier_destroy(&gate); clean(state);
+  assert(a.request.size == 4096 && !a.request.error && atomic_load(&attr_atime) == N + 1);
+  if (!concurrent) {
+   assert(atomic_load(&locks) - baseline == 3 && atomic_load(&map_updates) == 2);
+   assert(atomic_load(&stats) == 1 && state->generation == 2 && state->xattr_generation == 2);
+  }
+  return;
+ }
+ if (!strcmp(name, "write-busy-end")) {
+  pthread_t thread; atomic_store(&hold_stat, 1);
+  assert(!pthread_create(&thread, NULL, write_worker, &a)); wait_for(&stat_entered, 1);
+  write_begin(&b); assert(!b.context->cohort && b.context->mutation.armed);
+  lower_write(); write_finish(&b, 4096);
+  atomic_store(&allow_stat, true); pthread_join(thread, NULL); clean(state);
+  assert(atomic_load(&attrs) == 1 && atomic_load(&attr_atime) == 2);
+  assert(!atomic_load(&exits)); return;
+ }
+ if (!strcmp(name, "write-end-map-failure")) {
+  atomic_store(&fail_map, true); lower_write(); write_finish(&a, 4096);
+  assert(perf_state.cache_bypass && !state->active && !state->xattr_active);
+  assert(!state->write_cohort_armed && !atomic_load(&state->write_cohort_refs));
+  assert(atomic_load(&map_attr) & 255); return;
+ }
+ write_begin(&b); assert(a.context->cohort == state && b.context->cohort == state);
+ if (!strcmp(name, "write-read-overlap")) {
+  struct perf_read_context *read = context(); begin(read); revoke = true;
+  lower_write(); write_finish(&a, 4096);
+  assert(!atomic_load(&refills) && state->active == 2 && state->xattr_active == 1);
+  lower_write(); write_finish(&b, 4096);
+  assert(atomic_load(&refills) == 1 && state->active == 1 && !state->xattr_active);
+  assert(!atomic_load(&attrs)); lower_read(); finish(read); clean(state);
+  assert(atomic_load(&attrs) == 1 && state->xattr_generation == 2); return;
+ }
+ lower_write(); write_finish(&a, !strcmp(name, "write-error-first") ? -EAGAIN : 4096);
+ assert(!atomic_load(&stats) && state->active == 1 && state->xattr_active == 1);
+ lower_write(); write_finish(&b, !strcmp(name, "write-short-last") ? 4095 : 4096);
+ clean(state); assert(atomic_load(&attrs) == 1 && atomic_load(&stats) == 1);
+ if (!strcmp(name, "write-error-first")) assert(a.request.error == EAGAIN && b.request.size == 4096);
+ if (!strcmp(name, "write-short-last")) assert(!a.request.error && b.request.error == EIO);
+ assert(atomic_load(&exits) == 1);
+}
 int main(int argc, char **argv)
 {
  struct perf_inode_generation *state; struct perf_read_context *a, *b;
  assert(argc == 2); const char *name = argv[1];
+ if (!strncmp(name, "write-", 6)) { write_case(name); return 0; }
  if (!strcmp(name, "cold-publication")) {
   enum { N = 16 }; pthread_t threads[N]; struct worker workers[N];
   pthread_barrier_init(&gate, NULL, N);
@@ -279,7 +430,7 @@ int main(int argc, char **argv)
  }
  if (!strcmp(name, "map-failure") || !strcmp(name, "fatal-first")) {
   atomic_store(&fail_map, true); atomic_store(&fatal_map, !strcmp(name, "fatal-first"));
-  bool ok = cache_read_begin(&a->mutation, &a->cohort);
+  bool ok = cache_io_begin(&a->mutation, &a->cohort);
   assert(ok == !atomic_load(&fatal_map)); assert(perf_state.cache_bypass);
   if (ok) { lower_read(); finish(a); } else { cache_mutation_end(&a->mutation); free(a); }
   free(b); clean(state); assert(!atomic_load(&attrs)); return 0;
@@ -315,7 +466,7 @@ int main(int argc, char **argv)
    assert(cas_calls == 3); /* injected conflict, refreshed expected, success */
   } else {
    assert(!b->cohort && atomic_load(&locks) == baseline + 1);
-   assert(cas_calls == PERF_READ_COHORT_JOIN_ATTEMPTS);
+   assert(cas_calls == PERF_IO_COHORT_JOIN_ATTEMPTS);
   }
   lower_read(); finish(b); lower_read(); finish(a); clean(state); return 0;
  }
@@ -349,7 +500,7 @@ int main(int argc, char **argv)
  }
  if (!strcmp(name, "fatal-admission")) {
   perf_state.counters.cache_bypass_errors = 1;
-  assert(!cache_read_begin(&b->mutation, &b->cohort)); assert(!b->cohort);
+  assert(!cache_io_begin(&b->mutation, &b->cohort)); assert(!b->cohort);
   cache_mutation_end(&b->mutation); free(b); lower_read(); finish(a); clean(state); return 0;
  }
  if (!strcmp(name, "writer-overlap")) {
@@ -364,7 +515,12 @@ int main(int argc, char **argv)
   lower_read(); finish(a); free(b); clean(state);
   state->read_cohort_armed = true; audit_coherence_state();
   assert(perf_state.counters.daemon_io_state_audit_errors == 1);
-  state->read_cohort_armed = false; clean(state); return 0;
+  state->read_cohort_armed = false; clean(state);
+  state->write_cohort_armed = true; audit_coherence_state();
+  assert(perf_state.counters.daemon_io_state_audit_errors == 1);
+  state->write_cohort_armed = false; atomic_store(&state->write_cohort_refs, 1);
+  audit_coherence_state(); assert(perf_state.counters.daemon_io_state_audit_errors == 1);
+  atomic_store(&state->write_cohort_refs, 0); clean(state); return 0;
  }
  if (!strcmp(name, "stat-error")) atomic_store(&fail_stat, true);
  begin(b); if (perf_state.mode != PERF_MODE_HIT) assert(!a->cohort && !b->cohort);
@@ -384,17 +540,21 @@ class ReadCohortTests(unittest.TestCase):
         names = {
             "LOOKUP": ("find_inode_generation_locked", "get_inode_generation_locked",
                        "inode_generation_value_locked"),
-            "MUTATION": ("cache_mutation_begin", "cache_mutation_end_capture_locked",
+            "MUTATION": ("cache_mutation_add", "cache_mutation_begin", "cache_mutation_end_capture_locked",
                          "cache_mutation_end_capture",
                          "cache_mutation_end_with_snapshot", "cache_mutation_end"),
-            "COHORT": ("cache_read_begin", "cache_read_cohort_last"),
+            "COHORT": ("cache_io_cohort_refs", "cache_io_begin",
+                       "cache_io_cohort_last", "cache_io_cohort_release"),
+            "WRITE": ("perf_write_contract_failed", "refill_capability_after_write",
+                      "publish_pinned_write_attr", "perf_write_complete", "perf_write_begin"),
             "AUDIT": ("audit_coherence_state",),
         }
-        code = HARNESS.replace("@STRUCTS@", structs)
+        code = HARNESS.replace("@STRUCTS@", structs + "\n" +
+                               extract(source, "struct perf_write_context {"))
         for tag, functions in names.items():
             bodies = []
             for name in functions:
-                match = re.search(r"^static [^;{}]*\b" + name + r"\(", source, re.M)
+                match = re.search(r"^static [^;{}]*\b" + name + r"\([^;{}]*\)\s*\{", source, re.M)
                 if match is None:
                     raise AssertionError(f"missing {name}")
                 bodies.append(extract(source, match.group()))
@@ -421,6 +581,23 @@ class ReadCohortTests(unittest.TestCase):
 
     def test_first_context_can_finish_before_parallel_last_member(self):
         self.check("shared-lifetime")
+
+    def test_write_cohort_owns_guard_after_first_context_is_freed(self):
+        self.check("write-shared-lifetime")
+        self.check("write-concurrent")
+
+    def test_write_boundaries_retain_fallback_and_reject_stale_publication(self):
+        self.check("write-busy-begin")
+        self.check("write-busy-end")
+
+    def test_write_refills_revoked_xattr_while_read_remains_active(self):
+        self.check("write-read-overlap")
+
+    def test_write_failures_preserve_individual_replies_and_release_cohort(self):
+        for name in ("write-fatal-first", "write-end-map-failure",
+                     "write-error-first", "write-short-last"):
+            with self.subTest(name=name):
+                self.check(name)
 
     def test_single_boundary_keeps_active_stat_and_uses_one_completion_lock(self):
         self.check("single-boundary")

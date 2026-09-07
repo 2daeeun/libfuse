@@ -699,6 +699,14 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_EXTFUSE_PAPER_READ_GUARD (1ULL << 48)
 
 /**
+ * Retire native mmap metadata guards after the backing file's last reference,
+ * including mappings which outlive FUSE RELEASE. The BPF MMAP handler must
+ * support counted BEGIN and END notifications. Requires native passthrough,
+ * ExtFUSE coherence V2 and attribute refresh. Disabled by default.
+ */
+#define FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE (1ULL << 49)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine

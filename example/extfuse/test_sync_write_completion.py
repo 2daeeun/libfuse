@@ -30,6 +30,7 @@ typedef int pthread_mutex_t;
 struct lo_data { double timeout; };
 struct lo_inode { int fd; dev_t dev; ino_t ino; };
 struct perf_cache_mutation { bool armed, xattr_quiescent; };
+struct perf_inode_generation;
 struct perf_cache_snapshot { uint64_t daemon_state, native_state; };
 struct fuse_mutation_attr { fuse_ino_t ino; struct stat *attr; double attr_timeout; int flags; };
 struct fuse_file_info { int writepage; };
@@ -67,15 +68,26 @@ static void invalidate_xattr_serialized(fuse_ino_t ino, const char *name, bool a
 { (void)name; assert(ino == 17 && all && locked); }
 static void refresh_negative_capability_serialized(fuse_ino_t ino, uint64_t state)
 { (void)ino; (void)state; assert(!"unexpected negative-row carry"); }
-static void refill_capability_after_write(fuse_req_t req, fuse_ino_t ino)
-{ (void)req; assert(ino == 17 && !active && !replies); event('C'); }
+static void prefetch_xattr_serialized(fuse_req_t req, fuse_ino_t ino, const char *name)
+{ (void)req; (void)name; assert(ino == 17 && locked && !active && !replies); event('C'); }
 static void cache_mutation_add(struct perf_cache_mutation *mutation, fuse_ino_t ino)
 { (void)mutation; assert(ino == 17); }
 static bool cache_mutation_begin(struct perf_cache_mutation *mutation)
 { assert(!active); mutation->armed = active = true; event('B'); return true; }
+/* Actual cohort synchronization is covered by test_read_cohort.py. */
+static bool cache_io_begin(struct perf_cache_mutation *m, struct perf_inode_generation **cohort)
+{ *cohort = NULL; return cache_mutation_begin(m); }
+static bool cache_io_cohort_last(struct perf_cache_mutation *m, struct perf_inode_generation *cohort)
+{ (void)m; (void)cohort; assert(!"unexpected cohort in the completion fixture"); return false; }
+static void cache_io_cohort_release(struct perf_inode_generation *cohort, bool attr_only)
+{ (void)cohort; (void)attr_only; assert(!"unexpected cohort in the completion fixture"); }
 static bool cache_mutation_end(struct perf_cache_mutation *mutation)
 { assert(active && mutation->armed); active = mutation->armed = false;
  mutation->xattr_quiescent = !overlap; event('E'); return !overlap; }
+static bool cache_mutation_end_capture(struct perf_cache_mutation *mutation,
+ struct perf_cache_snapshot *snapshot, bool *valid)
+{ bool quiescent = cache_mutation_end(mutation); memset(snapshot, 0, sizeof(*snapshot));
+ *valid = quiescent; return quiescent; }
 static __attribute__((unused)) size_t fuse_buf_size(struct fuse_bufvec *buf) { return buf->size; }
 static ssize_t lo_do_write_buf(fuse_req_t req, fuse_ino_t ino, struct fuse_bufvec *buf,
  off_t off, struct fuse_file_info *fi)
@@ -104,14 +116,14 @@ static int fuse_reply_write(fuse_req_t req, size_t size)
 static int fuse_reply_write_attr(fuse_req_t req, size_t size, const struct fuse_mutation_attr *attr)
 { assert(attr->ino == 17 && attr->attr_timeout == 1.0); attr_replies++; return fuse_reply_write(req, size); }
 static void fuse_session_exit(void *session) { assert(session == &perf_state); exits++; event('X'); }
-@CONTRACT@
+@COMMON@
 @CALLBACK@
 int main(int argc, char **argv)
 {
  struct fuse_file_info fi = {.writepage = 1}; struct fuse_bufvec buf = {.size = 8192};
  assert(argc == 2); perf_state.session = &perf_state; perf_state.paper_write_fast = true;
  if (strstr(argv[1], "ordinary")) fi.writepage = 0;
- if (strstr(argv[1], "legacy")) fast = false;
+ if (strstr(argv[1], "legacy")) fast = perf_state.paper_write_fast = false;
  if (strstr(argv[1], "short")) lower_result = 4096;
  if (strstr(argv[1], "zero")) lower_result = 0;
  if (strstr(argv[1], "oversize")) lower_result = 8193;
@@ -138,15 +150,15 @@ class SyncWriteCompletionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         source = SOURCE.read_text()
-        contract = extract(source, "static void perf_write_contract_failed(",
-                           "static void refill_capability_after_write(")
+        common = extract(source, "struct perf_write_context {",
+                         "static void perf_uring_write_complete(")
         callback = extract(source, "__attribute__((noinline, used))\nvoid perf_write_buf(",
                            "static void perf_flush(")
         cls.temporary = tempfile.TemporaryDirectory(prefix="extfuse-sync-write-")
         cls.addClassCleanup(cls.temporary.cleanup)
         root = Path(cls.temporary.name)
         path = root / "completion.c"
-        path.write_text(HARNESS.replace("@CONTRACT@", contract).replace("@CALLBACK@", callback))
+        path.write_text(HARNESS.replace("@COMMON@", common).replace("@CALLBACK@", callback))
         cls.binary = root / "completion"
         subprocess.run([*shlex.split(os.environ.get("CC", "cc")), "-std=c11", "-O2",
                         "-Wall", "-Wextra", "-Werror", str(path), "-o", str(cls.binary)],
@@ -163,7 +175,7 @@ class SyncWriteCompletionTests(unittest.TestCase):
 
     def test_full_write_preserves_reply_and_metadata(self):
         self.case("full", "BWESPR 0 8192 0 0")
-        self.case("metadata-full", "BWESPR 0 8192 0 1")
+        self.case("legacy-metadata-full", "BWESPR 0 8192 0 1")
         self.case("overlap-full", "BWER 0 8192 0 0")
 
     def test_writeback_short_zero_oversize_reject_after_publication(self):
@@ -182,8 +194,8 @@ class SyncWriteCompletionTests(unittest.TestCase):
         self.case("legacy-short", "BWESPR 0 4096 0 0")
 
     def test_lower_errors_and_existing_publication_reply_errors(self):
-        self.case("io-error", "BWERX 28 0 1 0", "write-io")
-        self.case("ordinary-io-error", "BWER 28 0 0 0")
+        self.case("io-error", "BWESPRX 28 0 1 0", "write-io")
+        self.case("ordinary-io-error", "BWESPR 28 0 0 0")
         self.case("stat-error", "BWESRX 0 8192 1 0", "write-attr-publication")
         self.case("reply-error", "BWESPRX 0 8192 1 0", "write-reply")
 

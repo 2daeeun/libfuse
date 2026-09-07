@@ -235,7 +235,9 @@ static void create_lookup_entry(struct fuse_entry_out *out,
  */
 static int has_passthrough_mmap_marker(__u64 nodeid)
 {
-	return bpf_map_lookup_elem(&mmap_map, &nodeid) != NULL;
+	__u32 *count = bpf_map_lookup_elem(&mmap_map, &nodeid);
+
+	return count && *count;
 }
 
 static __u32 policy_flags(void)
@@ -591,8 +593,16 @@ static int passthrough_notification(void *ctx, __u32 mask, int write)
 		ret = update_native_state(nodeid, in.phase, write);
 		if (ret)
 			return ret;
-		if (mark_passthrough_attr_stale(ctx, mask) ||
-		    (write && invalidate_positive_capability(ctx))) {
+		/*
+		 * V2 WRITE already advanced the native xattr token before lower I/O.
+		 * Positive GETXATTR rows require that exact, inactive token, and
+		 * daemon publication validates it again after the lower snapshot.
+		 * END advances it once more, so an overlapping publication cannot
+		 * make a pre-write capability value current. Avoid the redundant
+		 * large-key xattr lookup/delete here; ordinary WRITE handlers keep
+		 * their invalidation because they do not own this native token.
+		 */
+		if (mark_passthrough_attr_stale(ctx, mask)) {
 			/* BEGIN succeeded, so close it before requesting fallback. */
 			update_native_state(nodeid,
 					    EXTFUSE_PASSTHROUGH_PHASE_END, write);
@@ -617,21 +627,53 @@ HANDLER(EXTFUSE_PASSTHROUGH_WRITE, 66)(void *ctx)
 		1);
 }
 
+/* Zero-count rows stay allocated: a concurrent BEGIN must never lose its key. */
+static int transition_mmap_count(__u32 *count, __u32 amount, int begin)
+{
+	__u32 old = *count;
+	__u32 next;
+	__u32 seen;
+	int i;
+
+	for (i = 0; i < 32; i++) {
+		/* The high bit permanently poisons malformed/overflowed state. */
+		if (old & (1U << 31))
+			return -ESTALE;
+		if (!amount || amount > 0x7fffffffU ||
+		    (begin ? old > 0x7fffffffU - amount : old < amount))
+			break;
+		next = begin ? old + amount : old - amount;
+		seen = __sync_val_compare_and_swap(count, old, next);
+		if (seen == old)
+			return 0;
+		old = seen;
+	}
+	/* A lost END must suppress caching, never expose an unguarded mapping. */
+	__sync_fetch_and_or(count, 1U << 31);
+	return -EIO;
+}
+
 HANDLER(EXTFUSE_PASSTHROUGH_MMAP, 67)(void *ctx)
 {
 	struct extfuse_passthrough_in in = {};
 	__u64 nodeid = 0;
 	__u32 marker = 1;
+	__u32 *count;
+	int ret;
 
 	/*
 	 * Native mappings are reported when mmap installs the lower mapping;
 	 * ordinary cached shared mappings are reported only at their first write
-	 * fault.  Both cases need the same persistent fail-closed marker once
-	 * unbracketed lower metadata changes can occur.
+	 * fault. Native END, when negotiated, retires only the BEGINs owned by a
+	 * backing file whose final reference and lower close have completed.
+	 * Cached shared faults and older kernels never emit END and stay guarded.
 	 */
 	if (bpf_extfuse_read_args(ctx, IN_PARAM_0_VALUE, &in, sizeof(in)) < 0)
 		return -EIO;
-	if (in.reserved || in.phase != EXTFUSE_PASSTHROUGH_PHASE_BEGIN)
+	if ((in.phase == EXTFUSE_PASSTHROUGH_PHASE_BEGIN && in.reserved) ||
+	    (in.phase == EXTFUSE_PASSTHROUGH_PHASE_END && !in.mmap_count) ||
+	    (in.phase != EXTFUSE_PASSTHROUGH_PHASE_BEGIN &&
+	     in.phase != EXTFUSE_PASSTHROUGH_PHASE_END))
 		return -EINVAL;
 	/* The gate profile never enables this paper-comparison relaxation. */
 	if (!policy_enabled(EXTFUSE_POLICY_COHERENCE_EPOCHS) &&
@@ -639,9 +681,32 @@ HANDLER(EXTFUSE_PASSTHROUGH_MMAP, 67)(void *ctx)
 		return RETURN;
 	if (bpf_extfuse_read_args(ctx, NODEID, &nodeid, sizeof(nodeid)) < 0)
 		return -EIO;
-	if (bpf_map_update_elem(&mmap_map, &nodeid, &marker, BPF_ANY))
+	count = bpf_map_lookup_elem(&mmap_map, &nodeid);
+	if (in.phase == EXTFUSE_PASSTHROUGH_PHASE_BEGIN) {
+		if (!count) {
+			if (!bpf_map_update_elem(&mmap_map, &nodeid, &marker,
+						 BPF_NOEXIST))
+				return RETURN;
+			count = bpf_map_lookup_elem(&mmap_map, &nodeid);
+		}
+		return count ? transition_mmap_count(count, 1, 1) : -EIO;
+	}
+	if (!count) {
+		marker = 1U << 31;
+		bpf_map_update_elem(&mmap_map, &nodeid, &marker, BPF_NOEXIST);
+		return -ESTALE;
+	}
+	/* Invalidate snapshots taken before/during mmap before lifting the guard. */
+	ret = update_native_state(nodeid, EXTFUSE_PASSTHROUGH_PHASE_BEGIN, 1);
+	if (ret)
+		return ret;
+	ret = mark_passthrough_attr_stale(
+		ctx, FATTR_ATIME | FATTR_SIZE | FATTR_MTIME | FATTR_CTIME);
+	if (!ret)
+		ret = transition_mmap_count(count, in.mmap_count, 0);
+	if (update_native_state(nodeid, EXTFUSE_PASSTHROUGH_PHASE_END, 1))
 		return -EIO;
-	return RETURN;
+	return ret;
 }
 
 static int attr_needs_native_refresh(const lookup_attr_val_t *attr,

@@ -32,7 +32,7 @@ struct perf_cache_lockset { int unused; };
 struct perf_inode_generation { uint64_t generation, active, xattr_generation, xattr_active; };
 struct lo_data { double timeout; };
 struct lo_inode { int fd; dev_t dev; ino_t ino; };
-struct fuse_file_info { uint64_t fh; };
+struct fuse_file_info { uint64_t fh; bool writepage; };
 struct fuse_bufvec { size_t size; };
 typedef int pthread_mutex_t;
 enum perf_cache_attr_outcome { PERF_CACHE_ATTR_DISABLED, PERF_CACHE_ATTR_PUBLISHED,
@@ -96,6 +96,13 @@ static void cache_mutation_add(struct perf_cache_mutation *m, fuse_ino_t ino) { 
 static bool cache_mutation_begin(struct perf_cache_mutation *m)
 { if (begin_error) return false; m->armed = true; state.generation++; state.active++;
   state.xattr_generation++; state.xattr_active++; return true; }
+/* Actual cohort synchronization is covered by test_read_cohort.py. */
+static bool cache_io_begin(struct perf_cache_mutation *m, struct perf_inode_generation **cohort)
+{ *cohort = NULL; return cache_mutation_begin(m); }
+static bool cache_io_cohort_last(struct perf_cache_mutation *m, struct perf_inode_generation *cohort)
+{ (void)m; (void)cohort; assert(!"unexpected cohort in the completion fixture"); return false; }
+static void cache_io_cohort_release(struct perf_inode_generation *cohort, bool attr_only)
+{ (void)cohort; (void)attr_only; assert(!"unexpected cohort in the completion fixture"); }
 static int fuse_uring_submit_fixed_io(fuse_req_t req, int fd, off_t offset, size_t size, bool write,
  void (*callback)(fuse_req_t, ssize_t, void *), void *context)
 { (void)req; assert(fd == 88 && offset == 4096 && size == 8192 && write && state.active && !locked);
@@ -111,7 +118,8 @@ static void test_free(void *ptr) { assert(ptr); freed++; free(ptr); }
 
 int main(int argc, char **argv)
 {
- struct fuse_file_info fi = { 88 }; struct fuse_bufvec buf = { 8192 };
+ struct fuse_file_info fi = { .fh = 88, .writepage = true };
+ struct fuse_bufvec buf = { 8192 };
  ssize_t result = 8192; const char *which;
  assert(argc == 2); which = argv[1]; perf_state.session = &perf_state;
  if (!strncmp(which, "read-", 5)) {
@@ -141,6 +149,8 @@ int main(int argc, char **argv)
  else if (!strcmp(which, "overlap")) { state.active = state.xattr_active = 1; }
  else if (!strcmp(which, "io-error")) result = -EIO;
  else if (!strcmp(which, "short")) result = 4096;
+ else if (!strcmp(which, "ordinary-short")) { fi.writepage = false; result = 4096; }
+ else if (!strcmp(which, "ordinary-zero")) { fi.writepage = false; result = 0; }
  else if (!strcmp(which, "oversize")) result = 8193;
  perf_write_uring_zero_copy(&fi, 17, &buf, 4096, &fi);
  if (pending) { assert(!freed && !replies); pending(&fi, result, pending_context); }
@@ -164,8 +174,8 @@ class WriteCompletionTests(unittest.TestCase):
         root = Path(cls.temporary.name)
         end = SOURCE.split("static bool cache_mutation_end_capture_locked(", 1)[1]
         end = "static bool cache_mutation_end_capture_locked(" + end.split("static uint64_t timeout_seconds", 1)[0]
-        write = SOURCE.split("struct perf_uring_write_context {", 1)[1]
-        write = "struct perf_uring_write_context {" + write.split("#define PERF_READ_COHORT_BUSY", 1)[0]
+        write = SOURCE.split("struct perf_write_context {", 1)[1]
+        write = "struct perf_write_context {" + write.split("#define PERF_IO_COHORT_BUSY", 1)[0]
         source = root / "completion.c"
         source.write_text(HARNESS.replace("@END@", end).replace("@WRITE@", write))
         cls.binary = root / "completion"
@@ -205,13 +215,21 @@ class WriteCompletionTests(unittest.TestCase):
                 self.assertGreater(values[3], 0)
                 self.assertGreater(values[5], 0)
                 if name == "submit-capture-error":
-                    self.assertIn("operation=write-submit-attr-publication", errors)
+                    self.assertIn("operation=write-attr-publication", errors)
 
     def test_error_short_oversize_and_reply_failure_still_reply_once(self):
         for name in ("io-error", "short", "oversize", "reply-error"):
             with self.subTest(name=name):
                 values, errors = self.case(name)
                 self.assertGreater(values[3], 0, errors)
+                if name == "short":
+                    self.assertEqual(values[4:], [0, 5])
+
+    def test_foreground_partial_results_remain_valid(self):
+        for name, size in (("ordinary-short", 4096), ("ordinary-zero", 0)):
+            with self.subTest(name=name):
+                values, errors = self.case(name)
+                self.assertEqual(values[3:], [0, size, 0], errors)
 
 
 if __name__ == "__main__":

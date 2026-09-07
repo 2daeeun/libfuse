@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise production BPF WRITE/GETXATTR coherence with unprivileged maps."""
+"""Exercise BPF WRITE/GETXATTR and native token interleavings with mock maps."""
 
 import os
 from pathlib import Path
@@ -36,9 +36,13 @@ HARNESS = r"""
 #define IN_PARAM_1_VALUE 2
 #define OUT_PARAM_0 0
 #define EXTFUSE_COHERENCE_VERSION 1
+#define EXTFUSE_PASSTHROUGH_PHASE_BEGIN 1
+#define EXTFUSE_PASSTHROUGH_PHASE_END 2
+#define BPF_NOEXIST 1
 #define PRINTK(...)
 #define HANDLER(op, number) int bpf_func_##op
 struct extfuse_req { struct { __u32 version, target_count; } coherence; };
+struct extfuse_passthrough_in { __u32 phase, reserved; };
 static int policy_map, attr_map, xattr_map, daemon_io_map, native_io_map, mmap_map;
 static __u32 flags;
 static lookup_attr_val_t attr;
@@ -49,6 +53,7 @@ static struct fuse_getxattr_in incoming = {.size = 4};
 static int marked;
 static int missing_policy, missing_attr, missing_capability, key_error, delete_error;
 static int revoke_at_attr;
+static int missing_native;
 static unsigned int policy_lookups, attr_lookups, xattr_lookups, deletes;
 static void revoke_paper_capability_policy(void);
 
@@ -102,7 +107,8 @@ static void *bpf_map_lookup_elem(int *map, const void *key)
     if (map == &daemon_io_map || map == &native_io_map || map == &mmap_map) {
         assert(*(__u64 *)key == 17);
         if (map == &mmap_map) return marked ? &marked : NULL;
-        return map == &daemon_io_map ? &daemon_state : &native_state;
+        return map == &daemon_io_map ? &daemon_state :
+               (missing_native ? NULL : &native_state);
     }
     assert(map == &xattr_map);
     assert(((xattr_key_t *)key)->nodeid == 17);
@@ -121,7 +127,93 @@ static int bpf_map_delete_elem(int *map, const void *key)
     return 0;
 }
 
+static int bpf_map_update_elem(int *map, const void *key,
+                               const void *value, unsigned long mode)
+{
+    assert(map == &native_io_map && *(__u64 *)key == 17 && mode == BPF_NOEXIST);
+    if (!missing_native)
+        return -EEXIST;
+    native_state = *(const struct extfuse_io_state *)value;
+    missing_native = 0;
+    return 0;
+}
+
 @PRODUCTION@
+
+static int native_notification(struct extfuse_req *request, unsigned phase)
+{
+    struct fuse_getxattr_in saved = incoming;
+    int result;
+
+    incoming.size = phase;
+    incoming.padding = 0;
+    result = bpf_func_EXTFUSE_PASSTHROUGH_WRITE(request);
+    incoming = saved;
+    return result;
+}
+
+static int native_scenario(struct extfuse_req *request, const char *scenario)
+{
+    const __u64 step = EXTFUSE_NATIVE_STATE_SEQUENCE_ONE;
+    int result;
+
+    if (strstr(scenario, "invalid")) {
+        assert(native_notification(request, 0) == -EINVAL);
+        assert(native_state.attr_state == 0 && native_state.xattr_state == 0);
+        return 0;
+    }
+    if (strstr(scenario, "fresh"))
+        missing_native = 1;
+    assert(native_notification(request, EXTFUSE_PASSTHROUGH_PHASE_BEGIN) == 0);
+    assert(native_state.attr_state == step + 1);
+    assert(native_state.xattr_state == step + 1);
+    assert(!missing_capability && !deletes && !xattr_lookups);
+
+    if (strstr(scenario, "negative")) {
+        assert(capability.error == ENODATA && !capability.size);
+        assert(bpf_func_FUSE_GETXATTR(request) == -ENODATA);
+    } else {
+        assert(bpf_func_FUSE_GETXATTR(request) == -ENOSYS);
+        /* Even a row published during the active write cannot become a hit. */
+        capability.native_state = native_state.xattr_state;
+        assert(bpf_func_FUSE_GETXATTR(request) == -ENOSYS);
+    }
+    if (strstr(scenario, "setxattr")) {
+        revoke_paper_capability_policy();
+        daemon_state.xattr_state = step + 1;
+        capability.error = 0;
+        capability.size = 4;
+        capability.daemon_state = daemon_state.xattr_state;
+        assert(bpf_func_FUSE_GETXATTR(request) == -ENOSYS);
+        daemon_state.xattr_state = 2 * step;
+        capability.daemon_state = daemon_state.xattr_state;
+        capability.native_state = native_state.xattr_state;
+        assert(bpf_func_FUSE_GETXATTR(request) == -ENOSYS);
+    }
+    assert(native_notification(request, EXTFUSE_PASSTHROUGH_PHASE_END) == 0);
+    assert(native_state.attr_state == 2 * step);
+    assert(native_state.xattr_state == 2 * step);
+    result = bpf_func_FUSE_GETXATTR(request);
+    if (capability.error == ENODATA) {
+        assert(result == -ENODATA);
+        /* A later SETXATTR must invalidate the stable negative daemon token. */
+        daemon_state.xattr_state += step + 1;
+        assert(bpf_func_FUSE_GETXATTR(request) == -ENOSYS);
+        daemon_state.xattr_state += step - 1;
+        assert(bpf_func_FUSE_GETXATTR(request) == -ENOSYS);
+    } else {
+        assert(result == -ENOSYS);
+        /* A snapshot started before BEGIN may be published after END. */
+        capability.native_state = 0;
+        assert(bpf_func_FUSE_GETXATTR(request) == -ENOSYS);
+        /* A new lower snapshot can publish the now-inactive exact tokens. */
+        capability.native_state = native_state.xattr_state;
+        capability.daemon_state = daemon_state.xattr_state;
+        assert(bpf_func_FUSE_GETXATTR(request) == 0);
+    }
+    assert(!deletes && !missing_capability);
+    return 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -142,7 +234,9 @@ int main(int argc, char **argv)
     revoke_at_attr = atoi(argv[12]);
     if (atoi(argv[11]))
         revoke_paper_capability_policy();
-    if (!strncmp(argv[1], "get", 3)) {
+    if (!strncmp(argv[1], "native", 6)) {
+        result = native_scenario(&request, argv[1]);
+    } else if (!strncmp(argv[1], "get", 3)) {
         if (strstr(argv[1], "user")) xattr_name = "user.fixture";
         if (strstr(argv[1], "daemon-active")) daemon_state.xattr_state = 1;
         if (strstr(argv[1], "daemon-token")) daemon_state.xattr_state = 65536;
@@ -187,7 +281,9 @@ class WBCacheCapabilityTests(unittest.TestCase):
             ("static int daemon_cache_token_current(", "static int cache_tokens_current("),
             ("static int native_stable_negative_capability(", "HANDLER(FUSE_LOOKUP, 1)"),
             ("static int mark_passthrough_attr_stale(", "static int transition_native_state("),
+            ("static int transition_native_state(", "static int invalidate_positive_capability("),
             ("static int invalidate_positive_capability(", "static int passthrough_notification("),
+            ("static int passthrough_notification(", "static int transition_mmap_count("),
             ("HANDLER(FUSE_READ, 15)", "HANDLER(FUSE_SETATTR, 4)"),
             ("HANDLER(FUSE_GETXATTR, 22)", "HANDLER(FUSE_SETXATTR, 21)"),
         )
@@ -294,6 +390,33 @@ class WBCacheCapabilityTests(unittest.TestCase):
         for operation in ("getuser-native-active", "getuser-native-token",
                           "getuser-daemon-active", "getuser-daemon-token"):
             self.assertEqual(self.run_handler(cap_error=61, operation=operation)[0], -38)
+
+    def test_native_positive_rows_keep_exact_tokens_without_cache_deletion(self):
+        for operation in ("native-positive", "native-positive-fresh"):
+            for flags in (0, EPOCHS, WBCACHE | EPOCHS):
+                with self.subTest(operation=operation, flags=flags):
+                    row = self.run_handler(flags=flags, operation=operation)
+                    self.assertEqual(row[0], 0)
+                    self.assertEqual(row[5], 0)
+
+    def test_native_write_and_setxattr_publication_cannot_reuse_positive_token(self):
+        for flags, error, operation in (
+                (0, 0, "native-setxattr"),
+                (PROOF, 61, "native-negative-setxattr")):
+            with self.subTest(flags=flags, operation=operation):
+                row = self.run_handler(flags=flags, cap_error=error,
+                                       operation=operation)
+                self.assertEqual(row[0], 0)
+                self.assertEqual(row[5], 0)
+
+    def test_native_negative_capability_stays_valid_only_until_daemon_mutation(self):
+        row = self.run_handler(flags=0, cap_error=61, operation="native-negative")
+        self.assertEqual(row[0], 0)
+        self.assertEqual(row[5], 0)
+
+    def test_native_invalid_phase_keeps_fail_closed_protocol(self):
+        row = self.run_handler(flags=0, operation="native-invalid")
+        self.assertEqual(row[:6], (0, 0, 0, 0, 0, 0))
 
 
 if __name__ == "__main__":

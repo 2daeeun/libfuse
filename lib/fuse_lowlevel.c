@@ -2918,6 +2918,13 @@ static bool want_flag_dependencies_valid(uint64_t want)
 			 "attr release barrier");
 		return false;
 	}
+	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE) &&
+	    (want & attr_release_barrier_dependencies) !=
+		    attr_release_barrier_dependencies) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: ExtFUSE mmap release requires native attr refresh\n");
+		return false;
+	}
 	if ((want & FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS) &&
 	    (want & coherence_epochs_dependencies) != coherence_epochs_dependencies) {
 		fuse_log(FUSE_LOG_ERR,
@@ -3197,6 +3204,9 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		    FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER)
 			se->conn.capable_ext |=
 				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
+		if (inargflags & FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE)
+			se->conn.capable_ext |=
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE;
 		if (inargflags & FUSE_EXTFUSE_COHERENCE_EPOCHS)
 			se->conn.capable_ext |= FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS;
 		if (inargflags & FUSE_MUTATION_METADATA)
@@ -3412,6 +3422,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	if (se->conn.want_ext &
 	    FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER)
 		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER;
+	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE)
+		outargflags |= FUSE_EXTFUSE_PASSTHROUGH_MMAP_RELEASE;
 	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS)
 		outargflags |= FUSE_EXTFUSE_COHERENCE_EPOCHS;
 	if (se->conn.want_ext & FUSE_CAP_MUTATION_METADATA)

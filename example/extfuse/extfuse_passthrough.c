@@ -154,7 +154,7 @@ struct xattr_value {
 #define PERF_START_MOUNT_FMT \
 	"mountpoint=%s debug=%u callback_counting=%u "
 #define PERF_START_WBCACHE_FMT \
-	"wbcache_passthrough=%u native_passthrough=0 "
+	"wbcache_passthrough=%u native_passthrough=%u "
 #define PERF_START_FIXED_READ_FMT "EXTFUSE_FIXED_READ=%u "
 #define PERF_INIT_CACHE_FMT \
 	"reply_timeout=%.3f cache_mode=%d writeback_requested=%u "
@@ -173,7 +173,7 @@ struct xattr_value {
 
 enum perf_backing_mode {
 	PERF_BACKING_DAEMON,
-	PERF_BACKING_WBCACHE,
+	PERF_BACKING_REGISTERED,
 	PERF_BACKING_QUARANTINED,
 };
 
@@ -226,6 +226,8 @@ struct perf_inode_generation {
 	_Atomic uint64_t read_cohort_refs;
 	atomic_bool read_cohort_armed;
 	uint64_t read_cohort_generation;
+	_Atomic uint64_t write_cohort_refs;
+	atomic_bool write_cohort_armed;
 };
 
 struct perf_cache_mutation {
@@ -312,6 +314,7 @@ struct perf_counters {
 	atomic_uint_fast64_t passthrough_attr_suppressions;
 	atomic_uint_fast64_t passthrough_mmap_suppressions;
 	atomic_uint_fast64_t passthrough_release_readonly_fast;
+	atomic_uint_fast64_t passthrough_release_readonly_attr_refreshes;
 	atomic_uint_fast64_t passthrough_release_may_modify;
 	atomic_uint_fast64_t passthrough_release_registration_refreshes;
 	atomic_uint_fast64_t passthrough_release_attr_snapshots;
@@ -345,6 +348,7 @@ struct perf_state {
 	bool c2_fixed_write;
 	bool fixed_read;
 	bool wbcache_write_stream;
+	bool allopt_wbcache;
 	ebpf_context_t *bpf;
 	struct fuse_conn_info_opts *conn_opts;
 	struct fuse_session *session;
@@ -384,7 +388,6 @@ struct perf_state {
 	bool passthrough_attr_refresh_requested;
 	bool passthrough_attr_release_barrier_capable;
 	bool passthrough_attr_release_barrier_requested;
-	bool require_passthrough_coherence;
 	uint32_t bpf_policy_flags;
 	pthread_rwlock_t namespace_lock;
 	pthread_mutex_t backing_mutex;
@@ -928,9 +931,19 @@ static bool notify_inval_xattr_enabled(void)
 	       perf_state.notify_inval_xattr_requested;
 }
 
-static bool wbcache_passthrough_enabled(void)
+static bool allopt_enabled(void)
 {
 	return perf_state.mode == PERF_MODE_ALLOPT;
+}
+
+static bool wbcache_passthrough_enabled(void)
+{
+	return allopt_enabled() && perf_state.allopt_wbcache;
+}
+
+static bool native_passthrough_enabled(void)
+{
+	return allopt_enabled() && !perf_state.allopt_wbcache;
 }
 
 static bool paper_wbcache_passthrough_enabled(void)
@@ -980,6 +993,8 @@ static bool paper_write_fast_active(void)
 
 static const char *coherence_mode_name(void)
 {
+	if (perf_state.passthrough_coherence_v2_requested)
+		return "native-v2";
 	if (!perf_state.wbcache_passthrough_requested)
 		return "none";
 	return coherence_epochs_enabled() ? "strict" : "paper";
@@ -1160,8 +1175,9 @@ static int disable_xattr_cache_locked(const char *reason);
 
 /*
  * The kernel records every native mmap in a dedicated nodeid map.
- * That marker survives RELEASE, so later daemon refreshes cannot accidentally
- * make mmap-mutated attributes BPF-visible.
+ * A nonzero count survives RELEASE while the backing file/VMA remains live,
+ * so a daemon refresh cannot expose mmap-mutated attributes. Negotiated final
+ * backing-file retirement leaves a zero row; older kernels keep it nonzero.
  */
 static bool has_passthrough_mmap_marker_locked(fuse_ino_t ino)
 {
@@ -1171,7 +1187,7 @@ static bool has_passthrough_mmap_marker_locked(fuse_ino_t ino)
 
 	if (!ebpf_data_lookup(perf_state.bpf, &key, &value,
 			      EXTFUSE_MMAP_MAP))
-		return true;
+		return value != 0;
 	lookup_error = errno;
 	if (lookup_error == ENOENT)
 		return false;
@@ -1219,12 +1235,12 @@ static bool attr_cache_suppressed_locked(fuse_ino_t ino,
 	 */
 	if (paper_wbcache_passthrough_enabled())
 		return false;
-	backing = find_backing_locked(ino, NULL);
 	if (coherence_epochs_enabled() ||
 	    perf_state.passthrough_coherence_v2_requested) {
 		*mmap_suppressed = has_passthrough_mmap_marker_locked(ino);
 		return *mmap_suppressed;
 	}
+	backing = find_backing_locked(ino, NULL);
 
 	/*
 	 * Compatibility fallback for an older kernel without negotiated native-I/O
@@ -1332,6 +1348,8 @@ get_inode_generation_locked(fuse_ino_t ino)
 	state->ino = ino;
 	atomic_init(&state->read_cohort_refs, 0);
 	atomic_init(&state->read_cohort_armed, false);
+	atomic_init(&state->write_cohort_refs, 0);
+	atomic_init(&state->write_cohort_armed, false);
 	state->next = perf_state.inode_generations[bucket];
 	atomic_store_explicit(&perf_state.inode_generations[bucket], state,
 			      memory_order_release);
@@ -1920,7 +1938,7 @@ cache_attr(fuse_ino_t nodeid, const struct stat *st, double timeout,
 	 * A snapshot which overlapped a mutation must not be installed in either
 	 * the BPF map or the kernel's inode-attribute cache. Stable ordinary replies
 	 * keep the configured TTL. Native mmap page faults can mutate lower metadata
-	 * after RELEASE, so marked inodes also use zero TTL permanently.
+ * after RELEASE, so an inode with a live mmap guard also uses zero TTL.
 	 */
 	if (!stable) {
 		*reply_timeout = 0;
@@ -2180,7 +2198,7 @@ static bool negative_capability_cache_current_serialized(fuse_ino_t nodeid,
 
 	pthread_mutex_lock(lock);
 	if (perf_state.xattr_cache_bypass ||
-	    (wbcache_passthrough_enabled() &&
+	    (allopt_enabled() &&
 	     has_passthrough_mmap_marker_locked(nodeid)))
 		goto out;
 	if (ebpf_data_lookup(perf_state.bpf, &key, &value, EXTFUSE_XATTR_MAP)) {
@@ -2228,7 +2246,7 @@ refresh_negative_capability_serialized(fuse_ino_t nodeid,
 
 	pthread_mutex_lock(lock);
 	if (perf_state.xattr_cache_bypass ||
-	    (wbcache_passthrough_enabled() &&
+	    (allopt_enabled() &&
 	     has_passthrough_mmap_marker_locked(nodeid)))
 		goto out;
 	state = find_inode_generation_locked(nodeid);
@@ -2458,15 +2476,17 @@ static int invalidate_entry(fuse_ino_t parent, const char *name)
 	return result;
 }
 
-static void apply_wbcache_passthrough_flags(struct fuse_file_info *fi,
-					    int backing_id)
+static void apply_backing_flags(struct fuse_file_info *fi, int backing_id)
 {
 	fi->backing_id = backing_id;
 	/*
-	 * Keep the ordinary FUSE page cache.  Only page-backed READ/WRITE
-	 * requests selected by the ExtFUSE policy use the registered lower file.
+	 * Both routes share registration, but only WBCache uses the upper cache.
+	 * Native O_DIRECT is carried by the lower file's open flags; FOPEN_DIRECT_IO
+	 * would instead route READ/WRITE back through the daemon.
 	 */
-	fi->extfuse_wbcache_passthrough = 1;
+	fi->extfuse_wbcache_passthrough = wbcache_passthrough_enabled();
+	if (native_passthrough_enabled())
+		fi->keep_cache = 0;
 	fi->direct_io = 0;
 	fi->parallel_direct_writes = 0;
 }
@@ -2476,7 +2496,7 @@ static void apply_wbcache_passthrough_flags(struct fuse_file_info *fi,
  * the callback that discovered the failure so its side effects and reply stay
  * consistent, but request loop shutdown immediately.  The validation harness
  * then rejects the fallback counters instead of measuring daemon I/O as
- * WBCache passthrough.
+ * the selected passthrough route.
  */
 static void request_allopt_session_exit(void)
 {
@@ -2490,10 +2510,10 @@ static void request_allopt_session_exit(void)
  * passes NULL because its ordinary READ/WRITE hooks provide the finite
  * invalidation boundary.  This function always consumes both objects.
  */
-static void attach_wbcache_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
-				       struct fuse_file_info *fi,
-				       struct perf_backing *candidate,
-				       struct perf_tombstone *tombstone_candidate)
+static void attach_backing(fuse_req_t req, fuse_ino_t ino, int fd,
+			   struct fuse_file_info *fi,
+			   struct perf_backing *candidate,
+			   struct perf_tombstone *tombstone_candidate)
 {
 	struct perf_backing **link;
 	struct perf_backing *backing;
@@ -2560,10 +2580,9 @@ static void attach_wbcache_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 		free(candidate);
 		free(tombstone_candidate);
 		backing->open_count++;
-		if (backing->mode == PERF_BACKING_WBCACHE) {
+		if (backing->mode == PERF_BACKING_REGISTERED) {
 			counter_increment(&perf_state.counters.passthrough_reuses);
-			apply_wbcache_passthrough_flags(fi,
-						  backing->backing_id);
+			apply_backing_flags(fi, backing->backing_id);
 			counter_increment(&perf_state.counters.passthrough_opens);
 		} else {
 			counter_increment(
@@ -2613,7 +2632,7 @@ static void attach_wbcache_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 	saved_error = errno ? errno : EIO;
 	if (backing_id > 0) {
 		backing->backing_id = backing_id;
-		backing->mode = PERF_BACKING_WBCACHE;
+		backing->mode = PERF_BACKING_REGISTERED;
 		if (paper_wbcache_passthrough_enabled() ||
 		    perf_state.passthrough_coherence_v2_requested ||
 		    coherence_epochs_enabled())
@@ -2625,7 +2644,7 @@ static void attach_wbcache_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 		if (!paper_wbcache_passthrough_enabled())
 			advance_inode_generation_locked(ino,
 						 "backing-registration");
-		apply_wbcache_passthrough_flags(fi, backing_id);
+		apply_backing_flags(fi, backing_id);
 		counter_increment(&perf_state.counters.passthrough_opens);
 		count = counter_value(
 			&perf_state.counters.passthrough_registrations);
@@ -2653,10 +2672,10 @@ static void attach_wbcache_passthrough(fuse_req_t req, fuse_ino_t ino, int fd,
 	pthread_mutex_unlock(&perf_state.backing_mutex);
 }
 
-static bool classify_wbcache_passthrough_release(fuse_ino_t ino,
-						 bool handle_may_modify,
-						 bool *may_modify,
-						 bool *registration_refresh)
+static bool classify_backing_release(fuse_ino_t ino,
+				     bool handle_may_modify,
+				     bool *may_modify,
+				     bool *registration_refresh)
 {
 	struct perf_backing *backing;
 	uint64_t errors;
@@ -2693,8 +2712,8 @@ static bool classify_wbcache_passthrough_release(fuse_ino_t ino,
 	return true;
 }
 
-static bool release_wbcache_passthrough(fuse_req_t req, fuse_ino_t ino,
-					bool advance_generation)
+static bool release_backing(fuse_req_t req, fuse_ino_t ino,
+			    bool advance_generation)
 {
 	struct perf_backing **link;
 	struct perf_backing *backing;
@@ -2766,7 +2785,7 @@ static bool release_wbcache_passthrough(fuse_req_t req, fuse_ino_t ino,
 	return true;
 }
 
-static void cleanup_wbcache_passthrough_state(void)
+static void cleanup_backing_state(void)
 {
 	struct perf_backing *backing;
 	struct perf_tombstone *tombstone;
@@ -3135,6 +3154,10 @@ static void audit_coherence_state(void)
 			if (atomic_load_explicit(&state->read_cohort_refs,
 						 memory_order_acquire) ||
 			    atomic_load_explicit(&state->read_cohort_armed,
+						 memory_order_acquire) ||
+			    atomic_load_explicit(&state->write_cohort_refs,
+						 memory_order_acquire) ||
+			    atomic_load_explicit(&state->write_cohort_armed,
 						 memory_order_acquire))
 				daemon_errors++;
 		}
@@ -3207,6 +3230,7 @@ static void print_counters(const char *phase)
 		" passthrough_attr_suppressions=%" PRIu64
 		" passthrough_mmap_suppressions=%" PRIu64
 		" passthrough_release_readonly_fast=%" PRIu64
+		" passthrough_release_readonly_attr_refreshes=%" PRIu64
 		" passthrough_release_may_modify=%" PRIu64
 		" passthrough_release_registration_refreshes=%" PRIu64
 		" passthrough_release_attr_snapshots=%" PRIu64
@@ -3287,6 +3311,8 @@ static void print_counters(const char *phase)
 		counter_value(&perf_state.counters
 				      .passthrough_release_readonly_fast),
 		counter_value(&perf_state.counters
+				      .passthrough_release_readonly_attr_refreshes),
+		counter_value(&perf_state.counters
 				      .passthrough_release_may_modify),
 		counter_value(&perf_state.counters
 				      .passthrough_release_registration_refreshes),
@@ -3319,6 +3345,17 @@ static void print_counters(const char *phase)
 		counter_value(&perf_state.counters.native_io_active_residuals),
 		counter_value(&perf_state.counters.native_io_state_audit_errors));
 	fflush(stderr);
+}
+
+static bool require_allopt_feature(struct fuse_conn_info *conn, uint64_t feature)
+{
+	if (fuse_set_feature_flag(conn, feature))
+		return true;
+	if (!perf_state.init_rc)
+		perf_state.init_rc = -EOPNOTSUPP;
+	/* Make missing capabilities fail INIT instead of selecting daemon I/O. */
+	conn->want_ext |= feature;
+	return false;
 }
 
 static void perf_init(void *userdata, struct fuse_conn_info *conn)
@@ -3383,8 +3420,12 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 		 FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM) != 0;
 	perf_state.uring_zero_copy_required = perf_state.c2_fixed_write ||
 		perf_state.fixed_read;
-	if (wbcache_passthrough_enabled()) {
-		/* C3/C4 retain the upper FUSE cache; native passthrough stays off. */
+	if (native_passthrough_enabled()) {
+		/* Native passthrough and the upper writeback cache are exclusive. */
+		lo->writeback = 0;
+		fuse_unset_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
+		conn->max_backing_stack_depth = FUSE_BACKING_STACKED_UNDER;
+	} else if (wbcache_passthrough_enabled()) {
 		lo->writeback = 1;
 		if (!fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE)) {
 			perf_state.init_rc = -EOPNOTSUPP;
@@ -3460,7 +3501,29 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 						FUSE_CAP_NOTIFY_INVAL_XATTR);
 		}
 	}
-	if (wbcache_passthrough_enabled()) {
+	if (native_passthrough_enabled()) {
+		fuse_unset_feature_flag(conn, FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH);
+		fuse_unset_feature_flag(conn, FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM);
+		fuse_unset_feature_flag(conn, FUSE_CAP_EXTFUSE_COHERENCE_EPOCHS);
+		fuse_unset_feature_flag(conn, FUSE_CAP_MUTATION_METADATA);
+		fuse_unset_feature_flag(conn, FUSE_CAP_NOTIFY_INVAL_XATTR);
+		perf_state.passthrough_requested =
+			require_allopt_feature(conn, FUSE_CAP_PASSTHROUGH);
+		perf_state.passthrough_coherence_requested =
+			require_allopt_feature(
+				conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE);
+		perf_state.passthrough_coherence_v2_requested =
+			require_allopt_feature(
+				conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE_V2);
+		perf_state.passthrough_attr_refresh_requested =
+			require_allopt_feature(
+				conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH);
+		perf_state.passthrough_attr_release_barrier_requested =
+			require_allopt_feature(conn,
+				FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
+		if (perf_state.init_rc)
+			request_allopt_session_exit();
+	} else if (wbcache_passthrough_enabled()) {
 		/* Do not mix this cached route with the native passthrough ABI. */
 		fuse_unset_feature_flag(conn, FUSE_CAP_PASSTHROUGH);
 		fuse_unset_feature_flag(
@@ -3544,6 +3607,16 @@ static void perf_init(void *userdata, struct fuse_conn_info *conn)
 			FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_RELEASE_BARRIER);
 		perf_state.passthrough_attr_release_barrier_requested = false;
 	}
+	/* Old kernels retain their conservative, session-lifetime mmap markers. */
+	if (native_passthrough_enabled() &&
+	    perf_state.passthrough_coherence_v2_requested &&
+	    perf_state.passthrough_attr_refresh_requested)
+		fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE);
+	else
+		fuse_unset_feature_flag(conn, FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE);
+	fprintf(stderr, "NATIVE_MMAP_RELEASE capable=%u requested=%u\n",
+		!!(conn->capable_ext & FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE),
+		!!(conn->want_ext & FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE));
 	if ((perf_state.wbcache_passthrough_requested ||
 	     perf_state.passthrough_attr_release_barrier_requested ||
 	     coherence_epochs_enabled()) &&
@@ -3647,8 +3720,8 @@ static void perf_destroy(void *userdata)
 		close(perf_state.syncfs_fd);
 		perf_state.syncfs_fd = -1;
 	}
-	if (wbcache_passthrough_enabled())
-		cleanup_wbcache_passthrough_state();
+	if (allopt_enabled())
+		cleanup_backing_state();
 	audit_coherence_state();
 	print_counters("destroy");
 	cleanup_inode_generation_state();
@@ -4042,7 +4115,7 @@ static void perf_tmpfile(fuse_req_t req, fuse_ino_t parent, mode_t mode,
 		lo_tmpfile(req, parent, mode, fi);
 		return;
 	}
-	if (wbcache_passthrough_enabled()) {
+	if (allopt_enabled()) {
 		candidate = calloc(1, sizeof(*candidate));
 		if (!paper_wbcache_passthrough_enabled())
 			tombstone_candidate =
@@ -4099,9 +4172,9 @@ static void perf_tmpfile(fuse_req_t req, fuse_ino_t parent, mode_t mode,
 		fi->keep_cache = 1;
 	fi->parallel_direct_writes = 1;
 	enable_uring_fixed_io_for_open(fi);
-	if (wbcache_passthrough_enabled())
-		attach_wbcache_passthrough(req, entry.ino, fd, fi, candidate,
-					   tombstone_candidate);
+	if (allopt_enabled())
+		attach_backing(req, entry.ino, fd, fi, candidate,
+				tombstone_candidate);
 	entry.attr_timeout = cache_inode_attr_before_reply(
 		req, entry.ino, &entry.attr);
 	fuse_reply_create(req, &entry, fi);
@@ -4131,7 +4204,7 @@ void perf_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		return;
 	}
 	lo = lo_data(req);
-	if (wbcache_passthrough_enabled()) {
+	if (allopt_enabled()) {
 		candidate = calloc(1, sizeof(*candidate));
 		if (!paper_wbcache_passthrough_enabled())
 			tombstone_candidate =
@@ -4216,9 +4289,9 @@ void perf_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 	invalidate_entry(parent, name);
 	invalidate_attr(entry.ino);
 	invalidate_xattr(entry.ino, PERF_CAPABILITY_XATTR, true);
-	if (wbcache_passthrough_enabled())
-		attach_wbcache_passthrough(req, entry.ino, fd, fi, candidate,
-					   tombstone_candidate);
+	if (allopt_enabled())
+		attach_backing(req, entry.ino, fd, fi, candidate,
+				tombstone_candidate);
 	cache_mutation_end(&mutation);
 	if (existing_fd >= 0)
 		close(existing_fd);
@@ -4484,7 +4557,7 @@ void perf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 		return;
 	}
 
-	if (wbcache_passthrough_enabled()) {
+	if (allopt_enabled()) {
 		candidate = calloc(1, sizeof(*candidate));
 		if (!paper_wbcache_passthrough_enabled())
 			tombstone_candidate =
@@ -4539,11 +4612,40 @@ void perf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	}
 
 	enable_uring_fixed_io_for_open(fi);
-	if (wbcache_passthrough_enabled())
-		attach_wbcache_passthrough(req, ino, (int)fi->fh, fi, candidate,
-					   tombstone_candidate);
+	if (allopt_enabled())
+		attach_backing(req, ino, (int)fi->fh, fi, candidate,
+				tombstone_candidate);
 	cache_inode_attr_before_reply(req, ino, NULL);
 	fuse_reply_open(req, fi);
+}
+
+/* An idle native READ leaves an atime token stale even on a read-only close. */
+static bool native_readonly_attr_needs_refresh(fuse_ino_t ino)
+{
+	struct attr_key key = { .nodeid = ino };
+	struct attr_value value;
+	uint64_t native_state;
+	bool mmap_suppressed;
+	bool refresh = false;
+
+	if (!perf_state.passthrough_coherence_v2_requested)
+		return false;
+	pthread_mutex_lock(&perf_state.backing_mutex);
+	if (perf_state.cache_bypass ||
+	    attr_cache_suppressed_locked(ino, &mmap_suppressed) ||
+	    !native_state_snapshot_locked(ino, &native_state,
+					 "readonly-release-state", false) ||
+	    (native_state & EXTFUSE_NATIVE_STATE_ACTIVE_MASK))
+		goto out;
+	if (!ebpf_data_lookup(perf_state.bpf, &key, &value, EXTFUSE_ATTR_MAP))
+		refresh = value.stale || value.native_state != native_state;
+	else if (errno == ENOENT)
+		refresh = true;
+	else
+		disable_metadata_cache_locked("readonly-release-attr-lookup");
+out:
+	pthread_mutex_unlock(&perf_state.backing_mutex);
+	return refresh;
 }
 
 __attribute__((noinline, used))
@@ -4567,7 +4669,7 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 	bool released;
 
 	callback_increment(&perf_state.counters.release);
-	if (!wbcache_passthrough_enabled()) {
+	if (!allopt_enabled()) {
 		lo_release(req, ino, fi);
 		return;
 	}
@@ -4579,7 +4681,7 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 		 * ExtFUSE WRITE decision, so do not add a close-time fstat, cache
 		 * publication, or generation transition to the data path.
 		 */
-		released = release_wbcache_passthrough(req, ino, false);
+		released = release_backing(req, ino, false);
 		close(fi->fh);
 		if (!released) {
 			xattr_lock = xattr_lock_for_inode(ino);
@@ -4596,9 +4698,8 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 	pthread_mutex_lock(xattr_lock);
 	barrier = attr_release_barrier_enabled();
 	handle_may_modify = file_may_modify(fi->flags);
-	if (!classify_wbcache_passthrough_release(ino, handle_may_modify,
-						  &may_modify,
-						  &registration_refresh)) {
+	if (!classify_backing_release(ino, handle_may_modify,
+				      &may_modify, &registration_refresh)) {
 		/* Fatal state loss must not leave an exact-token row serviceable. */
 		invalidate_attr(ino);
 		invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
@@ -4608,9 +4709,15 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 		return;
 	}
 	if (!may_modify) {
-		released = release_wbcache_passthrough(req, ino, false);
+		released = release_backing(req, ino, false);
 		close(fi->fh);
 		if (released) {
+			/* Snapshot through the pinned inode after retiring this handle. */
+			if (native_readonly_attr_needs_refresh(ino)) {
+				counter_increment(&perf_state.counters
+					.passthrough_release_readonly_attr_refreshes);
+				cache_inode_attr_snapshot(req, ino, NULL);
+			}
 			counter_increment(
 				&perf_state.counters
 					 .passthrough_release_readonly_fast);
@@ -4632,11 +4739,11 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 	cache_mutation_add(&mutation, ino);
 	if (!cache_mutation_begin(&mutation)) {
 		cache_mutation_end(&mutation);
-		if (barrier) {
-			invalidate_attr(ino);
-			invalidate_xattr_serialized(
-				ino, PERF_CAPABILITY_XATTR, true);
-		}
+		/* RELEASE must retire its handle even after coherence setup fails. */
+		release_backing(req, ino, false);
+		close(fi->fh);
+		invalidate_attr(ino);
+		invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
 		pthread_mutex_unlock(xattr_lock);
 		fuse_reply_err(req, EIO);
 		return;
@@ -4644,7 +4751,7 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 	if (!barrier)
 		invalidate_attr(ino);
 	invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
-	released = release_wbcache_passthrough(req, ino, !barrier);
+	released = release_backing(req, ino, !barrier);
 	close(fi->fh);
 	if (!barrier)
 		invalidate_attr(ino);
@@ -4734,8 +4841,16 @@ void perf_release(fuse_req_t req, fuse_ino_t ino,
 	fuse_reply_err(req, 0);
 }
 
-struct perf_uring_write_context {
+static bool cache_io_begin(struct perf_cache_mutation *mutation,
+			   struct perf_inode_generation **cohort);
+static bool cache_io_cohort_last(struct perf_cache_mutation *mutation,
+				  struct perf_inode_generation *cohort);
+static void cache_io_cohort_release(struct perf_inode_generation *cohort,
+				    bool attr_only);
+
+struct perf_write_context {
 	struct perf_cache_mutation mutation;
+	struct perf_inode_generation *cohort;
 	struct lo_data *lo;
 	fuse_ino_t ino;
 	size_t requested;
@@ -4743,6 +4858,7 @@ struct perf_uring_write_context {
 	dev_t dev;
 	ino_t lower_ino;
 	bool capability_fast;
+	bool writeback;
 };
 
 static void perf_write_contract_failed(const char *path,
@@ -4783,10 +4899,10 @@ static enum perf_cache_attr_outcome publish_pinned_write_attr(
 			  reply_timeout);
 }
 
-static void perf_uring_write_complete(fuse_req_t req, ssize_t result,
-				      void *userdata)
+static void perf_write_complete(fuse_req_t req, ssize_t result,
+				struct perf_write_context *context,
+				const char *path)
 {
-	struct perf_uring_write_context *context = userdata;
 	struct perf_cache_snapshot snapshot;
 	struct stat st;
 	double ignored_reply_timeout;
@@ -4794,10 +4910,15 @@ static void perf_uring_write_complete(fuse_req_t req, ssize_t result,
 	bool attr_published = false;
 	bool quiescent;
 	bool snapshot_valid;
+	bool last = true;
 	int reply_result;
+	struct perf_inode_generation *cohort = context->cohort;
 
-	quiescent = cache_mutation_end_capture(&context->mutation, &snapshot,
-					      &snapshot_valid);
+	context->cohort = NULL;
+	if (cohort)
+		last = cache_io_cohort_last(&context->mutation, cohort);
+	quiescent = last && cache_mutation_end_capture(
+		&context->mutation, &snapshot, &snapshot_valid);
 	if (context->mutation.xattr_quiescent &&
 	    (!context->capability_fast || !paper_capability_is_safe()))
 		refill_capability_after_write(req, context->ino);
@@ -4808,29 +4929,62 @@ static void perf_uring_write_complete(fuse_req_t req, ssize_t result,
 			&ignored_reply_timeout, &snapshot, snapshot_valid);
 		attr_published = attr_outcome == PERF_CACHE_ATTR_PUBLISHED;
 	}
+	if (cohort && last)
+		cache_io_cohort_release(cohort, false);
 
 	if (result < 0) {
 		reply_result = fuse_reply_err(req, (int)-result);
-		perf_write_contract_failed("uring-fixed", "write-io",
-					   (int)result);
+		if (context->writeback)
+			perf_write_contract_failed(path, "write-io", (int)result);
 	} else if ((size_t)result > context->requested) {
 		reply_result = fuse_reply_err(req, EIO);
-		perf_write_contract_failed("uring-fixed", "write-oversize",
-					   EIO);
+		perf_write_contract_failed(path, "write-oversize", EIO);
+	} else if (context->writeback && (size_t)result != context->requested) {
+		/* Writeback cannot retry a tail after the folios have been released. */
+		reply_result = fuse_reply_err(req, EIO);
+		perf_write_contract_failed(path, "write-short", EIO);
 	} else {
 		reply_result = fuse_reply_write(req, (size_t)result);
-		if ((size_t)result != context->requested)
-			perf_write_contract_failed("uring-fixed", "write-short",
-						   EIO);
 	}
 	/* A new writer may supersede quiescence before this snapshot is installed. */
 	if (quiescent && !attr_published &&
 	    attr_outcome != PERF_CACHE_ATTR_UNSTABLE)
-		perf_write_contract_failed(
-			"uring-fixed", "write-attr-publication", EIO);
+		perf_write_contract_failed(path, "write-attr-publication", EIO);
 	if (reply_result)
-		perf_write_contract_failed("uring-fixed", "write-reply",
-					   reply_result);
+		perf_write_contract_failed(path, "write-reply", reply_result);
+}
+
+static bool perf_write_begin(fuse_req_t req, fuse_ino_t ino, size_t requested,
+			     const struct fuse_file_info *fi,
+			     struct perf_write_context *context, const char *path)
+{
+	struct lo_inode *inode = lo_inode(req, ino);
+
+	*context = (struct perf_write_context) {
+		.lo = lo_data(req),
+		.ino = ino,
+		.requested = requested,
+		.inode_fd = inode->fd,
+		.dev = inode->dev,
+		.lower_ino = inode->ino,
+		.capability_fast = paper_write_fast_active(),
+		.writeback = fi->writepage,
+	};
+	cache_mutation_add(&context->mutation, ino);
+	if (cache_io_begin(&context->mutation, &context->cohort))
+		return true;
+	cache_mutation_end(&context->mutation);
+	fuse_reply_err(req, EIO);
+	perf_write_contract_failed(path, "write-mutation-begin", EIO);
+	return false;
+}
+
+static void perf_uring_write_complete(fuse_req_t req, ssize_t result,
+				      void *userdata)
+{
+	struct perf_write_context *context = userdata;
+
+	perf_write_complete(req, result, context, "uring-fixed");
 	free(context);
 }
 
@@ -4839,14 +4993,7 @@ static void perf_write_uring_zero_copy(fuse_req_t req, fuse_ino_t ino,
 				       off_t offset,
 				       struct fuse_file_info *fi)
 {
-	struct perf_uring_write_context *context;
-	struct perf_cache_snapshot snapshot;
-	struct lo_inode *inode;
-	enum perf_cache_attr_outcome attr_outcome = PERF_CACHE_ATTR_MISSING;
-	bool attr_published = false;
-	bool quiescent;
-	bool snapshot_valid;
-	int reply_result;
+	struct perf_write_context *context;
 	int result;
 
 	if (!fuse_req_is_uring_zero_copy(req)) {
@@ -4862,21 +5009,9 @@ static void perf_write_uring_zero_copy(fuse_req_t req, fuse_ino_t ino,
 					   ENOMEM);
 		return;
 	}
-	inode = lo_inode(req, ino);
-	context->lo = lo_data(req);
-	context->ino = ino;
-	context->requested = fuse_buf_size(buffer);
-	context->inode_fd = inode->fd;
-	context->dev = inode->dev;
-	context->lower_ino = inode->ino;
-	context->capability_fast = paper_write_fast_active();
-	cache_mutation_add(&context->mutation, ino);
-	if (!cache_mutation_begin(&context->mutation)) {
-		cache_mutation_end(&context->mutation);
+	if (!perf_write_begin(req, ino, fuse_buf_size(buffer), fi, context,
+			      "uring-fixed")) {
 		free(context);
-		fuse_reply_err(req, EIO);
-		perf_write_contract_failed(
-			"uring-fixed", "write-mutation-begin", EIO);
 		return;
 	}
 	result = fuse_uring_submit_fixed_io(
@@ -4885,45 +5020,35 @@ static void perf_write_uring_zero_copy(fuse_req_t req, fuse_ino_t ino,
 	if (!result)
 		return;
 
-	quiescent = cache_mutation_end_capture(&context->mutation, &snapshot,
-					      &snapshot_valid);
-	if (context->mutation.xattr_quiescent &&
-	    (!context->capability_fast || !paper_capability_is_safe()))
-		refill_capability_after_write(req, ino);
-	if (quiescent) {
-		struct stat st;
-		double ignored_reply_timeout;
-
-		attr_outcome = publish_pinned_write_attr(
-			ino, context->inode_fd, context->dev,
-			context->lower_ino, context->lo, &st,
-			&ignored_reply_timeout, &snapshot, snapshot_valid);
-		attr_published = attr_outcome == PERF_CACHE_ATTR_PUBLISHED;
-	}
-	free(context);
-	reply_result = fuse_reply_err(req, -result);
-	if (quiescent && !attr_published &&
-	    attr_outcome != PERF_CACHE_ATTR_UNSTABLE)
-		perf_write_contract_failed(
-			"uring-fixed", "write-submit-attr-publication", EIO);
-	if (reply_result)
-		perf_write_contract_failed(
-			"uring-fixed", "write-submit-reply", reply_result);
+	/* Submission failure leaves the cohort and replies exactly once. */
+	perf_uring_write_complete(req, result, context);
 	perf_write_contract_failed("uring-fixed", "write-submit", result);
 }
 
-/* BUSY excludes joins while the first BEGIN or the last publication runs. */
-#define PERF_READ_COHORT_BUSY UINT64_MAX
-#define PERF_READ_COHORT_JOIN_ATTEMPTS 4
+/*
+ * Overlapping I/O of the same kind shares a guard, not a lower I/O or reply.
+ * READ guards attr; WRITE guards attr and xattr. Keep the domains separate so
+ * the last WRITE can refill xattr while READs still keep attr active.
+ * BUSY excludes joins while the first BEGIN or the last publication runs.
+ */
+#define PERF_IO_COHORT_BUSY UINT64_MAX
+#define PERF_IO_COHORT_JOIN_ATTEMPTS 4
 
-static bool cache_read_begin(struct perf_cache_mutation *mutation,
-			    struct perf_inode_generation **cohort)
+static _Atomic uint64_t *
+cache_io_cohort_refs(struct perf_inode_generation *state, bool attr_only)
+{
+	return attr_only ? &state->read_cohort_refs : &state->write_cohort_refs;
+}
+
+static bool cache_io_begin(struct perf_cache_mutation *mutation,
+			   struct perf_inode_generation **cohort)
 {
 	struct perf_inode_generation *state;
+	_Atomic uint64_t *cohort_refs;
 	uint64_t refs;
 
 	*cohort = NULL;
-	if (perf_state.mode != PERF_MODE_HIT || !mutation->attr_only ||
+	if (perf_state.mode != PERF_MODE_HIT ||
 	    mutation->count != 1 ||
 	    counter_value(&perf_state.counters.cache_bypass_errors))
 		return cache_mutation_begin(mutation);
@@ -4935,33 +5060,38 @@ static bool cache_read_begin(struct perf_cache_mutation *mutation,
 		state = state->next;
 	if (!state)
 		return cache_mutation_begin(mutation);
-	refs = atomic_load_explicit(&state->read_cohort_refs, memory_order_acquire);
+	cohort_refs = cache_io_cohort_refs(state, mutation->attr_only);
+	refs = atomic_load_explicit(cohort_refs, memory_order_acquire);
 	/* A changing active count is not a boundary: retry without a stripe. */
 	for (unsigned int attempt = 0;
-	     refs && refs < PERF_READ_COHORT_BUSY - 1 &&
-	     attempt < PERF_READ_COHORT_JOIN_ATTEMPTS; attempt++) {
+	     refs && refs < PERF_IO_COHORT_BUSY - 1 &&
+	     attempt < PERF_IO_COHORT_JOIN_ATTEMPTS; attempt++) {
 		if (atomic_compare_exchange_strong_explicit(
-			    &state->read_cohort_refs, &refs, refs + 1,
+			    cohort_refs, &refs, refs + 1,
 			    memory_order_acq_rel, memory_order_acquire)) {
 			*cohort = state;
 			return true;
 		}
 	}
 	if (!refs && atomic_compare_exchange_strong_explicit(
-			   &state->read_cohort_refs, &refs, PERF_READ_COHORT_BUSY,
+			   cohort_refs, &refs, PERF_IO_COHORT_BUSY,
 			   memory_order_acq_rel, memory_order_acquire)) {
 		if (!cache_mutation_begin(mutation)) {
 			cache_mutation_end(mutation);
-			atomic_store_explicit(&state->read_cohort_refs, 0,
+			atomic_store_explicit(cohort_refs, 0,
 					      memory_order_release);
 			return false;
 		}
 		/* The first request may finish before another cohort member. */
-		state->read_cohort_armed = mutation->armed;
-		state->read_cohort_generation = mutation->read_generation;
+		if (mutation->attr_only) {
+			state->read_cohort_armed = mutation->armed;
+			state->read_cohort_generation = mutation->read_generation;
+		} else {
+			state->write_cohort_armed = mutation->armed;
+		}
 		mutation->armed = false;
 		*cohort = state;
-		atomic_store_explicit(&state->read_cohort_refs, 1,
+		atomic_store_explicit(cohort_refs, 1,
 				      memory_order_release);
 		return true;
 	}
@@ -4969,38 +5099,51 @@ static bool cache_read_begin(struct perf_cache_mutation *mutation,
 	return cache_mutation_begin(mutation);
 }
 
-static bool cache_read_cohort_last(struct perf_cache_mutation *mutation,
-				   struct perf_inode_generation *cohort)
+static bool cache_io_cohort_last(struct perf_cache_mutation *mutation,
+				  struct perf_inode_generation *cohort)
 {
-	uint64_t refs = atomic_load_explicit(&cohort->read_cohort_refs,
-					    memory_order_acquire);
+	_Atomic uint64_t *cohort_refs = cache_io_cohort_refs(cohort,
+							mutation->attr_only);
+	uint64_t refs = atomic_load_explicit(cohort_refs, memory_order_acquire);
 
 	for (;;) {
 		uint64_t replacement;
 
-		if (!refs || refs == PERF_READ_COHORT_BUSY) {
+		if (!refs || refs == PERF_IO_COHORT_BUSY) {
 			pthread_mutex_t *lock = cache_lock_for_inode(cohort->ino);
 
 			pthread_mutex_lock(lock);
 			counter_increment(
 				&perf_state.counters.passthrough_state_errors);
-			disable_all_caches_locked("read-cohort-state");
+			disable_all_caches_locked("io-cohort-state");
 			pthread_mutex_unlock(lock);
 			return false;
 		}
-		replacement = refs == 1 ? PERF_READ_COHORT_BUSY : refs - 1;
+		replacement = refs == 1 ? PERF_IO_COHORT_BUSY : refs - 1;
 		if (atomic_compare_exchange_weak_explicit(
-			    &cohort->read_cohort_refs, &refs, replacement,
+			    cohort_refs, &refs, replacement,
 			    memory_order_acq_rel, memory_order_acquire))
 			break;
 	}
 	if (refs != 1)
 		return false;
-	/* Reconstruct the first member's attr-only guard in the last context. */
-	mutation->armed = cohort->read_cohort_armed;
-	mutation->read_generation = cohort->read_cohort_generation;
-	cohort->read_cohort_armed = false;
+	/* Transfer the first member's guard to the last completing request. */
+	if (mutation->attr_only) {
+		mutation->armed = cohort->read_cohort_armed;
+		mutation->read_generation = cohort->read_cohort_generation;
+		cohort->read_cohort_armed = false;
+	} else {
+		mutation->armed = cohort->write_cohort_armed;
+		cohort->write_cohort_armed = false;
+	}
 	return true;
+}
+
+static void cache_io_cohort_release(struct perf_inode_generation *cohort,
+				    bool attr_only)
+{
+	atomic_store_explicit(cache_io_cohort_refs(cohort, attr_only), 0,
+			      memory_order_release);
 }
 
 struct perf_read_context {
@@ -5053,7 +5196,7 @@ static void perf_read_prepare(void *opaque, ssize_t read_result)
 	int saved_errno = errno;
 
 	context->cohort = NULL;
-	if (cohort && !cache_read_cohort_last(&context->mutation, cohort))
+	if (cohort && !cache_io_cohort_last(&context->mutation, cohort))
 		goto out;
 	/* Even a failed/partial lower read may have changed atime. */
 	(void)read_result;
@@ -5076,8 +5219,7 @@ static void perf_read_prepare(void *opaque, ssize_t read_result)
 			   false, &ignored_reply_timeout);
 release_cohort:
 	if (cohort)
-		atomic_store_explicit(&cohort->read_cohort_refs, 0,
-				      memory_order_release);
+		cache_io_cohort_release(cohort, true);
 out:
 	/* Cache failure never replaces the lower READ result or its errno. */
 	errno = saved_errno;
@@ -5138,7 +5280,7 @@ static void perf_read_fixed(fuse_req_t req, fuse_ino_t ino, size_t size,
 	context->requested = size;
 	context->mutation.attr_only = true;
 	cache_mutation_add(&context->mutation, ino);
-	if (!cache_read_begin(&context->mutation, &context->cohort)) {
+	if (!cache_io_begin(&context->mutation, &context->cohort)) {
 		cache_mutation_end(&context->mutation);
 		free(context);
 		fuse_reply_err(req, EIO);
@@ -5182,7 +5324,7 @@ void perf_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 	context.lo = lo_data(req);
 	context.inode = lo_inode(req, ino);
 	cache_mutation_add(&context.mutation, ino);
-	if (!cache_read_begin(&context.mutation, &context.cohort)) {
+	if (!cache_io_begin(&context.mutation, &context.cohort)) {
 		cache_mutation_end(&context.mutation);
 		fuse_reply_err(req, EIO);
 		return;
@@ -5207,15 +5349,8 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 	double ignored_reply_timeout;
 	struct perf_cache_snapshot snapshot;
 	struct fuse_mutation_attr mutation_attr;
-	enum perf_cache_attr_outcome attr_outcome = PERF_CACHE_ATTR_MISSING;
 	bool carry_negative_capability = false;
-	bool capability_fast;
 	bool have_attr = false;
-	bool publish_attr;
-	bool quiescent;
-	bool strict_writeback;
-	size_t requested;
-	int reply_result;
 	uint64_t negative_capability_daemon_state;
 	ssize_t result;
 	int inode_fd;
@@ -5232,71 +5367,50 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 		lo_write_buf(req, ino, buffer, offset, fi);
 		return;
 	}
+	if (perf_state.paper_write_fast) {
+		struct perf_write_context context;
+
+		if (!perf_write_begin(req, ino, fuse_buf_size(buffer), fi,
+				      &context, "sync"))
+			return;
+		result = lo_do_write_buf(req, ino, buffer, offset, fi);
+		perf_write_complete(req, result, &context, "sync");
+		return;
+	}
 	lo = lo_data(req);
 	inode = lo_inode(req, ino);
 	inode_fd = inode->fd;
-	capability_fast = paper_write_fast_active();
-	strict_writeback = capability_fast && fi->writepage;
-	if (!capability_fast) {
-		xattr_lock = xattr_lock_for_inode(ino);
-		pthread_mutex_lock(xattr_lock);
-		carry_negative_capability =
-			negative_capability_cache_current_serialized(
-				ino, &negative_capability_daemon_state);
-	}
+	xattr_lock = xattr_lock_for_inode(ino);
+	pthread_mutex_lock(xattr_lock);
+	carry_negative_capability = negative_capability_cache_current_serialized(
+		ino, &negative_capability_daemon_state);
 	cache_mutation_add(&mutation, ino);
 	if (!cache_mutation_begin(&mutation)) {
 		cache_mutation_end(&mutation);
-		if (xattr_lock)
-			pthread_mutex_unlock(xattr_lock);
+		pthread_mutex_unlock(xattr_lock);
 		fuse_reply_err(req, EIO);
 		return;
 	}
-	if (!capability_fast) {
-		/* Preserve the legacy C1/C2 and C3/C4 daemon fallback contract. */
-		invalidate_attr(ino);
-		if (!carry_negative_capability)
-			invalidate_xattr_serialized(
-				ino, PERF_CAPABILITY_XATTR, true);
-	}
-	requested = fuse_buf_size(buffer);
+	/* Preserve the legacy metadata and AllOpt daemon fallback contract. */
+	invalidate_attr(ino);
+	if (!carry_negative_capability)
+		invalidate_xattr_serialized(ino, PERF_CAPABILITY_XATTR, true);
 	result = lo_do_write_buf(req, ino, buffer, offset, fi);
-	quiescent = cache_mutation_end(&mutation);
-	if (!capability_fast && result >= 0 && carry_negative_capability)
+	cache_mutation_end(&mutation);
+	if (result >= 0 && carry_negative_capability)
 		refresh_negative_capability_serialized(
 			ino, negative_capability_daemon_state);
-	if (xattr_lock)
-		pthread_mutex_unlock(xattr_lock);
-	if (result >= 0 && mutation.xattr_quiescent &&
-	    perf_state.paper_write_fast &&
-	    !paper_capability_is_safe())
-		refill_capability_after_write(req, ino);
+	pthread_mutex_unlock(xattr_lock);
 
 	if (result >= 0) {
-		/* Coalesce only the explicit paper-fast writer cohort. */
-		publish_attr = !capability_fast || quiescent;
-		if (publish_attr && cache_snapshot_begin(ino, &snapshot)) {
-			if (capability_fast &&
-			    ((snapshot.daemon_state | snapshot.native_state) &
-			     EXTFUSE_NATIVE_STATE_ACTIVE_MASK)) {
-				attr_outcome = PERF_CACHE_ATTR_UNSTABLE;
-			} else if (!extfuse_snapshot_pinned_inode(
-					   inode_fd, inode->dev, inode->ino, &st)) {
-				attr_outcome = cache_attr(
-					ino, &st, lo->timeout, &snapshot, false,
-					&ignored_reply_timeout);
-				/* Legacy/C3/C4 retain their pre-existing reply behavior. */
-				have_attr = !capability_fast ||
-					    attr_outcome == PERF_CACHE_ATTR_PUBLISHED;
-			}
+		if (cache_snapshot_begin(ino, &snapshot) &&
+		    !extfuse_snapshot_pinned_inode(
+			    inode_fd, inode->dev, inode->ino, &st)) {
+			cache_attr(ino, &st, lo->timeout, &snapshot, false,
+				    &ignored_reply_timeout);
+			have_attr = true;
 		}
-		/* Async writeback cannot replay an unwritten tail after this reply. */
-		if (strict_writeback && (size_t)result != requested) {
-			reply_result = fuse_reply_err(req, EIO);
-			perf_write_contract_failed(
-				"sync", (size_t)result > requested ?
-				"write-oversize" : "write-short", EIO);
-		} else if (have_attr && mutation_metadata_enabled()) {
+		if (have_attr && mutation_metadata_enabled()) {
 			mutation_attr = (struct fuse_mutation_attr) {
 				.ino = ino,
 				.attr = &st,
@@ -5304,23 +5418,13 @@ void perf_write_buf(fuse_req_t req, fuse_ino_t ino,
 					ino, ignored_reply_timeout),
 				.flags = FUSE_MUTATION_NODE_ATTR_VALID,
 			};
-			reply_result = fuse_reply_write_attr(
+			fuse_reply_write_attr(
 				req, (size_t)result, &mutation_attr);
 		} else {
-			reply_result = fuse_reply_write(req, (size_t)result);
+			fuse_reply_write(req, (size_t)result);
 		}
-		/* UNSTABLE means a newer writer now owns the final publication. */
-		if (capability_fast && quiescent && !have_attr &&
-		    attr_outcome != PERF_CACHE_ATTR_UNSTABLE)
-			perf_write_contract_failed(
-				"sync", "write-attr-publication", EIO);
-		if (capability_fast && reply_result)
-			perf_write_contract_failed(
-				"sync", "write-reply", reply_result);
 	} else {
 		fuse_reply_err(req, (int)-result);
-		if (strict_writeback)
-			perf_write_contract_failed("sync", "write-io", (int)result);
 	}
 }
 
@@ -6138,7 +6242,6 @@ static int validate_experiment_toggles(void)
 {
 	bool paper_profile = perf_state.profile == PERF_PROFILE_PAPER_LIKE;
 	bool c1_or_c2 = perf_state.mode == PERF_MODE_HIT && paper_profile;
-	bool c3_or_c4 = perf_state.mode == PERF_MODE_ALLOPT && paper_profile;
 
 	if (perf_state.read_upcall_only) {
 		fprintf(stderr,
@@ -6163,12 +6266,29 @@ static int validate_experiment_toggles(void)
 			"EXTFUSE_FIXED_READ requires hit mode, uring transport, and paper-like profile\n");
 		return -1;
 	}
-	if (perf_state.wbcache_write_stream && !c3_or_c4) {
+	if (perf_state.wbcache_write_stream &&
+	    !paper_wbcache_passthrough_enabled()) {
 		fprintf(stderr,
-			"EXTFUSE_WBCACHE_WRITE_STREAM requires allopt mode and paper-like profile\n");
+			"EXTFUSE_WBCACHE_WRITE_STREAM requires allopt mode, paper-like profile, and EXTFUSE_ALLOPT_DATA_PATH=wbcache\n");
 		return -1;
 	}
 	return 0;
+}
+
+static int parse_allopt_data_path(void)
+{
+	const char *path = getenv("EXTFUSE_ALLOPT_DATA_PATH");
+
+	if (!path || !strcmp(path, "native")) {
+		perf_state.allopt_wbcache = false;
+		return 0;
+	}
+	if (!strcmp(path, "wbcache")) {
+		perf_state.allopt_wbcache = true;
+		return 0;
+	}
+	fprintf(stderr, "EXTFUSE_ALLOPT_DATA_PATH must be native or wbcache\n");
+	return -1;
 }
 
 static int parse_uring_q_depth(unsigned int *q_depth)
@@ -6202,6 +6322,9 @@ static void usage(const char *program)
 		"{zero-ttl|paper-like|gate} BPF_OBJECT SOURCE MOUNTPOINT "
 		"[PASSTHROUGH_LL_OPTION ...]\n",
 		program);
+	fputs("AllOpt defaults to native passthrough.\n", stderr);
+	fputs("Use EXTFUSE_ALLOPT_DATA_PATH=wbcache for upper-cache forwarding.\n",
+	      stderr);
 }
 
 int main(int argc, char **argv)
@@ -6252,7 +6375,7 @@ int main(int argc, char **argv)
 			"ExtFUSE experiment toggles must be exactly 0 or 1\n");
 		return 2;
 	}
-	if (validate_experiment_toggles())
+	if (parse_allopt_data_path() || validate_experiment_toggles())
 		return 2;
 	if (perf_state.trace_metadata_upcalls &&
 	    perf_state.mode != PERF_MODE_HIT &&
@@ -6286,8 +6409,7 @@ int main(int argc, char **argv)
 			"EXTFUSE_REQUIRE_PASSTHROUGH_COHERENCE must be 0 or 1\n");
 		return 2;
 	}
-	perf_state.require_passthrough_coherence =
-		require_coherence && !strcmp(require_coherence, "1");
+	/* Accept the legacy knob; native AllOpt always requires V2 and its barrier. */
 	bpf_object = argv[4];
 	source = argv[5];
 	mountpoint = argv[6];
@@ -6380,10 +6502,12 @@ int main(int argc, char **argv)
 	} else {
 		option_length = snprintf(
 			options, sizeof(options),
-			"source=%s,cache=auto,timeout=1.0,xattr,allow_other,writeback,"
-			"writeback_cache,max_write=131072,splice_read,"
-			"splice_write,splice_move,fsname=extfuse-perf-%s-%s%s",
-			source, perf_state.mode_name, perf_state.transport,
+			"source=%s,%s,%s,%s,fsname=extfuse-perf-%s-%s%s",
+			source, "cache=auto,timeout=1.0,xattr,allow_other",
+			native_passthrough_enabled() ? "no_writeback" :
+				"writeback,writeback_cache",
+			"max_write=131072,splice_read,splice_write,splice_move",
+			perf_state.mode_name, perf_state.transport,
 			uring_options);
 	}
 	if (option_length < 0 || (size_t)option_length >= sizeof(options)) {
@@ -6420,7 +6544,8 @@ int main(int argc, char **argv)
 		"mount_options=%s\n",
 		perf_state.mode_name, perf_state.transport, argv[3],
 		source, mountpoint, debug_enabled, perf_state.count_callbacks,
-		wbcache_passthrough_enabled(), perf_state.read_upcall_only,
+		wbcache_passthrough_enabled(), native_passthrough_enabled(),
+		perf_state.read_upcall_only,
 		perf_state.paper_write_fast, perf_state.c2_fixed_write,
 		perf_state.wbcache_write_stream, perf_state.fixed_read,
 		PERF_XATTR_LOCK_BUCKETS,

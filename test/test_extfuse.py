@@ -105,6 +105,18 @@ def test_extfuse_fixed_buffer_lifetime():
     _run_kernel_source_test('test_fixed_buffer_lifetime.py')
 
 
+def test_extfuse_uring_fixed_request_payload():
+    _run_kernel_source_test('test_uring_fixed_request_payload.py')
+
+
+def test_extfuse_copied_writeback_queue():
+    _run_kernel_source_test('test_copied_writeback_queue.py')
+
+
+def test_extfuse_uring_background_completion():
+    _run_kernel_source_test('test_uring_background_completion.py')
+
+
 def test_extfuse_native_overwrite():
     _run_kernel_source_test('test_native_overwrite.py')
 

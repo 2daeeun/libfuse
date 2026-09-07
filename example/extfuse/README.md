@@ -330,6 +330,18 @@ kernel helpers against allocation/ownership fixtures; set `EXTFUSE_KERNEL_SOURCE
 if the Linux tree is not a sibling of libfuse. Its C tests are a separate step
 from source inspection.
 
+After fixed WRITE registration and per-operation header delivery, the paired
+kernel reports the validated logical page length directly. It no longer imports
+the copied payload buffer or walks those folios again just to skip copying
+them. Requests with no remaining input arguments also skip copy-state setup;
+their output buffer is still imported when consuming the reply. Copied WRITE
+and other actual input payloads retain the generic copy path. Fixed READ reply
+handling still checks the returned length, clears the unfilled folio portions
+and flushes the cache as before. Registration, folio ownership, metadata guards
+and completion accounting are unchanged. `test_uring_fixed_request_payload.py`
+executes the actual input helper against bounded fixtures for payload sizes,
+headers, copied fallback and errors; it does not measure throughput.
+
 These changes target per-request costs across request sizes and worker counts;
 they do not depend on a fio workload name. Small fixed I/O avoids an allocation,
 and overlapping writes can avoid repeated inode-stripe acquisitions. Fixed READ
@@ -358,16 +370,26 @@ qualification of this option is pending.
 
 The paired kernel retains a home queue for each open-file stream. Buffered
 writeback can use one representative handle for all writers of an inode, so
-discontinuous fixed WRITE may use an idle queue as soon as home has work.
-Contiguous WRITE keeps its home while a slot is available without older pending
-requests; otherwise it may also use an idle queue. READ, copied I/O and already
-dispatched requests keep their existing placement.
+discontinuous writeback may use an idle queue of the same buffer mode as soon
+as home has work. This also applies to copied writeback: one synchronous queue
+worker otherwise finishes each mutation before the next can join its cohort.
+Copied contiguous WRITE retains its home queue. Fixed contiguous WRITE keeps
+its home while a slot is available without older pending requests; otherwise
+it may also use an idle queue. READ, direct writes, copied fallback on fixed
+queues and already dispatched requests keep their existing placement.
+Background completion skips a second connection-wide lock acquisition when
+the legacy/WBCache waiting list is empty; existing waiters and concurrent new
+enqueues retain their normal admission and flush behavior.
 This is a local transport optimization, not a change to the paper's metadata
 maps. Teardown emits `FUSE_URING_QUEUE_STATS` for queues with fixed I/O using
 the existing counters after the worker is joined. These per-queue diagnostics
 are not additional requests and must not be added to the aggregate counters.
 The kernel change requires rebuilding and deploying the paired kernel;
 rebuilding this daemon alone only adds queue-level diagnostic logs.
+`test_copied_writeback_queue.py` and `test_uring_background_completion.py`
+exercise the actual kernel functions in userspace, including sequential and
+fixed-path regressions, saturated queues and concurrent enqueue progress.
+These checks do not measure the scheduling tradeoff or throughput improvement.
 
 With `EXTFUSE_PAPER_WRITE_FAST=1`, the ordinary FUSE_WRITE BPF hook and daemon
 skip positive-capability lookup and negative-row refresh only while the verified

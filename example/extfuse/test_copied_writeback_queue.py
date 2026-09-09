@@ -23,6 +23,7 @@ HARNESS = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #define FUSE_READ 15
@@ -34,7 +35,7 @@ typedef uint64_t u64;
 typedef struct { bool held, contended; } spinlock_t;
 struct list_head {
  bool empty;
- struct list_head *first, *last, *next;
+ struct list_head *first, *last, *next, *owner;
 };
 struct fuse_write_in { u64 offset; unsigned size, write_flags; };
 struct fuse_file { bool uring_writeback_seen; u64 uring_writeback_end; };
@@ -108,13 +109,18 @@ static unsigned atomic_fetch_inc_relaxed(unsigned *p) { return (*p)++; }
  ((head)->first ? list_first_entry(head, type, member) : NULL)
 static void list_add_tail(struct list_head *node, struct list_head *head) {
  node->next = NULL;
+ node->owner = head;
  if (head->last) head->last->next = node;
  else head->first = node;
  head->last = node; head->empty = false;
 }
 static void list_move_tail(struct list_head *node, struct list_head *head) {
- /* These tests keep admission saturated; promoting a request is a bug. */
- (void)node; (void)head; abort();
+ struct list_head *old = node->owner;
+ /* flush_bg() always promotes the oldest background request. */
+ assert(old && old->first == node);
+ old->first = node->next;
+ if (!old->first) { old->last = NULL; old->empty = true; }
+ list_add_tail(node, head);
 }
 static void set_bit(unsigned bit, unsigned long *flags) { *flags |= 1ul << bit; }
 #define NUMA_NO_NODE (-1)
@@ -637,6 +643,136 @@ int main(int argc, char **argv) {
    assert(select_queue() == 1);
   }
   break;
+ case 24: { /* Busy fixed workers must share both admitted and waiting work. */
+  struct fuse_req incoming[168];
+  unsigned queued[4] = {0};
+  reset(true);
+  ring.writeback_stream_affinity = true;
+  ring.writeback_stream_queues = 4;
+  connection.active_background = connection.num_background = 32;
+  connection.max_background = 176;
+  for (unsigned i = 0; i < 4; i++) {
+   queues[i].write_in_task = true;
+   queues[i].active_background = 8;
+   occupy_slots(i);
+  }
+  for (unsigned i = 0; i < 168; i++) {
+   incoming[i] = req;
+   in.offset = (u64)(i + 1) * 16384;
+   assert(fuse_uring_queue_bq_req(&incoming[i]));
+   assert(!held && (incoming[i].flags & (1ul << FR_URING)));
+  }
+  for (unsigned i = 0; i < 4; i++)
+   for (struct list_head *node = queues[i].fuse_req_bg_queue.first;
+        node; node = node->next) queued[i]++;
+  printf("fixed_group active=%u,%u,%u,%u queued=%u,%u,%u,%u\n",
+         queues[0].active_background, queues[1].active_background,
+         queues[2].active_background, queues[3].active_background,
+         queued[0], queued[1], queued[2], queued[3]);
+  fflush(stdout);
+  assert(connection.active_background == 176 && connection.blocked);
+  assert(connection.num_background == 200);
+  for (unsigned i = 0; i < 4; i++) {
+   struct list_head *node = queues[i].fuse_req_queue.first;
+   assert(queues[i].active_background == 44 && queued[i] == 6);
+   for (unsigned j = i; j < 144; j += 4) {
+    assert(node == &incoming[j].list);
+    assert(incoming[j].ring_queue == &queues[i]);
+    node = node->next;
+   }
+   assert(!node);
+   node = queues[i].fuse_req_bg_queue.first;
+   for (unsigned j = 144 + i; j < 168; j += 4) {
+    assert(node == &incoming[j].list);
+    assert(incoming[j].ring_queue == &queues[i]);
+    node = node->next;
+   }
+   assert(!node);
+  }
+  break;
+ }
+ case 25: { /* Saturated rotation cannot escape a bounded DELL NUMA group. */
+  struct fuse_ring_queue storage[88], *entries[88];
+  struct fuse_ring topology = {.nr_queues = 88, .queues = entries,
+                               .writeback_stream_affinity = true};
+  reset(true);
+  memset(storage, 0, sizeof(storage));
+  memset(node_masks, 0, sizeof(node_masks));
+  for (unsigned cpu = 0; cpu < 88; cpu++) {
+   int node = (cpu < 22 || (cpu >= 44 && cpu < 66)) ? 0 : 1;
+   cpu_nodes[cpu] = node; node_masks[node].cpus[cpu] = true;
+   entries[cpu] = &storage[cpu];
+   storage[cpu].qid = cpu;
+   storage[cpu].zero_copy = storage[cpu].write_in_task = true;
+   storage[cpu].active_background = 8;
+   storage[cpu].ent_avail_queue.empty = true;
+   storage[cpu].fuse_req_queue.empty = true;
+   storage[cpu].fuse_req_bg_queue.empty = true;
+  }
+  fuse_uring_init_stream_queues(&topology);
+  for (unsigned home = 0; home < 88; home++) {
+   for (unsigned width = 2; width <= 8; width *= 2) {
+    topology.writeback_stream_queues = width;
+    topology.bg_queue_seq = UINT32_MAX - 3;
+    for (unsigned turn = 0; turn < 32; turn++) {
+     unsigned expected = home;
+     unsigned cursor = topology.bg_queue_seq;
+     struct fuse_ring_queue *selected;
+     for (unsigned step = 0; step < cursor % width; step++)
+      expected = topology.writeback_next_queue[expected];
+     selected = fuse_uring_lock_writeback_queue(&topology, &req, entries[home]);
+     assert(held == 1 && selected->lock.held);
+     assert(selected == entries[expected]);
+     assert(cpu_nodes[selected->qid] == cpu_nodes[home]);
+     spin_unlock(&selected->lock);
+     assert(!held && topology.bg_queue_seq == cursor + 1);
+    }
+   }
+  }
+  break;
+ }
+ case 26: /* Saturated rotation still requires a live matching worker. */
+  for (unsigned mode = 0; mode < 10; mode++) {
+   reset(true); ring.writeback_stream_affinity = true;
+   ring.writeback_stream_queues = 3; ring.bg_queue_seq = 1;
+   for (unsigned i = 0; i < 4; i++) {
+    queues[i].write_in_task = true; occupy_slots(i);
+    queues[i].fuse_req_bg_queue.empty = false;
+   }
+   switch (mode) {
+   case 0: queues[1].stopped = true; break;
+   case 1: queues[1].zero_copy = false; break;
+   case 2: queues[1].write_in_task = false; break;
+   case 3: queues[1].lock.contended = true; break;
+   case 4: refs[1] = NULL; break;
+   case 5: queues[1].ent_in_userspace.empty = true; break;
+   case 6: queues[1].ent_in_userspace.empty = true;
+           queues[1].ent_released.empty = false; break;
+   case 7: queues[1].ent_in_userspace.empty = true;
+           queues[1].ent_w_req_queue.empty = false; break;
+   case 8: queues[1].ent_in_userspace.empty = true;
+           queues[1].ent_commit_queue.empty = false; break;
+   case 9: queues[1].ent_avail_queue.empty = false; break;
+   }
+   assert(select_queue() == (mode >= 7 ? 1u : 2u));
+  }
+  break;
+ case 27: /* A short or unknown topology never expands during saturation. */
+  reset(true); ring.writeback_stream_affinity = true;
+  ring.writeback_stream_queues = 4;
+  for (unsigned i = 0; i < 4; i++) {
+   queues[i].write_in_task = true; occupy_slots(i);
+  }
+  cpu_nodes[1] = cpu_nodes[2] = 1;
+  node_masks[0].cpus[1] = node_masks[0].cpus[2] = false;
+  node_masks[1].cpus[1] = node_masks[1].cpus[2] = true;
+  fuse_uring_init_stream_queues(&ring);
+  for (unsigned i = 0; i < 32; i++)
+   assert(select_queue() == (i % 2 ? 3u : 0u));
+  cpu_nodes[0] = NUMA_NO_NODE;
+  fuse_uring_init_stream_queues(&ring);
+  for (unsigned i = 0; i < 8; i++) assert(select_queue() == 0);
+  break;
  default: abort();
  }
  return 0;
@@ -663,11 +799,13 @@ class CopiedWritebackQueueTests(unittest.TestCase):
                 "-fsanitize=undefined", str(source), "-o", str(binary)],
                 capture_output=True, text=True)
             self.assertEqual(compile_run.returncode, 0, compile_run.stderr)
-            for scenario in range(24):
+            for scenario in range(28):
                 with self.subTest(scenario=scenario):
                     run = subprocess.run([str(binary), str(scenario)],
                                          capture_output=True, text=True)
-                    self.assertEqual(run.returncode, 0, run.stderr)
+                    if scenario == 24:
+                        print(run.stdout.strip(), flush=True)
+                    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
 
 if __name__ == "__main__":

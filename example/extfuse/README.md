@@ -383,7 +383,13 @@ kernel snapshots `uring_writeback_stream_affinity=Y` and
 module parameters affects new connections. These settings select workers,
 not the registered depth of each queue. The cyclic queue order follows NUMA
 topology rather than consecutive CPU numbers. Fewer local queues or unknown
-topology narrows the group; saturation or lock contention falls back to home.
+topology narrows the group. When all of the group's registered slots are busy,
+new background requests rotate through its live workers' FIFOs. Keeping every
+pending request on home would leave other workers unable to drain that backlog
+after finishing their own requests. Rotation stays inside the original group,
+preserves each queue's FIFO and never moves an existing request or registered
+buffer. Missing, stopped, cancelled or contended workers are skipped; if no
+eligible queue can be locked, placement falls back to home.
 Disabling affinity restores the full scan for these fixed requests. Asynchronous
 fixed writeback retains its full scan and idle-worker preference. READ, direct
 writes, copied fallback on fixed queues and already dispatched requests keep
@@ -401,7 +407,10 @@ rebuilding this daemon alone does not activate them.
 `test_copied_writeback_queue.py` and `test_uring_background_completion.py`
 exercise the actual kernel functions in userspace, including sequential and
 fixed-path regressions, NUMA boundaries, saturated queues and concurrent enqueue
-progress.
+progress. The fixed-group fixture exercises the actual selector, background
+admission and enqueue functions at depth eight and an admission limit of 176;
+it verifies that both admitted and waiting requests remain distributed within
+the four-worker group without exceeding the admission limit.
 These checks do not measure the scheduling tradeoff or throughput improvement.
 
 With `EXTFUSE_PAPER_WRITE_FAST=1`, the ordinary FUSE_WRITE BPF hook and daemon

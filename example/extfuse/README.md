@@ -370,13 +370,25 @@ qualification of this option is pending.
 
 The paired kernel retains a home queue for each open-file stream. Buffered
 writeback can use one representative handle for all writers of an inode, so
-discontinuous writeback may use an idle queue of the same buffer mode as soon
-as home has work. This also applies to copied writeback: one synchronous queue
-worker otherwise finishes each mutation before the next can join its cohort.
-Copied contiguous WRITE retains its home queue. Fixed contiguous WRITE keeps
-its home while a slot is available without older pending requests; otherwise
-it may also use an idle queue. READ, direct writes, copied fallback on fixed
-queues and already dispatched requests keep their existing placement.
+discontinuous copied writeback first seeks an idle queue with the same buffer
+mode. If every worker is busy, it can append to another live queue's background
+FIFO, allowing that worker to drain the backlog later. It never moves older
+requests or bypasses them. Copied contiguous WRITE retains its home queue.
+
+Fixed writeback negotiated with WRITE_IN_TASK fills home slots before waking
+additional submitters that compete for the same lower inode. By default,
+overflow uses at most four queues, including home, on home's NUMA node. The
+kernel snapshots `uring_writeback_stream_affinity=Y` and
+`uring_writeback_stream_queues=4` when creating a connection; changing the FUSE
+module parameters affects new connections. These settings select workers,
+not the registered depth of each queue. The cyclic queue order follows NUMA
+topology rather than consecutive CPU numbers. Fewer local queues or unknown
+topology narrows the group; saturation or lock contention falls back to home.
+Disabling affinity restores the full scan for these fixed requests. Asynchronous
+fixed writeback retains its full scan and idle-worker preference. READ, direct
+writes, copied fallback on fixed queues and already dispatched requests keep
+their existing placement.
+
 Background completion skips a second connection-wide lock acquisition when
 the legacy/WBCache waiting list is empty; existing waiters and concurrent new
 enqueues retain their normal admission and flush behavior.
@@ -384,11 +396,12 @@ This is a local transport optimization, not a change to the paper's metadata
 maps. Teardown emits `FUSE_URING_QUEUE_STATS` for queues with fixed I/O using
 the existing counters after the worker is joined. These per-queue diagnostics
 are not additional requests and must not be added to the aggregate counters.
-The kernel change requires rebuilding and deploying the paired kernel;
-rebuilding this daemon alone only adds queue-level diagnostic logs.
+The queue placement changes require rebuilding and deploying the paired kernel;
+rebuilding this daemon alone does not activate them.
 `test_copied_writeback_queue.py` and `test_uring_background_completion.py`
 exercise the actual kernel functions in userspace, including sequential and
-fixed-path regressions, saturated queues and concurrent enqueue progress.
+fixed-path regressions, NUMA boundaries, saturated queues and concurrent enqueue
+progress.
 These checks do not measure the scheduling tradeoff or throughput improvement.
 
 With `EXTFUSE_PAPER_WRITE_FAST=1`, the ordinary FUSE_WRITE BPF hook and daemon
@@ -412,6 +425,9 @@ seed row, without overwriting writeback size/mtime. Concurrent mutation or
 dirty/writeback state leaves the cache invalid. The `gate` profile retains
 its full epoch guard. These correctness checks do not guarantee zero fallback
 under mutation, eviction or failure, nor a universal C0-C4 throughput ordering.
+Synchronous native READ and splice READ rely on the existing completion-time
+atime invalidation before metadata END, avoiding a duplicate accessed callback.
+Asynchronous READ retains both its early and completion-time invalidation.
 
 The daemon captures a quiescent READ snapshot token under its existing END
 lock, avoiding a second acquisition of the connection-wide mutex. The lower
@@ -420,6 +436,16 @@ publication. WRITE and namespace mutation callers keep their existing path.
 This removes redundant locking, not all cross-inode contention. An active or
 stale attribute still requires safe fallback; a zero-request acceptance gate
 must not be satisfied by returning an outdated attribute as a cache hit.
+
+For ordinary software HASH maps without special BTF fields, the paired kernel
+uses stack scratch for UPDATE_ELEM inputs when the aligned key plus value fits
+in 256 bytes. This removes temporary input allocations, not hash-element
+allocation or the lower `fstat`. Permissions, update flags, error handling,
+write-active accounting and map replacement semantics remain unchanged. Other
+map types and larger inputs retain the existing allocation path.
+`test_small_map_update.py` executes the actual syscall helpers with bounded
+fixtures covering size limits, copy failures, rejected updates and fallback;
+it does not load BPF programs or establish a throughput gain.
 
 The non-mount `test_reply_data_prepare` has separate copy and `--splice`
 variants. The latter explicitly negotiates `FUSE_CAP_SPLICE_WRITE` and
@@ -452,3 +478,10 @@ reuse entries; new arrivals remain for the next batch. The copied transport
 keeps its original order. This closes one metadata-publication scheduling
 window. The negotiated write-in-task path described above separately addresses
 io-wq handoffs for eligible lower WRITEs.
+
+Immediate reply submission and resubmission propagate negative io_uring submit
+results to the session after releasing the queue lock. Ring-thread startup,
+submission and completion failures also reach the session result instead of
+silently ending the loop. Normal ENOTCONN teardown in the ring thread preserves
+success or a previously recorded error. `test_uring_taskrun.py` and
+`test_uring_loop_errors.py` exercise these paths without mounting a filesystem.

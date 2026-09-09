@@ -83,6 +83,7 @@ static struct io_uring_cqe cqe;
 static int init_error, files_error, ring_fd_error, no_sqe, submit_error;
 static int setups, files_registered, rings_registered, flags_seen;
 static int sqes, pending, submits, combined_waits, plain_waits, handled, locks;
+static int exits;
 static bool locked;
 static char log_line[256];
 
@@ -139,6 +140,8 @@ static struct fuse_uring_cmd_req *fuse_uring_get_sqe_cmd(struct io_uring_sqe *ou
 static void fuse_uring_sqe_set_req_data(struct fuse_uring_cmd_req *cmd, unsigned int qid, uint64_t id)
 { assert(cmd == &command && qid == 4 && (id == 19 || id == 0)); }
 static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *q);
+void fuse_session_exit(struct fuse_session *se)
+{ assert(se == &session && !locked); exits++; atomic_store(&se->mt_exited, 1); }
 
 #define io_uring_queue_init_params mock_setup
 #define io_uring_register_files mock_files
@@ -212,12 +215,17 @@ int main(int argc, char **argv)
         bool retry = strstr(argv[1], "retry") != NULL;
         atomic_store(&queue.cqe_processing, strstr(argv[1], "batch") != NULL);
         no_sqe = strstr(argv[1], "full") != NULL;
+        if (strstr(argv[1], "submit-error")) submit_error = -EIO;
         if (retry) {
             entry.last_cmd = FUSE_IO_URING_CMD_REGISTER;
             fuse_uring_resubmit(&queue, &entry);
             result = session.error;
         } else result = fuse_uring_commit_sqe(&pool, &queue, &entry);
-        assert(result == (no_sqe ? -EIO : 0));
+        assert(result == (no_sqe ? -EIO : submit_error));
+        if (submit_error) {
+            assert(session.error == submit_error && exits == 1);
+            assert(atomic_load(&session.mt_exited));
+        }
         assert(!locked && sqes == 1 && locks == !pool.single_issuer);
         assert(submits == (!no_sqe && !atomic_load(&queue.cqe_processing)));
     }
@@ -270,6 +278,10 @@ class UringTaskrunTests(unittest.TestCase):
 
     def test_retry_uses_same_owner_and_existing_flush_policy(self):
         self.run_cases("retry", "retry-batch", "retry-full", "retry-multi")
+
+    def test_immediate_submit_failure_is_reported_and_stops_session(self):
+        self.run_cases("commit-submit-error", "commit-multi-submit-error",
+                       "retry-submit-error", "retry-multi-submit-error")
 
     def test_production_loop_flushes_before_wait_without_an_added_wait(self):
         self.run_cases("loop", "loop-multi", "loop-error")

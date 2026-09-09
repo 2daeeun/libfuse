@@ -239,6 +239,7 @@ int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 	struct fuse_uring_ent_in_out *ent_in_out =
 		(struct fuse_uring_ent_in_out *)&rrh->ring_ent_in_out;
 	struct io_uring_sqe *sqe;
+	int res = 0;
 
 	/* The public single-issuer contract excludes deferred foreign replies. */
 	if (fuse_uring_check_queue_owner(queue))
@@ -285,10 +286,15 @@ int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 	}
 
 	if (!atomic_load_explicit(&queue->cqe_processing, memory_order_relaxed))
-		io_uring_submit(&queue->ring);
+		res = io_uring_submit(&queue->ring);
 
 	if (locked)
 		pthread_mutex_unlock(&queue->ring_lock);
+	if (res < 0) {
+		se->error = res;
+		fuse_session_exit(se);
+		return res;
+	}
 
 	return 0;
 }
@@ -1084,6 +1090,7 @@ static void fuse_uring_resubmit(struct fuse_ring_queue *queue,
 {
 	const bool locked = !queue->ring_pool->single_issuer;
 	struct io_uring_sqe *sqe;
+	int res = 0;
 
 	if (fuse_uring_check_queue_owner(queue))
 		return;
@@ -1141,9 +1148,13 @@ static void fuse_uring_resubmit(struct fuse_ring_queue *queue,
 	}
 
 	if (!atomic_load_explicit(&queue->cqe_processing, memory_order_relaxed))
-		io_uring_submit(&queue->ring);
+		res = io_uring_submit(&queue->ring);
 	if (locked)
 		pthread_mutex_unlock(&queue->ring_lock);
+	if (res < 0) {
+		queue->ring_pool->se->error = res;
+		fuse_session_exit(queue->ring_pool->se);
+	}
 }
 
 static int fuse_uring_handle_cqe(struct fuse_ring_queue *queue,
@@ -1651,6 +1662,9 @@ static void *fuse_uring_thread(void *arg)
 	return NULL;
 
 err:
+	/* A normal unmount must not replace success or an earlier error. */
+	if (err < 0 && err != -ENOTCONN)
+		se->error = err;
 	fuse_session_exit(se);
 err_non_fatal:
 	return NULL;

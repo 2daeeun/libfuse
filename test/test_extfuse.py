@@ -43,6 +43,13 @@ def test_uring_taskrun():
     ])
 
 
+def test_uring_loop_errors():
+    root = Path(__file__).resolve().parents[1]
+    subprocess.check_call([
+        sys.executable, str(root / 'test/test_uring_loop_errors.py'),
+    ])
+
+
 def test_uring_cq_priority():
     root = Path(__file__).resolve().parents[1]
     subprocess.check_call([
@@ -111,6 +118,10 @@ def test_extfuse_uring_fixed_request_payload():
 
 def test_extfuse_copied_writeback_queue():
     _run_kernel_source_test('test_copied_writeback_queue.py')
+
+
+def test_extfuse_small_map_update():
+    _run_kernel_source_test('test_small_map_update.py')
 
 
 def test_extfuse_uring_background_completion():

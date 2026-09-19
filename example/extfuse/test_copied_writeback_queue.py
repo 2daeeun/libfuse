@@ -29,6 +29,7 @@ HARNESS = r'''
 #define FUSE_READ 15
 #define FUSE_WRITE 16
 #define FUSE_WRITE_CACHE 1
+#define FUSE_URING_STATE_RUNNING 0
 #define READ_ONCE(x) (x)
 #define check_add_overflow(a, b, out) __builtin_add_overflow(a, b, out)
 typedef uint64_t u64;
@@ -56,7 +57,8 @@ struct fuse_req {
 struct fuse_ring_queue {
  struct fuse_ring *ring;
  spinlock_t lock;
- bool stopped, zero_copy, write_in_task;
+ bool stopped, zero_copy, write_in_task, runtime;
+ unsigned runtime_state;
  unsigned qid;
  unsigned active_background;
  struct list_head ent_avail_queue, fuse_req_queue, fuse_req_bg_queue;
@@ -786,6 +788,7 @@ class CopiedWritebackQueueTests(unittest.TestCase):
             source = Path(work) / "selector.c"
             binary = Path(work) / "selector"
             code = HARNESS.replace("/* STREAM_TOPOLOGY */", kernel_function(
+                "fuse_uring_queue_running", "static bool") + kernel_function(
                 "fuse_uring_init_stream_queues", "static void"))
             code = code.replace("/* SELECTOR */", kernel_function(
                 "fuse_uring_lock_writeback_queue", "static struct fuse_ring_queue *"))

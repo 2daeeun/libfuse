@@ -706,6 +706,11 @@ struct fuse_loop_config_v1 {
  */
 #define FUSE_CAP_EXTFUSE_PASSTHROUGH_MMAP_RELEASE (1ULL << 49)
 
+/** Local opt-in runtime QD control; requires io_uring_adaptive. */
+#define FUSE_CAP_IO_URING_RUNTIME (1ULL << 50)
+/** Application-facing requested-I/O window statistics. */
+#define FUSE_CAP_WORKLOAD_MONITOR (1ULL << 51)
+
 /**
  * Ioctl flags
  *

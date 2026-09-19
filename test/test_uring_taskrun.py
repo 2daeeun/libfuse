@@ -56,10 +56,11 @@ HARNESS = r"""
 #define FUSE_LOG_DEBUG 2
 #define FUSE_LOG_INFO 3
 struct fuse_session { bool debug; int error; _Atomic int mt_exited; };
-struct fuse_ring_pool { bool single_issuer, zero_copy; struct fuse_session *se; };
+struct fuse_ring_pool { bool single_issuer, zero_copy, runtime_qd; struct fuse_session *se; };
 struct fuse_ring_queue {
     struct fuse_ring_pool *ring_pool;
     int qid;
+    uint64_t generation;
     pthread_t tid;
     pthread_mutex_t ring_lock;
     _Atomic bool cqe_processing;
@@ -140,6 +141,8 @@ static struct fuse_uring_cmd_req *fuse_uring_get_sqe_cmd(struct io_uring_sqe *ou
 static void fuse_uring_sqe_set_req_data(struct fuse_uring_cmd_req *cmd, unsigned int qid, uint64_t id)
 { assert(cmd == &command && qid == 4 && (id == 19 || id == 0)); }
 static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *q);
+static int fuse_uring_runtime_service(struct fuse_ring_queue *q)
+{ assert(!q->ring_pool->runtime_qd); return 0; }
 void fuse_session_exit(struct fuse_session *se)
 { assert(se == &session && !locked); exits++; atomic_store(&se->mt_exited, 1); }
 
@@ -166,6 +169,7 @@ static int run_queue_loop(void)
 {
     struct fuse_ring_queue *queue = &::QUEUE_PLACEHOLDER::;
     struct fuse_session *se = &session;
+    struct fuse_ring_pool *ring_pool = &pool;
     const bool single_issuer = pool.single_issuer;
     int err;
     @LOOP@
@@ -188,7 +192,7 @@ int main(int argc, char **argv)
         if (strstr(argv[1], "unsupported")) init_error = -EINVAL;
         if (strstr(argv[1], "files-error")) files_error = -EBADF;
         if (strstr(argv[1], "ring-fd-fallback")) ring_fd_error = -EINVAL;
-        result = fuse_queue_setup_io_uring(&queue.ring, 4, 8, 17, 18, pool.single_issuer);
+        result = fuse_queue_setup_io_uring(&queue.ring, 4, 8, 17, 18, pool.single_issuer, false);
         assert(setups == 1);
         assert((unsigned int)flags_seen == (common | (pool.single_issuer ?
                IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN : 0)));

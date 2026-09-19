@@ -19,6 +19,7 @@
 #include "mount_util.h"
 #include "util.h"
 #include "fuse_uring_i.h"
+#include "fuse_adaptive_i.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -332,9 +333,10 @@ void fuse_free_req(fuse_req_t req)
 	 *      a lock across ring queues.
 	 */
 	if (se->conn.no_interrupt || req->flags.is_uring) {
-		ctr = --req->ref_cnt;
 		fuse_chan_put(req->ch);
 		req->ch = NULL;
+		/* Runtime drain observes the final reference as a reuse barrier. */
+		ctr = --req->ref_cnt;
 	} else {
 		pthread_mutex_lock(&se->lock);
 		req->u.ni.func = NULL;
@@ -3238,6 +3240,11 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			se->conn.capable_ext |= FUSE_CAP_IO_URING_BUFPOOL;
 #endif
 
+		if (inargflags & FUSE_HAS_IO_URING_RUNTIME)
+			se->conn.capable_ext |= FUSE_CAP_IO_URING_RUNTIME;
+		if (inargflags & FUSE_HAS_WORKLOAD_MONITOR)
+			se->conn.capable_ext |= FUSE_CAP_WORKLOAD_MONITOR;
+
 	} else {
 		se->conn.max_readahead = 0;
 	}
@@ -3282,6 +3289,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	LL_SET_DEFAULT(se->op.readdirplus && se->op.readdir,
 		       FUSE_CAP_READDIRPLUS_AUTO);
 	LL_SET_DEFAULT(1, FUSE_CAP_OVER_IO_URING);
+	LL_SET_DEFAULT(se->uring.runtime_qd, FUSE_CAP_IO_URING_RUNTIME);
+	LL_SET_DEFAULT(se->uring.runtime_qd, FUSE_CAP_WORKLOAD_MONITOR);
 
 	/* This could safely become default, but libfuse needs an API extension
 	 * to support it
@@ -3302,6 +3311,19 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		 * Userspace might still use conn.want - we need to convert it
 		 */
 		fuse_convert_to_conn_want_ext(&se->conn);
+	}
+
+	if (se->uring.runtime_qd &&
+	    (!se->uring.enable ||
+	     !(se->conn.want_ext & FUSE_CAP_OVER_IO_URING) ||
+	     !(se->conn.want_ext & FUSE_CAP_IO_URING_RUNTIME) ||
+	     !(se->conn.want_ext & FUSE_CAP_WORKLOAD_MONITOR))) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: adaptive io-uring requires kernel runtime and monitor capabilities\n");
+		fuse_reply_err(req, EOPNOTSUPP);
+		se->error = -EOPNOTSUPP;
+		fuse_session_exit(se);
+		return;
 	}
 
 	require_io_uring_bufpool =
@@ -3445,6 +3467,9 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_PAPER_READ_GUARD)
 		outargflags |= FUSE_EXTFUSE_PAPER_READ_GUARD;
 
+	if (se->uring.runtime_qd)
+		outargflags |= FUSE_HAS_IO_URING_RUNTIME | FUSE_HAS_WORKLOAD_MONITOR;
+
 	if ((inargflags & FUSE_REQUEST_TIMEOUT) && se->conn.request_timeout) {
 		outargflags |= FUSE_REQUEST_TIMEOUT;
 		outarg.request_timeout = se->conn.request_timeout;
@@ -3503,7 +3528,7 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			fuse_log(FUSE_LOG_INFO,
 				 "fuse: failed to start io-uring: %s\n",
 				 strerror(ring_error));
-			if (require_io_uring_bufpool) {
+			if (require_io_uring_bufpool || se->uring.runtime_qd) {
 				fuse_reply_err(req, ring_error);
 				se->error = -ring_error;
 				fuse_session_exit(se);
@@ -3529,8 +3554,23 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 	 */
 	se->got_init = 1;
 	send_reply_ok(req, &outarg, outargsize);
-	if (enable_io_uring)
+	if (!se->uring.runtime_qd)
+		fuse_log(FUSE_LOG_INFO,
+			 "FUSE_ADAPTIVE mode=off runtime_qd=0 workload_monitor=0 initial_depth=%u max_depth=%u policy=POLICY_NOT_CONFIGURED\n",
+			 se->uring.q_depth, se->uring.q_depth);
+	if (enable_io_uring) {
 		fuse_uring_wake_ring_threads(se);
+		if (se->uring.runtime_qd) {
+			int rc = fuse_adaptive_start(se);
+
+			if (rc) {
+				fuse_log(FUSE_LOG_ERR, "fuse: adaptive control: %s\n",
+					 strerror(-rc));
+				se->error = rc;
+				fuse_session_exit(se);
+			}
+		}
+	}
 }
 
 static __attribute__((no_sanitize("thread"))) void
@@ -4396,6 +4436,12 @@ static const struct fuse_opt fuse_ll_opts[] = {
 	LL_OPTION("allow_root", deny_others, 1),
 	LL_OPTION("io_uring", uring.enable, 1),
 	LL_OPTION("io_uring_q_depth=%u", uring.q_depth, -1),
+	LL_OPTION("io_uring_adaptive", uring.runtime_qd, 1),
+	LL_OPTION("io_uring_adaptive=on", uring.runtime_qd, 1),
+	LL_OPTION("io_uring_adaptive=off", uring.runtime_qd, 0),
+	LL_OPTION("io_uring_q_depth_max=%u", uring.max_depth, -1),
+	LL_OPTION("io_uring_drain_timeout_ms=%u", uring.drain_timeout_ms, -1),
+	LL_OPTION("io_uring_control=%s", uring.control_path, 0),
 	FUSE_OPT_END
 };
 
@@ -4416,6 +4462,11 @@ void fuse_lowlevel_help(void)
 "    -o auto_unmount        auto unmount on process termination\n"
 "    -o io_uring            enable io-uring\n"
 "    -o io_uring_q_depth=<n> io-uring queue depth\n"
+"    -o io_uring_adaptive=on|off runtime QD and monitor (default off)\n"
+"    -o io_uring_adaptive   alias for io_uring_adaptive=on\n"
+"    -o io_uring_q_depth_max=<n> runtime capacity (default 64)\n"
+"    -o io_uring_drain_timeout_ms=<n> drain timeout (default 5000)\n"
+"    -o io_uring_control=<path> owner-only local control socket\n"
 );
 }
 
@@ -4423,6 +4474,7 @@ void fuse_session_destroy(struct fuse_session *se)
 {
 	struct fuse_ll_pipe *llp;
 
+	fuse_adaptive_stop(se);
 	if (se->got_init && !se->got_destroy) {
 		if (se->op.destroy)
 			se->op.destroy(se->userdata);
@@ -4440,6 +4492,8 @@ void fuse_session_destroy(struct fuse_session *se)
 	if (se->io != NULL)
 		free(se->io);
 	destroy_mount_opts(se->mo);
+	free(se->uring.control_path);
+	pthread_mutex_destroy(&se->uring.runtime_lock);
 	free(se);
 }
 
@@ -4753,6 +4807,9 @@ fuse_session_new_versioned(struct fuse_args *args,
 		fuse_log(FUSE_LOG_ERR, "fuse: failed to allocate fuse object\n");
 		goto out1;
 	}
+	pthread_mutex_init(&se->uring.runtime_lock, NULL);
+	se->uring.max_depth = 64;
+	se->uring.drain_timeout_ms = 5000;
 	native_request_counter_init(se);
 	se->fd = -1;
 	se->conn.max_write = FUSE_DEFAULT_MAX_PAGES_LIMIT * getpagesize();
@@ -4773,6 +4830,15 @@ fuse_session_new_versioned(struct fuse_args *args,
 	/* Parse options */
 	if(fuse_opt_parse(args, se, fuse_ll_opts, NULL) == -1)
 		goto out2;
+	if ((se->uring.control_path && !se->uring.runtime_qd) ||
+	    (se->uring.runtime_qd &&
+	     (!se->uring.enable || !se->uring.q_depth ||
+	      se->uring.q_depth > se->uring.max_depth ||
+	      se->uring.max_depth > UINT16_MAX - 1 ||
+	      !se->uring.drain_timeout_ms))) {
+		fuse_log(FUSE_LOG_ERR, "fuse: invalid adaptive io-uring options\n");
+		goto out2;
+	}
 	if(se->deny_others) {
 		/* Allowing access only by root is done by instructing
 		 * kernel to allow access by everyone, and then restricting
@@ -4843,6 +4909,8 @@ out3:
 	if (mo != NULL)
 		destroy_mount_opts(mo);
 out2:
+	free(se->uring.control_path);
+	pthread_mutex_destroy(&se->uring.runtime_lock);
 	free(se);
 out1:
 	return NULL;

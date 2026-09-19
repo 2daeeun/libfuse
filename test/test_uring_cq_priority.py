@@ -19,6 +19,8 @@ HARNESS = r"""
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include "fuse_kernel.h"
 #define FUSE_LOG_ERR 1
 #define FUSE_URING_CQE_BATCH_MAX 32
 #define unlikely(x) (x)
@@ -30,16 +32,21 @@ typedef struct fuse_req *fuse_req_t;
 typedef void (*fuse_uring_fixed_io_callback_t)(fuse_req_t, ssize_t, void *);
 enum { FUSE_URING_CQE_COMMAND, FUSE_URING_CQE_FIXED_IO };
 struct fuse_session { int error; };
-struct fuse_ring_pool { struct fuse_session *se; bool zero_copy; };
+struct fuse_ring_pool { struct fuse_session *se; bool zero_copy, runtime_qd; };
 struct fuse_ring_ent {
  struct fuse_req req;
  fuse_uring_fixed_io_callback_t fixed_io_callback;
  void *fixed_io_userdata;
  bool fixed_io_write, fixed_io_pending, fixed_io_completed;
- int cqe_kind;
+ int cqe_kind, last_cmd, rearm_error;
+ bool retired;
 };
 struct fuse_ring_queue {
  struct fuse_ring_pool *ring_pool; struct io_uring ring; int eventfd, qid;
+ int control_eventfd, control_result;
+ bool control_pending, rearming, payload_released[2];
+ char payload_tags[2];
+ struct fuse_ring_ent control_ent;
  uint64_t fixed_write_errors, fixed_write_completed, fixed_write_bytes;
  uint64_t fixed_read_errors, fixed_read_completed, fixed_read_bytes;
 };
@@ -92,6 +99,8 @@ static int fuse_uring_handle_cqe(struct fuse_ring_queue *q, struct io_uring_cqe 
 }
 static void fuse_uring_resubmit(struct fuse_ring_queue *q, struct fuse_ring_ent *ent)
 { assert(q == &queue && ent && !ent->fixed_io_pending); retried++; event('R'); }
+static int fuse_uring_poll_control(struct fuse_ring_queue *q)
+{ assert(q == &queue && !pool.runtime_qd); return 0; }
 @PRODUCTION@
 int main(int argc, char **argv)
 {
@@ -160,7 +169,8 @@ int main(int argc, char **argv)
 
 
 def function(source, name):
-    match = re.search(r"^static (?:int|bool) " + name + r"\(", source, re.M)
+    match = re.search(r"^static (?:int|bool) " + name + r"\([^;{}]*\)\s*\{",
+                      source, re.M)
     if match is None:
         return ""
     opening = source.index("{", match.start())
@@ -189,7 +199,7 @@ class UringCompletionPriorityTests(unittest.TestCase):
         path.write_text(HARNESS.replace("@PRODUCTION@", production))
         cls.binary = root / "completion"
         subprocess.run([*shlex.split(os.environ.get("CC", "cc")), "-std=c11", "-O2",
-                        "-Wall", "-Wextra", "-Werror", "-include", "sys/types.h",
+                        "-Wall", "-Wextra", "-Werror", "-include", "sys/types.h", "-I", str(ROOT / "include"),
                         str(path), "-o", str(cls.binary)], check=True, timeout=20)
 
     def cases(self, *names):

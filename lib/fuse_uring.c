@@ -11,6 +11,7 @@
 #define _GNU_SOURCE
 
 #include "fuse_i.h"
+#include "fuse_adaptive_i.h"
 #include "fuse_kernel.h"
 #include "fuse_uring_affinity.h"
 #include "fuse_uring_i.h"
@@ -30,6 +31,7 @@
 #include <stdio.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <time.h>
 
 /* Size of command data area in SQE when IORING_SETUP_SQE128 is used */
 #define FUSE_URING_MAX_SQE128_CMD_DATA 80
@@ -58,6 +60,9 @@ struct fuse_ring_ent {
 	bool fixed_io_write;
 	bool fixed_io_completed;
 	unsigned int fixed_buf_index;
+	bool retired;
+	bool submitted;
+	int rearm_error;
 
 	/* header and payload */
 	struct iovec iov[2];
@@ -70,6 +75,7 @@ struct fuse_ring_queue {
 	int numa_node;
 	pthread_t tid;
 	int eventfd;
+	int control_eventfd;
 	size_t req_header_sz;
 	struct io_uring ring;
 
@@ -82,6 +88,21 @@ struct fuse_ring_queue {
 	void *payload_pool;
 	size_t payload_pool_sz;
 	bool sparse_buffers_registered;
+	unsigned int payload_slot;
+	/* Addresses are CQE tokens; never interpreted as entry pointers. */
+	char payload_tags[2];
+	bool payload_released[2];
+	struct fuse_ring_ent control_ent;
+	struct fuse_uring_runtime_state query_result;
+	bool control_pending;
+	bool rearming;
+	int control_result;
+	unsigned int current_depth;
+	uint64_t generation;
+	void *prepared_pool;
+	size_t prepared_pool_sz;
+	void **prepared_payloads;
+	struct fuse_uring_runtime_queue_status runtime_status;
 	bool write_in_task;
 	uint64_t fixed_read_submitted;
 	uint64_t fixed_read_completed;
@@ -118,6 +139,15 @@ struct fuse_ring_pool {
 
 	/* number of per queue entries */
 	size_t queue_depth;
+	size_t initial_depth;
+	bool runtime_qd;
+	unsigned int drain_timeout_ms;
+	pthread_mutex_t control_lock;
+	uint64_t transaction;
+	unsigned int target_depth;
+	unsigned int control_qid;
+	bool control_busy;
+	int control_error;
 
 	/* max payload size for fuse requests*/
 	size_t max_req_payload_sz;
@@ -200,10 +230,11 @@ fuse_uring_sqe_prepare(struct io_uring_sqe *sqe, struct fuse_ring_ent *req,
 }
 
 #ifdef HAVE_URING_ZERO_COPY
-static void fuse_uring_use_payload_pool(struct io_uring_sqe *sqe)
+static void fuse_uring_use_payload_pool(struct io_uring_sqe *sqe,
+				       struct fuse_ring_queue *queue)
 {
 	sqe->uring_cmd_flags = IORING_URING_CMD_FIXED;
-	sqe->buf_index = 0;
+	sqe->buf_index = queue->payload_slot;
 }
 #endif
 
@@ -275,9 +306,12 @@ int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 	fuse_uring_sqe_prepare(sqe, ring_ent, ring_ent->last_cmd);
 	fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe), queue->qid,
 				    ring_ent->req_commit_id);
+	if (ring_pool->runtime_qd)
+		((struct fuse_uring_cmd_req *)fuse_uring_get_sqe_cmd(sqe))->flags =
+			queue->generation;
 #ifdef HAVE_URING_ZERO_COPY
 	if (ring_pool->zero_copy)
-		fuse_uring_use_payload_pool(sqe);
+		fuse_uring_use_payload_pool(sqe, queue);
 #endif
 
 	if (se->debug) {
@@ -610,13 +644,13 @@ prepare:
 
 static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
 				     size_t depth, int fd, int evfd,
-				     bool single_issuer)
+				     bool single_issuer, bool runtime_qd)
 {
 	int rc;
 	struct io_uring_params params = {0};
 	int files[2] = { fd, evfd };
 
-	depth += 1; /* for the eventfd poll SQE */
+	depth += runtime_qd ? 4 : 1; /* stop/control polls and control command */
 
 	params.flags = IORING_SETUP_SQE128;
 
@@ -689,6 +723,13 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 	uint64_t copied_read_fallbacks = 0;
 	uint64_t copied_write_fallbacks = 0;
 
+	/* Runtime owners must finish leaving their CQ pump without cancellation
+	 * while holding a mutex or awaiting a resource release notification.
+	 */
+	if (fuse_ring->runtime_qd && fuse_ring->se)
+		atomic_store_explicit(&fuse_ring->se->mt_exited, true,
+				      memory_order_relaxed);
+
 	for (size_t qid = 0; qid < fuse_ring->nr_queues; qid++) {
 		struct fuse_ring_queue *queue =
 			fuse_uring_get_queue(fuse_ring, qid);
@@ -702,7 +743,10 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 				fprintf(stderr,
 					"Wrote to eventfd=%d err=%s: rc=%d\n",
 					queue->eventfd, strerror(errno), rc);
-			pthread_cancel(queue->tid);
+			if (fuse_ring->runtime_qd)
+				sem_post(&fuse_ring->init_sem);
+			else
+				pthread_cancel(queue->tid);
 			pthread_join(queue->tid, NULL);
 			queue->tid = 0;
 		}
@@ -711,6 +755,8 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 			close(queue->eventfd);
 			queue->eventfd = -1;
 		}
+		if (queue->control_eventfd >= 0)
+			close(queue->control_eventfd);
 
 		if (queue->ring.ring_fd != -1)
 			io_uring_queue_exit(&queue->ring);
@@ -718,12 +764,24 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 		for (size_t idx = 0; idx < fuse_ring->queue_depth; idx++) {
 			struct fuse_ring_ent *ent = &queue->ent[idx];
 
-			if (!fuse_ring->zero_copy)
+			if (!fuse_ring->zero_copy && ent->op_payload)
 				numa_free(ent->op_payload, ent->req_payload_sz);
-			numa_free(ent->req_header, queue->req_header_sz);
+			if (ent->req_header) {
+				numa_free(ent->req_header, queue->req_header_sz);
+				pthread_mutex_destroy(&ent->req.lock);
+			}
 		}
 		if (queue->payload_pool)
 			numa_free(queue->payload_pool, queue->payload_pool_sz);
+		if (queue->prepared_pool)
+			numa_free(queue->prepared_pool, queue->prepared_pool_sz);
+		if (queue->prepared_payloads) {
+			for (size_t i = 0; i < fuse_ring->queue_depth; i++)
+				if (queue->prepared_payloads[i])
+					numa_free(queue->prepared_payloads[i],
+						  fuse_ring->max_req_payload_sz);
+			free(queue->prepared_payloads);
+		}
 		read_submitted += queue->fixed_read_submitted;
 		read_completed += queue->fixed_read_completed;
 		read_errors += queue->fixed_read_errors;
@@ -779,6 +837,8 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 	free(fuse_ring->queues);
 	pthread_cond_destroy(&fuse_ring->thread_start_cond);
 	pthread_mutex_destroy(&fuse_ring->thread_start_mutex);
+	pthread_mutex_destroy(&fuse_ring->control_lock);
+	sem_destroy(&fuse_ring->init_sem);
 	free(fuse_ring);
 }
 
@@ -808,7 +868,7 @@ static int fuse_uring_submit_control(struct fuse_ring_queue *queue,
 	case FUSE_IO_URING_CMD_ADD_BUFPOOL:
 		cmd->bufpool.uaddr = (uintptr_t)queue->payload_pool;
 		cmd->bufpool.len = (uint32_t)queue->payload_pool_sz;
-		fuse_uring_use_payload_pool(sqe);
+		fuse_uring_use_payload_pool(sqe, queue);
 		break;
 	default:
 		return -EINVAL;
@@ -904,12 +964,660 @@ static int fuse_uring_register_ent(struct fuse_ring_queue *queue,
 		struct fuse_uring_cmd_req *cmd = fuse_uring_get_sqe_cmd(sqe);
 
 		cmd->ent_zero_copy_buf_index = ent->fixed_buf_index;
-		fuse_uring_use_payload_pool(sqe);
+		fuse_uring_use_payload_pool(sqe, queue);
 	}
 #endif
 
 	return 0;
 
+}
+
+static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *queue);
+static int fuse_uring_runtime_service(struct fuse_ring_queue *queue);
+
+static uint64_t fuse_uring_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Runtime commands never borrow a stack pointer as CQE user_data. */
+/* Keep SQE128's extension out of the compiler's 64-byte SQE size inference. */
+static __attribute__((noinline)) void
+fuse_uring_runtime_prepare(struct io_uring_sqe *sqe,
+				       struct fuse_ring_queue *queue,
+				       struct fuse_ring_ent *ent,
+				       unsigned int opcode,
+				       const struct fuse_uring_runtime_cmd *cmd)
+{
+	/* liburing's public SQE type describes only the first 64 bytes. */
+	struct sqe128_storage {
+		struct io_uring_sqe sqe;
+		unsigned char extension[64];
+	};
+	struct sqe128_storage *storage = (void *)sqe;
+
+	fuse_uring_sqe_prepare(sqe, ent, opcode);
+	memcpy((char *)storage + offsetof(struct io_uring_sqe, cmd),
+	       cmd, sizeof(*cmd));
+#ifdef HAVE_URING_ZERO_COPY
+	if (opcode == FUSE_IO_URING_CMD_RECONFIG && queue->ring_pool->zero_copy)
+		fuse_uring_use_payload_pool(sqe, queue);
+#else
+	(void)queue;
+#endif
+}
+
+static struct fuse_uring_runtime_cmd
+fuse_uring_runtime_command(struct fuse_ring_queue *queue)
+{
+	struct fuse_uring_runtime_cmd cmd = {
+		.version = FUSE_URING_RUNTIME_VERSION,
+		.qid = queue->qid,
+		.generation = queue->generation,
+	};
+
+	return cmd;
+}
+
+/* Submit under the same lock used by copied-mode foreign repliers. */
+static int fuse_uring_runtime_flush(struct fuse_ring_queue *queue)
+{
+	int err;
+
+	pthread_mutex_lock(&queue->ring_lock);
+	err = io_uring_submit(&queue->ring);
+	pthread_mutex_unlock(&queue->ring_lock);
+	return err < 0 ? err : 0;
+}
+
+static int fuse_uring_runtime_pump(struct fuse_ring_queue *queue)
+{
+	struct __kernel_timespec timeout = { .tv_nsec = 10000000 };
+	struct io_uring_cqe *cqe;
+	int err;
+
+	if (atomic_load_explicit(&queue->ring_pool->se->mt_exited,
+				 memory_order_relaxed))
+		return -ENOTCONN;
+	err = fuse_uring_runtime_flush(queue);
+	if (err)
+		return err;
+	err = io_uring_wait_cqe_timeout(&queue->ring, &cqe, &timeout);
+	if (err == -ETIME || err == -EINTR)
+		return 0;
+	if (err)
+		return err;
+	atomic_store_explicit(&queue->cqe_processing, true, memory_order_relaxed);
+	err = fuse_uring_queue_handle_cqes(queue);
+	atomic_store_explicit(&queue->cqe_processing, false, memory_order_relaxed);
+	return err;
+}
+
+static int fuse_uring_runtime_control(struct fuse_ring_queue *queue,
+				      unsigned int opcode,
+				      struct fuse_uring_runtime_cmd *cmd)
+{
+	struct io_uring_sqe *sqe;
+	int err;
+
+	/* Only the owner enters this function, and only one control is issued. */
+	if (queue->control_pending)
+		return -EBUSY;
+	pthread_mutex_lock(&queue->ring_lock);
+	sqe = io_uring_get_sqe(&queue->ring);
+	if (!sqe) {
+		pthread_mutex_unlock(&queue->ring_lock);
+		return -EAGAIN;
+	}
+	queue->control_pending = true;
+	fuse_uring_runtime_prepare(sqe, queue, &queue->control_ent, opcode, cmd);
+	pthread_mutex_unlock(&queue->ring_lock);
+	while (queue->control_pending) {
+		err = fuse_uring_runtime_pump(queue);
+		if (err)
+			return err;
+	}
+	return queue->control_result;
+}
+
+static int fuse_uring_runtime_query(struct fuse_ring_queue *queue,
+				    struct fuse_uring_runtime_state *state)
+{
+	struct fuse_uring_runtime_cmd cmd = fuse_uring_runtime_command(queue);
+	int err;
+
+	memset(&queue->query_result, 0, sizeof(queue->query_result));
+	cmd.result_addr = (uintptr_t)&queue->query_result;
+	err = fuse_uring_runtime_control(queue, FUSE_IO_URING_CMD_QUERY, &cmd);
+	if (!err)
+		*state = queue->query_result;
+	return err;
+}
+
+static int fuse_uring_runtime_rearm(struct fuse_ring_queue *queue,
+				    unsigned int depth)
+{
+	struct fuse_ring_pool *pool = queue->ring_pool;
+	int err = 0;
+
+	queue->rearming = true;
+	pthread_mutex_lock(&queue->ring_lock);
+	for (unsigned int i = 0; i < depth; i++) {
+		struct fuse_ring_ent *ent = &queue->ent[i];
+		struct fuse_uring_runtime_cmd cmd = fuse_uring_runtime_command(queue);
+		struct io_uring_sqe *sqe;
+
+		if (ent->submitted && !ent->retired)
+			continue;
+		sqe = io_uring_get_sqe(&queue->ring);
+		if (!sqe) {
+			err = -EAGAIN;
+			break;
+		}
+		cmd.entry_id = i;
+		cmd.header_addr = (uintptr_t)ent->req_header;
+		if (!pool->zero_copy) {
+			cmd.payload_addr = (uintptr_t)ent->op_payload;
+			cmd.len = ent->req_payload_sz;
+		}
+		ent->last_cmd = FUSE_IO_URING_CMD_REARM;
+		ent->rearm_error = 0;
+		ent->retired = false;
+		ent->submitted = true;
+		fuse_uring_runtime_prepare(sqe, queue, ent, ent->last_cmd, &cmd);
+#ifdef HAVE_URING_ZERO_COPY
+		if (pool->zero_copy)
+			fuse_uring_use_payload_pool(sqe, queue);
+#endif
+	}
+	pthread_mutex_unlock(&queue->ring_lock);
+	return err;
+}
+
+static int fuse_uring_runtime_configuration(struct fuse_ring_queue *queue,
+					    unsigned int depth, bool init)
+{
+	struct fuse_ring_pool *pool = queue->ring_pool;
+	struct fuse_uring_runtime_cmd cmd = fuse_uring_runtime_command(queue);
+
+	cmd.flags = init ? FUSE_URING_RUNTIME_INIT : 0;
+	cmd.depth = depth;
+	cmd.max_depth = pool->queue_depth;
+	if (pool->zero_copy) {
+		cmd.flags |= FUSE_URING_RUNTIME_ZERO_COPY;
+		if (pool->write_in_task)
+			cmd.flags |= FUSE_URING_RUNTIME_WRITE_IN_TASK;
+		cmd.addr = (uintptr_t)queue->payload_pool;
+		cmd.len = queue->payload_pool_sz;
+		cmd.pool_index = queue->payload_slot;
+	}
+	return fuse_uring_runtime_control(queue, FUSE_IO_URING_CMD_RECONFIG, &cmd);
+}
+
+static int fuse_uring_runtime_resume(struct fuse_ring_queue *queue)
+{
+	struct fuse_uring_runtime_cmd cmd = fuse_uring_runtime_command(queue);
+
+	/* QUERY has observed accepted rearm commands before request admission. */
+	queue->rearming = false;
+	return fuse_uring_runtime_control(queue, FUSE_IO_URING_CMD_RESUME, &cmd);
+}
+
+static int fuse_uring_runtime_start_queue(struct fuse_ring_queue *queue)
+{
+	struct fuse_uring_runtime_state state;
+	int err;
+
+	err = fuse_uring_runtime_configuration(queue, queue->current_depth, true);
+	if (err)
+		return err;
+	err = fuse_uring_runtime_rearm(queue, queue->current_depth);
+	if (err)
+		return err;
+	err = fuse_uring_runtime_query(queue, &state);
+	if (err)
+		return err;
+	if (state.active != queue->current_depth)
+		return -EIO;
+	return fuse_uring_runtime_resume(queue);
+}
+
+static int fuse_uring_poll_control(struct fuse_ring_queue *queue)
+{
+	struct io_uring_sqe *sqe;
+
+	pthread_mutex_lock(&queue->ring_lock);
+	sqe = io_uring_get_sqe(&queue->ring);
+	if (sqe) {
+		io_uring_prep_poll_add(sqe, queue->control_eventfd, POLLIN);
+		io_uring_sqe_set_data(sqe,
+				     (void *)(uintptr_t)queue->control_eventfd);
+	}
+	pthread_mutex_unlock(&queue->ring_lock);
+	return sqe ? 0 : -EAGAIN;
+}
+
+static void fuse_uring_runtime_phase(struct fuse_ring_queue *queue,
+				     unsigned int phase)
+{
+	pthread_mutex_lock(&queue->ring_pool->control_lock);
+	queue->runtime_status.phase = phase;
+	pthread_mutex_unlock(&queue->ring_pool->control_lock);
+}
+
+static bool fuse_uring_runtime_drained(struct fuse_ring_queue *queue)
+{
+	for (size_t i = 0; i < queue->ring_pool->queue_depth; i++) {
+		struct fuse_ring_ent *ent = &queue->ent[i];
+
+		if ((ent->submitted && !ent->retired) || ent->fixed_io_pending ||
+		    atomic_load_explicit(&ent->req.ref_cnt, memory_order_acquire) != 1)
+			return false;
+	}
+	return true;
+}
+
+static int fuse_uring_runtime_drain(struct fuse_ring_queue *queue)
+{
+	uint64_t deadline = fuse_uring_now_ms() + queue->ring_pool->drain_timeout_ms;
+	int err;
+
+	while (!fuse_uring_runtime_drained(queue)) {
+		if (fuse_uring_now_ms() >= deadline)
+			return -ETIMEDOUT;
+		err = fuse_uring_runtime_pump(queue);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static int fuse_uring_runtime_pause(struct fuse_ring_queue *queue)
+{
+	struct fuse_uring_runtime_cmd cmd = fuse_uring_runtime_command(queue);
+
+	return fuse_uring_runtime_control(queue, FUSE_IO_URING_CMD_PAUSE, &cmd);
+}
+
+/* Resume old configuration even if a slow request prevented full quiescence. */
+static int fuse_uring_runtime_restore(struct fuse_ring_queue *queue,
+				      unsigned int depth)
+{
+	uint64_t deadline = fuse_uring_now_ms() + queue->ring_pool->drain_timeout_ms;
+	struct fuse_uring_runtime_state state;
+	int err;
+
+	for (;;) {
+		err = fuse_uring_runtime_rearm(queue, depth);
+		if (err)
+			return err;
+		err = fuse_uring_runtime_query(queue, &state);
+		if (err)
+			return err;
+		for (size_t i = 0; i < depth; i++)
+			if (queue->ent[i].rearm_error)
+				return queue->ent[i].rearm_error;
+		if (state.active == depth) {
+			err = fuse_uring_runtime_resume(queue);
+			if (!err)
+				return 0;
+			/* A concurrently completed COMMIT may have retired an entry. */
+			if (err != -EBUSY && err != -EAGAIN)
+				return err;
+		}
+		if (fuse_uring_now_ms() >= deadline)
+			return -ETIMEDOUT;
+		err = fuse_uring_runtime_pump(queue);
+		if (err)
+			return err;
+	}
+}
+
+static unsigned int fuse_uring_alternate_slot(struct fuse_ring_queue *queue)
+{
+	return queue->payload_slot ? 0 : queue->ring_pool->queue_depth + 1;
+}
+
+static int fuse_uring_runtime_prepare_payload(struct fuse_ring_queue *queue,
+					      unsigned int depth)
+{
+	struct fuse_ring_pool *pool = queue->ring_pool;
+
+	if (pool->zero_copy) {
+#ifdef HAVE_URING_ZERO_COPY
+		unsigned int slot = fuse_uring_alternate_slot(queue);
+		unsigned int token = slot ? 1 : 0;
+		struct iovec iov;
+		__u64 tag = (uintptr_t)&queue->payload_tags[token];
+		int err;
+
+		queue->prepared_pool_sz = depth * pool->max_req_payload_sz;
+		queue->prepared_pool = numa_alloc_local(queue->prepared_pool_sz);
+		if (!queue->prepared_pool) {
+			queue->prepared_pool_sz = 0;
+			return -ENOMEM;
+		}
+		iov.iov_base = queue->prepared_pool;
+		iov.iov_len = queue->prepared_pool_sz;
+		queue->payload_released[token] = false;
+		err = io_uring_register_buffers_update_tag(&queue->ring, slot,
+							 &iov, &tag, 1);
+		if (err != 1) {
+			numa_free(queue->prepared_pool, queue->prepared_pool_sz);
+			queue->prepared_pool = NULL;
+			queue->prepared_pool_sz = 0;
+			return err < 0 ? err : -EIO;
+		}
+#else
+		return -ENOTSUP;
+#endif
+	} else {
+		for (unsigned int i = queue->current_depth; i < depth; i++) {
+			queue->prepared_payloads[i] = numa_alloc_local(pool->max_req_payload_sz);
+			if (!queue->prepared_payloads[i])
+				return -ENOMEM;
+		}
+	}
+	return 0;
+}
+
+static void fuse_uring_runtime_swap_pool(struct fuse_ring_queue *queue)
+{
+	void *old = queue->payload_pool;
+	size_t old_sz = queue->payload_pool_sz;
+
+	queue->payload_pool = queue->prepared_pool;
+	queue->payload_pool_sz = queue->prepared_pool_sz;
+	queue->prepared_pool = old;
+	queue->prepared_pool_sz = old_sz;
+	queue->payload_slot = fuse_uring_alternate_slot(queue);
+}
+
+static int fuse_uring_runtime_free_prepared(struct fuse_ring_queue *queue)
+{
+	struct fuse_ring_pool *pool = queue->ring_pool;
+
+	if (queue->prepared_pool) {
+#ifdef HAVE_URING_ZERO_COPY
+		unsigned int slot = fuse_uring_alternate_slot(queue);
+		unsigned int token = slot ? 1 : 0;
+		struct iovec empty = { 0 };
+		__u64 tag = 0;
+		int err;
+
+		err = io_uring_register_buffers_update_tag(&queue->ring, slot,
+							 &empty, &tag, 1);
+		if (err != 1)
+			return err < 0 ? err : -EIO;
+		/* The tag, not registration's return, proves the old pin is gone. */
+		while (!queue->payload_released[token]) {
+			err = fuse_uring_runtime_pump(queue);
+			if (err)
+				return err;
+		}
+		numa_free(queue->prepared_pool, queue->prepared_pool_sz);
+		queue->prepared_pool = NULL;
+		queue->prepared_pool_sz = 0;
+#else
+		return -ENOTSUP;
+#endif
+	}
+	for (size_t i = 0; i < pool->queue_depth; i++) {
+		if (queue->prepared_payloads[i]) {
+			numa_free(queue->prepared_payloads[i], pool->max_req_payload_sz);
+			queue->prepared_payloads[i] = NULL;
+		}
+	}
+	return 0;
+}
+
+static void fuse_uring_runtime_publish_memory(struct fuse_ring_queue *queue)
+{
+	struct fuse_ring_pool *pool = queue->ring_pool;
+	uint64_t reclaim = queue->prepared_pool_sz;
+
+	if (!pool->zero_copy)
+		for (size_t i = 0; i < pool->queue_depth; i++)
+			if (queue->prepared_payloads[i])
+				reclaim += pool->max_req_payload_sz;
+	pthread_mutex_lock(&pool->control_lock);
+	queue->runtime_status.current_depth = queue->current_depth;
+	queue->runtime_status.generation = queue->generation;
+	queue->runtime_status.payload_bytes = queue->current_depth * pool->max_req_payload_sz;
+	queue->runtime_status.registered_bytes = pool->zero_copy ?
+		queue->payload_pool_sz + queue->prepared_pool_sz : 0;
+	queue->runtime_status.reclaim_bytes = reclaim;
+	pthread_mutex_unlock(&pool->control_lock);
+}
+
+/* Returns a recoverable transaction error; fatal is set only if recovery fails. */
+static int fuse_uring_runtime_change(struct fuse_ring_queue *queue,
+				     unsigned int depth, bool *fatal)
+{
+	struct fuse_ring_pool *pool = queue->ring_pool;
+	struct fuse_uring_runtime_state state;
+	unsigned int old_depth = queue->current_depth;
+	uint64_t old_generation = queue->generation;
+	bool switched = false;
+	bool configured = false;
+	int err, restore_err;
+
+	if (old_depth == depth)
+		return 0;
+	fuse_uring_runtime_phase(queue, FUSE_URING_RUNTIME_PREPARING);
+	err = fuse_uring_runtime_prepare_payload(queue, depth);
+	fuse_uring_runtime_publish_memory(queue);
+	if (err)
+		goto free_prepared;
+	fuse_uring_runtime_phase(queue, FUSE_URING_RUNTIME_DRAINING);
+	err = fuse_uring_runtime_pause(queue);
+	if (err)
+		goto free_prepared;
+	err = fuse_uring_runtime_drain(queue);
+	if (err)
+		goto restore;
+	err = fuse_uring_runtime_query(queue, &state);
+	if (err || state.state != FUSE_URING_STATE_QUIESCED || state.active) {
+		if (!err)
+			err = -EBUSY;
+		goto restore;
+	}
+	fuse_uring_runtime_phase(queue, FUSE_URING_RUNTIME_RECONFIGURING);
+	if (pool->zero_copy)
+		fuse_uring_runtime_swap_pool(queue);
+	else
+		for (unsigned int i = old_depth; i < depth; i++) {
+			queue->ent[i].op_payload = queue->prepared_payloads[i];
+			queue->prepared_payloads[i] = NULL;
+		}
+	switched = true;
+	queue->generation++;
+	err = fuse_uring_runtime_configuration(queue, depth, false);
+	if (err)
+		goto restore;
+	configured = true;
+	err = fuse_uring_runtime_restore(queue, depth);
+	if (err)
+		goto restore;
+	queue->current_depth = depth;
+	if (!pool->zero_copy)
+		for (unsigned int i = depth; i < old_depth; i++) {
+			queue->prepared_payloads[i] = queue->ent[i].op_payload;
+			queue->ent[i].op_payload = NULL;
+		}
+	fuse_uring_runtime_phase(queue, FUSE_URING_RUNTIME_RECLAIMING);
+	fuse_uring_runtime_publish_memory(queue);
+	err = fuse_uring_runtime_free_prepared(queue);
+	if (err)
+		*fatal = true;
+	fuse_uring_runtime_publish_memory(queue);
+	return err;
+
+restore:
+	if (queue->control_pending) {
+		*fatal = true;
+		return err;
+	}
+	if (configured) {
+		/* Retire the unsuccessful new generation before reverting it. */
+		restore_err = fuse_uring_runtime_pause(queue);
+		if (!restore_err)
+			restore_err = fuse_uring_runtime_drain(queue);
+		if (restore_err) {
+			*fatal = true;
+			return restore_err;
+		}
+	}
+	if (switched) {
+		if (pool->zero_copy)
+			fuse_uring_runtime_swap_pool(queue);
+		else
+			for (unsigned int i = old_depth; i < depth; i++) {
+				queue->prepared_payloads[i] = queue->ent[i].op_payload;
+				queue->ent[i].op_payload = NULL;
+			}
+		queue->generation = configured ? queue->generation + 1 : old_generation;
+		if (configured) {
+			restore_err = fuse_uring_runtime_configuration(queue, old_depth, false);
+			if (restore_err) {
+				*fatal = true;
+				return restore_err;
+			}
+		}
+	}
+	restore_err = fuse_uring_runtime_restore(queue, old_depth);
+	if (restore_err) {
+		*fatal = true;
+		return restore_err;
+	}
+free_prepared:
+	if (queue->control_pending) {
+		*fatal = true;
+		return err;
+	}
+	restore_err = fuse_uring_runtime_free_prepared(queue);
+	if (restore_err) {
+		*fatal = true;
+		return restore_err;
+	}
+	fuse_uring_runtime_publish_memory(queue);
+	return err;
+}
+
+static int fuse_uring_runtime_service(struct fuse_ring_queue *queue)
+{
+	struct fuse_ring_pool *pool = queue->ring_pool;
+	struct fuse_ring_queue *next = NULL;
+	unsigned int depth;
+	bool fatal = false;
+	int err;
+
+	pthread_mutex_lock(&pool->control_lock);
+	if (!pool->control_busy || pool->control_qid != (unsigned int)queue->qid) {
+		pthread_mutex_unlock(&pool->control_lock);
+		return 0;
+	}
+	depth = pool->target_depth;
+	pthread_mutex_unlock(&pool->control_lock);
+	err = fuse_uring_runtime_change(queue, depth, &fatal);
+	pthread_mutex_lock(&pool->control_lock);
+	queue->runtime_status.error = err;
+	queue->runtime_status.phase = err ? FUSE_URING_RUNTIME_FAILED :
+		FUSE_URING_RUNTIME_COMPLETE;
+	if (err || ++pool->control_qid == pool->nr_queues) {
+		pool->control_error = err;
+		pool->control_busy = false;
+	} else {
+		next = fuse_uring_get_queue(pool, pool->control_qid);
+	}
+	pthread_mutex_unlock(&pool->control_lock);
+	if (next) {
+		uint64_t value = 1;
+
+		if (write(next->control_eventfd, &value, sizeof(value)) < 0 &&
+		    errno != EAGAIN)
+			return -errno;
+	}
+	return fatal ? err : 0;
+}
+
+int fuse_uring_request_qd(struct fuse_session *se, uint32_t depth,
+			  uint64_t *transaction)
+{
+	struct fuse_ring_pool *pool = se->uring.pool;
+	struct fuse_ring_queue *first;
+	uint64_t value = 1;
+	int err = 0;
+
+	if (!pool || !pool->runtime_qd)
+		return -ENOTSUP;
+	if (!transaction || !depth || depth > pool->queue_depth)
+		return -EINVAL;
+	if (atomic_load_explicit(&pool->ready_queues, memory_order_acquire) !=
+	    pool->nr_queues)
+		return -EAGAIN;
+	if (atomic_load_explicit(&se->mt_exited, memory_order_relaxed))
+		return -ENOTCONN;
+	pthread_mutex_lock(&pool->control_lock);
+	if (pool->control_busy) {
+		err = -EBUSY;
+		goto out;
+	}
+	pool->control_busy = true;
+	pool->control_error = 0;
+	pool->control_qid = 0;
+	pool->target_depth = depth;
+	*transaction = ++pool->transaction;
+	for (size_t i = 0; i < pool->nr_queues; i++) {
+		struct fuse_ring_queue *q = fuse_uring_get_queue(pool, i);
+
+		q->runtime_status.target_depth = depth;
+		q->runtime_status.error = 0;
+		q->runtime_status.phase = FUSE_URING_RUNTIME_IDLE;
+	}
+	first = fuse_uring_get_queue(pool, 0);
+	if (write(first->control_eventfd, &value, sizeof(value)) < 0 && errno != EAGAIN) {
+		err = -errno;
+		pool->control_busy = false;
+		pool->control_error = err;
+	}
+out:
+	pthread_mutex_unlock(&pool->control_lock);
+	return err;
+}
+
+int fuse_uring_runtime_status(struct fuse_session *se,
+			      struct fuse_uring_runtime_status *status,
+			      struct fuse_uring_runtime_queue_status *queues,
+			      size_t capacity)
+{
+	struct fuse_ring_pool *pool = se->uring.pool;
+
+	if (!pool || !pool->runtime_qd)
+		return -ENOTSUP;
+	if (!status || (capacity && !queues))
+		return -EINVAL;
+	if (atomic_load_explicit(&pool->ready_queues, memory_order_acquire) !=
+	    pool->nr_queues)
+		return -EAGAIN;
+	if (capacity && capacity < pool->nr_queues)
+		return -ENOSPC;
+	pthread_mutex_lock(&pool->control_lock);
+	*status = (struct fuse_uring_runtime_status) {
+		.transaction = pool->transaction,
+		.max_depth = pool->queue_depth,
+		.nr_queues = pool->nr_queues,
+		.busy = pool->control_busy,
+		.error = pool->control_error,
+	};
+	if (capacity)
+		for (size_t i = 0; i < pool->nr_queues; i++)
+			queues[i] = fuse_uring_get_queue(pool, i)->runtime_status;
+	pthread_mutex_unlock(&pool->control_lock);
+	return pool->nr_queues;
 }
 
 static int fuse_uring_register_queue(struct fuse_ring_queue *queue)
@@ -919,6 +1627,12 @@ static int fuse_uring_register_queue(struct fuse_ring_queue *queue)
 	struct io_uring_sqe *sqe;
 	int res;
 
+	if (ring_pool->runtime_qd) {
+		res = fuse_uring_runtime_start_queue(queue);
+		if (res)
+			return res;
+		goto polls;
+	}
 	for (size_t idx = 0; idx < ring_pool->queue_depth; idx++) {
 		struct fuse_ring_ent *ent = &queue->ent[idx];
 
@@ -935,6 +1649,7 @@ static int fuse_uring_register_queue(struct fuse_ring_queue *queue)
 		return -EINVAL;
 	}
 
+polls:
 	/* Poll SQE for the eventfd to wake up on teardown */
 	sqe = io_uring_get_sqe(&queue->ring);
 	if (sqe == NULL) {
@@ -944,6 +1659,8 @@ static int fuse_uring_register_queue(struct fuse_ring_queue *queue)
 
 	io_uring_prep_poll_add(sqe, queue->eventfd, POLLIN);
 	io_uring_sqe_set_data(sqe, (void *)(uintptr_t)queue->eventfd);
+	if (ring_pool->runtime_qd)
+		return fuse_uring_poll_control(queue);
 
 	/* Only preparation until here, no submission yet */
 
@@ -953,7 +1670,8 @@ static int fuse_uring_register_queue(struct fuse_ring_queue *queue)
 static int fuse_uring_submit_registered_queue(struct fuse_ring_queue *queue)
 {
 	struct fuse_ring_pool *pool = queue->ring_pool;
-	size_t expected = pool->queue_depth + 1;
+	size_t expected = pool->runtime_qd ? io_uring_sq_ready(&queue->ring) :
+		pool->queue_depth + 1;
 	size_t submitted = 0;
 	unsigned int ready;
 
@@ -974,14 +1692,14 @@ static int fuse_uring_submit_registered_queue(struct fuse_ring_queue *queue)
 	if (ready == pool->nr_queues) {
 		if (pool->zero_copy) {
 			fuse_log(FUSE_LOG_INFO,
-				 "FUSE_URING_ZERO_COPY active=1 queues=%zu queue_depth=%zu fixed_buf_slot=0 request_slots=%zu register_entries=%zu\n",
-				 pool->nr_queues, pool->queue_depth,
+				 "FUSE_URING_ZERO_COPY active=1 queues=%zu queue_depth=%zu max_queue_depth=%zu fixed_buf_slot=0 request_slots=%zu register_entries=%zu\n",
+				 pool->nr_queues, pool->initial_depth, pool->queue_depth,
 				 pool->nr_queues * pool->queue_depth,
-				 pool->nr_queues * pool->queue_depth);
+				 pool->nr_queues * pool->initial_depth);
 		} else {
 			fuse_log(FUSE_LOG_INFO,
-				 "FUSE_URING_ZERO_COPY active=0 reason=not-requested queues=%zu queue_depth=%zu\n",
-				 pool->nr_queues, pool->queue_depth);
+				 "FUSE_URING_ZERO_COPY active=0 reason=not-requested queues=%zu queue_depth=%zu max_queue_depth=%zu\n",
+				 pool->nr_queues, pool->initial_depth, pool->queue_depth);
 		}
 	}
 	return 0;
@@ -1035,8 +1753,13 @@ static struct fuse_ring_pool *fuse_create_ring(struct fuse_session *se)
 		fuse_log(FUSE_LOG_ERR, "Allocating the ring failed\n");
 		goto err;
 	}
+	pthread_mutex_init(&fuse_ring->control_lock, NULL);
+	pthread_cond_init(&fuse_ring->thread_start_cond, NULL);
+	pthread_mutex_init(&fuse_ring->thread_start_mutex, NULL);
+	sem_init(&fuse_ring->init_sem, 0, 0);
 
-	queue_sz = fuse_ring_queue_size(se->uring.q_depth);
+	queue_sz = fuse_ring_queue_size(se->uring.runtime_qd ?
+		se->uring.max_depth : se->uring.q_depth);
 	fuse_ring->queues = calloc(1, queue_sz * nr_queues);
 	if (fuse_ring->queues == NULL) {
 		fuse_log(FUSE_LOG_ERR, "Allocating the queues failed\n");
@@ -1046,7 +1769,11 @@ static struct fuse_ring_pool *fuse_create_ring(struct fuse_session *se)
 	fuse_ring->se = se;
 	fuse_ring->nr_queues = nr_queues;
 	fuse_ring->cpu_core_ids = fuse_uring_read_cpu_core_ids(nr_queues);
-	fuse_ring->queue_depth = se->uring.q_depth;
+	fuse_ring->runtime_qd = se->uring.runtime_qd;
+	fuse_ring->queue_depth = se->uring.runtime_qd ?
+		se->uring.max_depth : se->uring.q_depth;
+	fuse_ring->initial_depth = se->uring.q_depth;
+	fuse_ring->drain_timeout_ms = se->uring.drain_timeout_ms;
 	fuse_ring->max_req_payload_sz = payload_sz;
 	fuse_ring->queue_mem_size = queue_sz;
 	fuse_ring->single_issuer = se->conn.io_uring_single_issuer;
@@ -1069,12 +1796,16 @@ static struct fuse_ring_pool *fuse_create_ring(struct fuse_session *se)
 		queue->qid = qid;
 		queue->ring_pool = fuse_ring;
 		queue->eventfd = -1;
+		queue->control_eventfd = -1;
+		queue->current_depth = se->uring.q_depth;
+		queue->generation = 1;
+		queue->runtime_status.qid = qid;
+		queue->runtime_status.current_depth = se->uring.q_depth;
+		queue->runtime_status.target_depth = se->uring.q_depth;
+		queue->runtime_status.generation = 1;
+		queue->runtime_status.payload_bytes = se->uring.q_depth * payload_sz;
 		pthread_mutex_init(&queue->ring_lock, NULL);
 	}
-
-	pthread_cond_init(&fuse_ring->thread_start_cond, NULL);
-	pthread_mutex_init(&fuse_ring->thread_start_mutex, NULL);
-	sem_init(&fuse_ring->init_sem, 0, 0);
 
 	return fuse_ring;
 
@@ -1128,16 +1859,19 @@ static void fuse_uring_resubmit(struct fuse_ring_queue *queue,
 				fuse_uring_get_sqe_cmd(sqe);
 
 			cmd->ent_zero_copy_buf_index = ent->fixed_buf_index;
-			fuse_uring_use_payload_pool(sqe);
+			fuse_uring_use_payload_pool(sqe, queue);
 		}
 #endif
 		break;
 	case FUSE_IO_URING_CMD_COMMIT_AND_FETCH:
 		fuse_uring_sqe_set_req_data(fuse_uring_get_sqe_cmd(sqe),
 					    queue->qid, ent->req_commit_id);
+		if (queue->ring_pool->runtime_qd)
+			((struct fuse_uring_cmd_req *)fuse_uring_get_sqe_cmd(sqe))->flags =
+				queue->generation;
 #ifdef HAVE_URING_ZERO_COPY
 		if (queue->ring_pool->zero_copy)
-			fuse_uring_use_payload_pool(sqe);
+			fuse_uring_use_payload_pool(sqe, queue);
 #endif
 		break;
 	default:
@@ -1291,6 +2025,12 @@ static bool fuse_uring_cqe_is_fixed_io(struct fuse_ring_queue *queue,
 
 	if ((uintptr_t)ent == (unsigned int)queue->eventfd)
 		return false;
+	if (queue->ring_pool->runtime_qd &&
+	    ((uintptr_t)ent == (unsigned int)queue->control_eventfd ||
+	     ent == &queue->control_ent ||
+	     (void *)ent == &queue->payload_tags[0] ||
+	     (void *)ent == &queue->payload_tags[1]))
+		return false;
 	return ent && ent->cqe_kind == FUSE_URING_CQE_FIXED_IO;
 }
 
@@ -1308,6 +2048,47 @@ static int fuse_uring_dispatch_cqe(struct fuse_ring_queue *queue,
 			return -ENOTCONN;
 		}
 		return err < 0 && err != -ECANCELED ? err : 0;
+	}
+	if (queue->ring_pool->runtime_qd) {
+		if ((uintptr_t)ent == (unsigned int)queue->control_eventfd) {
+			uint64_t value;
+
+			if (err < 0)
+				return err == -ECANCELED ? 0 : err;
+			if (read(queue->control_eventfd, &value, sizeof(value)) < 0 &&
+			    errno != EAGAIN)
+				return -errno;
+			return fuse_uring_poll_control(queue);
+		}
+		if (ent == &queue->control_ent) {
+			queue->control_result = err;
+			queue->control_pending = false;
+			return 0;
+		}
+		for (unsigned int i = 0; i < 2; i++) {
+			if ((void *)ent == &queue->payload_tags[i]) {
+				if (err)
+					return -EIO;
+				queue->payload_released[i] = true;
+				return 0;
+			}
+		}
+		if (!fixed_io && err == FUSE_URING_CQE_RETIRED) {
+			ent->retired = true;
+			return 0;
+		}
+		if (!fixed_io && err < 0 &&
+		    ent->last_cmd == FUSE_IO_URING_CMD_REARM) {
+			if (!queue->rearming) {
+				if (err == -ENOTCONN)
+					return 0;
+				se->error = err;
+				return err;
+			}
+			ent->retired = true;
+			ent->rearm_error = err;
+			return 0;
+		}
 	}
 	if (fixed_io)
 		return fuse_uring_handle_fixed_io_cqe(queue, ent, err);
@@ -1479,10 +2260,19 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 			 queue->qid, strerror(errno));
 		return res;
 	}
+	if (ring->runtime_qd) {
+		queue->control_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		if (queue->control_eventfd < 0)
+			return -errno;
+		queue->prepared_payloads = calloc(ring->queue_depth, sizeof(void *));
+		if (!queue->prepared_payloads)
+			return -ENOMEM;
+	}
 
 	res = fuse_queue_setup_io_uring(&queue->ring, queue->qid,
 					ring->queue_depth, se->fd,
-					queue->eventfd, ring->single_issuer);
+					queue->eventfd, ring->single_issuer,
+					ring->runtime_qd);
 	if (res != 0) {
 		fuse_log(FUSE_LOG_ERR, "qid=%d io_uring init failed\n",
 			 queue->qid);
@@ -1494,20 +2284,22 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 	if (ring->zero_copy) {
 #ifdef HAVE_URING_ZERO_COPY
 		struct iovec payload_iov;
-		__u64 payload_tag = 0;
+		__u64 payload_tag = ring->runtime_qd ?
+			(uintptr_t)&queue->payload_tags[0] : 0;
 
 		if (ring->queue_depth > UINT_MAX - 1 ||
 		    ring->max_req_payload_sz >
 			    UINT32_MAX / ring->queue_depth)
 			return -EOVERFLOW;
-		queue->payload_pool_sz = ring->queue_depth *
+		queue->payload_pool_sz = ring->initial_depth *
 					 ring->max_req_payload_sz;
 		queue->payload_pool = numa_alloc_local(queue->payload_pool_sz);
 		if (!queue->payload_pool)
 			return -ENOMEM;
 
 		res = io_uring_register_buffers_sparse(
-			&queue->ring, (unsigned int)ring->queue_depth + 1);
+			&queue->ring, (unsigned int)ring->queue_depth +
+			(ring->runtime_qd ? 2 : 1));
 		if (res)
 			return res;
 		queue->sparse_buffers_registered = true;
@@ -1517,6 +2309,7 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 			&queue->ring, 0, &payload_iov, &payload_tag, 1);
 		if (res != 1)
 			return res < 0 ? res : -EIO;
+		queue->runtime_status.registered_bytes = queue->payload_pool_sz;
 #else
 		return -ENOTSUP;
 #endif
@@ -1536,14 +2329,15 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 			numa_alloc_local(queue->req_header_sz);
 		if (!ring_ent->req_header)
 			return -ENOMEM;
+		pthread_mutex_init(&req->lock, NULL);
 		ring_ent->req_payload_sz = ring->max_req_payload_sz;
 		ring_ent->fixed_buf_index = (unsigned int)idx + 1;
 
 		if (ring->zero_copy) {
-			ring_ent->op_payload =
+			ring_ent->op_payload = idx < ring->initial_depth ?
 				(char *)queue->payload_pool +
-				idx * ring_ent->req_payload_sz;
-		} else {
+				idx * ring_ent->req_payload_sz : NULL;
+		} else if (idx < ring->initial_depth) {
 			ring_ent->op_payload =
 				numa_alloc_local(ring_ent->req_payload_sz);
 			if (!ring_ent->op_payload)
@@ -1551,7 +2345,6 @@ static int fuse_uring_init_queue(struct fuse_ring_queue *queue)
 		}
 
 		req->se = se;
-		pthread_mutex_init(&req->lock, NULL);
 		req->flags.is_uring = 1;
 		req->ref_cnt = 1; /* extra ref to avoid destruction */
 		list_init_req(req);
@@ -1590,8 +2383,10 @@ static void *fuse_uring_thread(void *arg)
 	}
 
 	sem_wait(&ring_pool->init_sem);
+	if (atomic_load_explicit(&se->mt_exited, memory_order_relaxed))
+		return NULL;
 
-	if (ring_pool->zero_copy) {
+	if (ring_pool->zero_copy && !ring_pool->runtime_qd) {
 #ifdef HAVE_URING_ZERO_COPY
 		err = fuse_uring_setup_zero_copy_queue(queue);
 #else
@@ -1645,6 +2440,11 @@ static void *fuse_uring_thread(void *arg)
 
 		atomic_store_explicit(&queue->cqe_processing, false,
 				      memory_order_relaxed);
+		if (ring_pool->runtime_qd) {
+			err = fuse_uring_runtime_service(queue);
+			if (err < 0)
+				goto err;
+		}
 
 		/*
 		 * Multi-issuer does not use io_uring_submit_and_wait(),
@@ -1691,6 +2491,13 @@ static int fuse_uring_sanity_check(struct fuse_session *se)
 		fuse_log(FUSE_LOG_ERR, "io-uring queue depth must be > 0\n");
 		return -EINVAL;
 	}
+	if (se->uring.runtime_qd &&
+	    (!se->uring.max_depth || se->uring.q_depth > se->uring.max_depth ||
+	     se->uring.max_depth >= UINT16_MAX || !se->uring.drain_timeout_ms))
+		return -EINVAL;
+	if (se->uring.runtime_qd &&
+	    !(se->conn.want_ext & FUSE_CAP_IO_URING_RUNTIME))
+		return -ENOTSUP;
 	if ((se->conn.want_ext & FUSE_CAP_IO_URING_BUFPOOL) &&
 	    !se->conn.io_uring_single_issuer) {
 		fuse_log(FUSE_LOG_ERR,
@@ -1711,6 +2518,8 @@ static int fuse_uring_sanity_check(struct fuse_session *se)
 	_Static_assert(sizeof(struct fuse_uring_cmd_req) <=
 		       FUSE_URING_MAX_SQE128_CMD_DATA,
 		       "SQE128_CMD_DATA has 80B cmd data");
+	_Static_assert(sizeof(struct fuse_uring_runtime_cmd) == 80,
+		       "Runtime command must occupy exactly the SQE128 command area");
 
 	return 0;
 }
@@ -1730,7 +2539,9 @@ int fuse_uring_start(struct fuse_session *se)
 		goto err;
 	}
 
+	pthread_mutex_lock(&se->uring.runtime_lock);
 	se->uring.pool = fuse_ring;
+	pthread_mutex_unlock(&se->uring.runtime_lock);
 	err = fuse_uring_start_ring_threads(fuse_ring);
 	if (err)
 		goto err;
@@ -1750,21 +2561,27 @@ int fuse_uring_start(struct fuse_session *se)
 err:
 	if (err) {
 		/* Note all threads need to have been started */
+		pthread_mutex_lock(&se->uring.runtime_lock);
+		se->uring.pool = NULL;
+		pthread_mutex_unlock(&se->uring.runtime_lock);
 		if (fuse_ring)
 			fuse_session_destruct_uring(fuse_ring);
-		se->uring.pool = NULL;
 	}
 	return err;
 }
 
 int fuse_uring_stop(struct fuse_session *se)
 {
-	struct fuse_ring_pool *ring = se->uring.pool;
+	struct fuse_ring_pool *ring;
 
-	if (ring == NULL)
-		return 0;
+	fuse_adaptive_stop(se);
+	pthread_mutex_lock(&se->uring.runtime_lock);
+	ring = se->uring.pool;
+	se->uring.pool = NULL;
+	pthread_mutex_unlock(&se->uring.runtime_lock);
 
-	fuse_session_destruct_uring(ring);
+	if (ring)
+		fuse_session_destruct_uring(ring);
 
 	return 0;
 }

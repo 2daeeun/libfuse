@@ -68,6 +68,12 @@ struct fuse_notify_req {
 struct fuse_session_uring {
 	bool enable;
 	unsigned int q_depth;
+	int runtime_qd; /* fuse_opt flag destinations are int-sized. */
+	unsigned int max_depth;
+	unsigned int drain_timeout_ms;
+	char *control_path;
+	pthread_mutex_t runtime_lock;
+	struct fuse_adaptive *adaptive;
 	struct fuse_ring_pool *pool;
 };
 

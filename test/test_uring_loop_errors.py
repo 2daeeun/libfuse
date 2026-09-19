@@ -40,7 +40,7 @@ struct io_uring_cqe { int unused; };
 struct fuse_session { _Atomic int mt_exited; int error; };
 struct fuse_ring_pool {
  struct fuse_session *se;
- bool single_issuer, zero_copy;
+ bool single_issuer, zero_copy, runtime_qd;
  pthread_mutex_t thread_start_mutex;
  pthread_cond_t thread_start_cond;
  sem_t init_sem;
@@ -99,6 +99,8 @@ static int fuse_uring_queue_handle_cqes(struct fuse_ring_queue *q)
  if (!dispatch_error) atomic_store(&session.mt_exited, 1);
  return dispatch_error;
 }
+static int fuse_uring_runtime_service(struct fuse_ring_queue *q)
+{ assert(q == &queue && !pool.runtime_qd); return 0; }
 static void fuse_session_exit(struct fuse_session *se)
 { assert(se == &session); exits++; atomic_store(&se->mt_exited, 1); }
 @PRODUCTION@

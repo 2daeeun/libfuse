@@ -36,4 +36,5 @@ if [ -e "${build_dir}" ] || [ -L "${build_dir}" ]; then
   rm -rf --one-file-system -- "${build_dir}"
 fi
 meson setup "${build_dir}" "$@"
-meson compile -C "${build_dir}" extfuse-passthrough extfuse-bpf
+meson compile -C "${build_dir}" \
+  extfuse-passthrough extfuse-bpf passthrough_ll fuse-uring-ctl

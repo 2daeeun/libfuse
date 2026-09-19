@@ -1,5 +1,10 @@
 fuseconf_path = join_paths(get_option('prefix'), get_option('sysconfdir'), 'fuse.conf')
 
+if host_machine.system().startswith('linux')
+  executable('fuse-uring-ctl', 'fuse-uring-ctl.c',
+             include_directories: include_dirs, install: true)
+endif
+
 executable('fusermount3', ['fusermount.c', '../lib/mount_util.c', '../lib/util.c'],
            include_directories: include_dirs,
            install: true,

@@ -11,6 +11,7 @@
 #include "fuse_config.h"
 #include "fuse_lowlevel.h"
 #include "fuse_kernel.h"
+#include "fuse_adaptive.h"
 
 #ifndef HAVE_URING
 #include "util.h"
@@ -41,6 +42,12 @@ int fuse_uring_commit_sqe(struct fuse_ring_pool *ring_pool,
 int fuse_uring_start(struct fuse_session *se);
 void fuse_uring_wake_ring_threads(struct fuse_session *se);
 int fuse_uring_stop(struct fuse_session *se);
+int fuse_uring_request_qd(struct fuse_session *se, uint32_t depth,
+			  uint64_t *transaction);
+int fuse_uring_runtime_status(struct fuse_session *se,
+			      struct fuse_uring_runtime_status *status,
+			      struct fuse_uring_runtime_queue_status *queues,
+			      size_t capacity);
 int send_reply_uring(fuse_req_t req, int error, const void *arg,
 		     size_t argsize);
 
@@ -53,6 +60,22 @@ int fuse_reply_data_uring_with_prepare(fuse_req_t req, struct fuse_bufvec *bufv,
 int fuse_send_msg_uring(fuse_req_t req, struct iovec *iov, int count);
 
 #else // HAVE_URING
+
+static inline int fuse_uring_request_qd(struct fuse_session *se FUSE_VAR_UNUSED,
+				      uint32_t depth FUSE_VAR_UNUSED,
+				      uint64_t *transaction FUSE_VAR_UNUSED)
+{
+	return -ENOTSUP;
+}
+
+static inline int fuse_uring_runtime_status(
+	struct fuse_session *se FUSE_VAR_UNUSED,
+	struct fuse_uring_runtime_status *status FUSE_VAR_UNUSED,
+	struct fuse_uring_runtime_queue_status *queues FUSE_VAR_UNUSED,
+	size_t capacity FUSE_VAR_UNUSED)
+{
+	return -ENOTSUP;
+}
 
 static inline int fuse_uring_start(struct fuse_session *se FUSE_VAR_UNUSED)
 {

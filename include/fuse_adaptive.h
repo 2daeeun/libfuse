@@ -73,7 +73,9 @@ struct fuse_workload_result {
 /* profile: 0..3, operation: 0=read/1=write; UINT32_MAX when undetermined.
  * files/requesters: 0, 1, or 2 (two or more); not exact cardinalities.
  * min_size/max_size measure requested iter bytes, not completed bytes.
- * stable is detection readiness; policy_configured remains zero for now.
+ * stable is legacy detector readiness; policy_configured reports whether an
+ * explicit host/case policy was selected. Mixed policy readiness is reported
+ * separately by the control socket's policy_stable field.
  */
 
 /** Enqueue a session-wide depth change; negative errno on failure/busy.
@@ -90,6 +92,8 @@ int fuse_session_workload_get(struct fuse_session *se,
 			      struct fuse_workload_result *result);
 /** Replace detector settings asynchronously and reset persistence immediately.
  * A zero return means accepted; workload_get reports later kernel errors.
+ * With a policy file selected, only identical settings are accepted (reset);
+ * attempts to override file settings return -EPERM.
  */
 int fuse_session_workload_configure(
 	struct fuse_session *se, const struct fuse_workload_settings *settings);

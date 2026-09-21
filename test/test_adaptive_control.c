@@ -15,6 +15,7 @@ static int mock_ioctl(int fd, unsigned long request, ...);
 #undef ioctl
 
 static atomic_uint startup_logs;
+static atomic_uint policy_startup_logs;
 
 void fuse_log(enum fuse_log_level level, const char *fmt, ...)
 {
@@ -25,6 +26,15 @@ void fuse_log(enum fuse_log_level level, const char *fmt, ...)
 	vsnprintf(text, sizeof(text), fmt, ap);
 	va_end(ap);
 	assert(level == FUSE_LOG_INFO);
+	if (!strncmp(text, "FUSE_QD_POLICY ", 15))
+		return;
+	if (strstr(text, "policy=thinkpad-c6")) {
+		assert(!strcmp(
+			"FUSE_ADAPTIVE mode=on runtime_qd=1 workload_monitor=1 initial_depth=32 max_depth=64 policy=thinkpad-c6\n",
+			text));
+		atomic_fetch_add(&policy_startup_logs, 1);
+		return;
+	}
 	assert(!strcmp(
 		"FUSE_ADAPTIVE mode=on runtime_qd=1 workload_monitor=1 initial_depth=2 max_depth=64 policy=POLICY_NOT_CONFIGURED\n",
 		text));
@@ -33,12 +43,12 @@ void fuse_log(enum fuse_log_level level, const char *fmt, ...)
 
 static struct {
 	pthread_mutex_t lock;
-	unsigned int config_calls, snapshot_calls, config_eagain;
-	int snapshot_errno, config_errno;
+	unsigned int config_calls, snapshot_calls, detail_calls, config_eagain;
+	int snapshot_errno, config_errno, status_error, status_errno;
 	uint64_t generation, window, end_ns, thresholds[3];
 	uint64_t transaction;
 	unsigned int requests, depth, target;
-	bool busy;
+	bool busy, detail_mode;
 } backend = { .lock = PTHREAD_MUTEX_INITIALIZER, .depth = 2, .target = 2 };
 
 static int mock_ioctl(int fd, unsigned long request, ...)
@@ -56,7 +66,8 @@ static int mock_ioctl(int fd, unsigned long request, ...)
 		struct fuse_workload_config *config = arg;
 
 		assert(config->version == FUSE_WORKLOAD_VERSION);
-		assert(config->flags == FUSE_WORKLOAD_ENABLE);
+		assert(config->flags == (FUSE_WORKLOAD_ENABLE |
+			(backend.detail_mode ? FUSE_WORKLOAD_DETAIL : 0)));
 		backend.config_calls++;
 		if (backend.config_eagain) {
 			backend.config_eagain--;
@@ -75,8 +86,11 @@ static int mock_ioctl(int fd, unsigned long request, ...)
 		struct fuse_workload_op_stats *op;
 		unsigned int bucket = 0;
 
-		assert(request == FUSE_DEV_IOC_MONITOR_SNAPSHOT);
+		assert(request == (backend.detail_mode ?
+			FUSE_DEV_IOC_MONITOR_DETAIL : FUSE_DEV_IOC_MONITOR_SNAPSHOT));
 		backend.snapshot_calls++;
+		if (backend.detail_mode)
+			backend.detail_calls++;
 		error = backend.snapshot_errno;
 		if (!error) {
 			*snapshot = (struct fuse_workload_snapshot) {
@@ -87,15 +101,35 @@ static int mock_ioctl(int fd, unsigned long request, ...)
 				.end_ns = backend.end_ns + UINT64_C(10000000),
 			};
 			backend.end_ns = snapshot->end_ns;
-			while (bucket < 3 && 16384 >= backend.thresholds[bucket])
-				bucket++;
-			op = &snapshot->op[1];
-			op->count[bucket] = 16;
-			op->bytes[bucket] = 16 * 16384;
-			op->min_size = op->max_size = 16384;
-			op->seq_pairs = 16;
-			op->files = 1;
-			op->requesters = 2;
+			if (backend.detail_mode) {
+				struct fuse_workload_detail *detail = arg;
+
+				/* One sequential stream alternates 1 MiB reads and
+				 * writes: union topology is 1T/1F, legacy is MIXED.
+				 */
+				detail->files = detail->requesters = 1;
+				detail->seq_pairs = detail->seq_contiguous = 31;
+				for (unsigned int rw = 0; rw < 2; rw++) {
+					op = &snapshot->op[rw];
+					op->count[3] = 16;
+					op->bytes[3] = 16 * UINT64_C(1048576);
+					op->min_size = op->max_size = 1048576;
+					/* Per-operation offsets skip the other op. */
+					op->seq_pairs = 15;
+					op->files = op->requesters = 1;
+				}
+			} else {
+				while (bucket < 3 &&
+				       backend.thresholds[bucket] <= 16384)
+					bucket++;
+				op = &snapshot->op[1];
+				op->count[bucket] = 16;
+				op->bytes[bucket] = 16 * 16384;
+				op->min_size = op->max_size = 16384;
+				op->seq_pairs = 16;
+				op->files = 1;
+				op->requesters = 2;
+			}
 		}
 	}
 	pthread_mutex_unlock(&backend.lock);
@@ -135,9 +169,15 @@ int fuse_uring_runtime_status(struct fuse_session *se,
 	if (capacity && capacity < 2)
 		return -ENOSPC;
 	pthread_mutex_lock(&backend.lock);
+	if (backend.status_errno) {
+		int rc = -backend.status_errno;
+
+		pthread_mutex_unlock(&backend.lock);
+		return rc;
+	}
 	*status = (struct fuse_uring_runtime_status) {
 		.transaction = backend.transaction, .max_depth = 64,
-		.nr_queues = 2, .busy = backend.busy,
+		.nr_queues = 2, .busy = backend.busy, .error = backend.status_error,
 	};
 	if (capacity) {
 		for (unsigned int i = 0; i < 2; i++)
@@ -509,7 +549,186 @@ static void test_path_ownership(char *path)
 	pthread_mutex_destroy(&se.uring.runtime_lock);
 }
 
-int main(void)
+/* Exercise automatic submission through the production controller and QD API
+ * backend, using synthetic monotonic observation windows instead of sleeping.
+ */
+static void test_policy_controller(const char *policy_file)
+{
+	struct fuse_session se;
+	struct fuse_adaptive a = { 0 };
+	struct fuse_workload_detail detail = { 0 };
+	struct fuse_workload_snapshot *s = &detail.snapshot;
+	struct fuse_qd_policy_config *config = calloc(1, sizeof(*config));
+	unsigned int baseline;
+
+	assert(config && !fuse_qd_policy_load(policy_file, config));
+	init_session(&se, NULL);
+	se.uring.policy_name = (char *)"dell-c2";
+	se.uring.policy_config = config;
+	se.uring.adaptive = &a;
+	a.se = &se;
+	a.settings = config->settings;
+	a.configured = true;
+	assert(!pthread_mutex_init(&a.lock, NULL));
+	adaptive_reset_policy(&a);
+	backend.busy = false;
+	backend.status_error = 0;
+	backend.depth = backend.target = 2;
+	baseline = backend.requests;
+	s->version = FUSE_WORKLOAD_VERSION;
+	s->generation = 1;
+	detail.files = detail.requesters = 32;
+	detail.seq_pairs = detail.seq_contiguous = 68;
+	for (unsigned int phase = 0; phase < 2; phase++) {
+		struct fuse_workload_op_stats *op;
+
+		memset(s->op, 0, sizeof(s->op));
+		op = &s->op[phase ? 0 : 1];
+		op->count[2] = 100;
+		op->bytes[2] = 100 * UINT64_C(131072);
+		op->min_size = op->max_size = 131072;
+		op->seq_pairs = op->seq_contiguous = 68;
+		op->files = op->requesters = 2;
+		for (unsigned int i = 0; i <= 10; i++) {
+			s->window_id++;
+			s->start_ns = s->end_ns;
+			s->end_ns += UINT64_C(1000000000);
+			assert(!fuse_qd_policy_update(&a.policy, &detail,
+						      &a.policy_result));
+			if (i == 10) {
+				assert(a.policy_result.stable);
+				backend.status_errno = ENOTSUP;
+				adaptive_apply_policy(&a); /* Pool creation pending. */
+				assert(!a.policy_error);
+				backend.status_errno = EAGAIN;
+				adaptive_apply_policy(&a); /* Queue readiness pending. */
+				assert(!a.policy_error);
+				assert(backend.requests == baseline + phase);
+				backend.status_errno = 0;
+				a.dirty = true;
+				adaptive_apply_policy(&a);
+				assert(backend.requests == baseline + phase);
+				a.dirty = false;
+			}
+			adaptive_apply_policy(&a);
+			assert(backend.requests == baseline + phase + (i == 10));
+		}
+		assert(backend.target == (phase ? 2 : 32));
+		adaptive_apply_policy(&a); /* Busy: do not enqueue again. */
+		assert(backend.requests == baseline + phase + 1);
+		backend.busy = false;
+		if (!phase) {
+			backend.depth = backend.target;
+			adaptive_apply_policy(&a); /* All queues already match. */
+			assert(backend.requests == baseline + 1);
+		}
+	}
+	backend.status_error = -ENOMEM;
+	adaptive_apply_policy(&a);
+	assert(a.policy_error == -ENOMEM);
+	adaptive_apply_policy(&a);
+	assert(backend.requests == baseline + 2); /* No failing retry loop. */
+	adaptive_reset_policy(&a);
+	assert(!a.policy_result.stable && !a.policy_error);
+	adaptive_apply_policy(&a);
+	assert(backend.requests == baseline + 2);
+	se.uring.adaptive = NULL;
+	a.policy_result.stable = 1;
+	adaptive_apply_policy(&a); /* Concurrent detach/stop wins. */
+	assert(backend.requests == baseline + 2);
+	pthread_mutex_destroy(&a.lock);
+	pthread_mutex_destroy(&se.uring.runtime_lock);
+	free(config);
+}
+
+/* Run the production collector thread, policy matcher, controller and socket
+ * together. Only telemetry and QD execution are mocked; no mount is created.
+ */
+static void test_policy_monitor(char *path, const char *policy_file)
+{
+	struct fuse_adaptive_control_request req = {
+		.version = FUSE_ADAPTIVE_CONTROL_VERSION,
+		.operation = FUSE_ADAPTIVE_WORKLOAD,
+	};
+	struct fuse_qd_policy_config *config = calloc(1, sizeof(*config));
+	struct fuse_workload_result result;
+	struct fuse_session se;
+	unsigned int baseline, completed_snapshots;
+	uint64_t deadline;
+	char reply[4096];
+	bool stable = false, sampled = false;
+
+	assert(config && !fuse_qd_policy_load(policy_file, config));
+	/* Shorten only this in-memory fixture; retain the file's mixed rule. */
+	config->settings.window_ms = 10;
+	config->settings.stable_ms = 30;
+	init_session(&se, path);
+	se.uring.q_depth = 32;
+	se.uring.policy_name = (char *)"thinkpad-c6";
+	se.uring.policy_config = config;
+	pthread_mutex_lock(&backend.lock);
+	backend.busy = false;
+	backend.status_error = 0;
+	backend.depth = backend.target = 32;
+	backend.detail_mode = true;
+	baseline = backend.requests;
+	pthread_mutex_unlock(&backend.lock);
+	assert(!fuse_adaptive_start(&se));
+	/* The policy file owns settings; APIs may reset but cannot override them. */
+	req.settings = config->settings;
+	req.settings.window_ms++;
+	assert(fuse_session_workload_configure(&se, &req.settings) == -EPERM);
+	assert(!fuse_session_workload_configure(&se, &config->settings));
+	deadline = adaptive_now() + UINT64_C(2000000000);
+	while (adaptive_now() < deadline) {
+		exchange(path, &req, sizeof(req), reply);
+		has_error(reply, 0);
+		if (strstr(reply, "\"policy_stable\":1")) {
+			stable = true;
+			break;
+		}
+		usleep(1000);
+	}
+	assert(stable);
+	assert(strstr(reply, "\"policy\":\"thinkpad-c6\""));
+	assert(strstr(reply, "\"policy_rule\":\"seqrw50-1m-1t-1f\""));
+	assert(strstr(reply, "\"policy_target_depth\":2"));
+	assert(strstr(reply, "\"policy_error\":0"));
+	assert(strstr(reply, "\"workload\":\"MIXED\""));
+	assert(strstr(reply, "\"stable\":0"));
+	assert(!fuse_session_workload_get(&se, &result));
+	assert(result.workload == FUSE_WORKLOAD_MIXED && !result.stable);
+	assert(result.policy_configured);
+	assert(atomic_load(&policy_startup_logs) == 1);
+	pthread_mutex_lock(&backend.lock);
+	assert(backend.detail_calls >= 4);
+	assert(backend.requests == baseline + 1);
+	assert(backend.busy && backend.target == 2);
+	backend.depth = backend.target;
+	backend.busy = false;
+	completed_snapshots = backend.detail_calls;
+	pthread_mutex_unlock(&backend.lock);
+	deadline = adaptive_now() + UINT64_C(2000000000);
+	while (adaptive_now() < deadline) {
+		pthread_mutex_lock(&backend.lock);
+		sampled = backend.detail_calls > completed_snapshots;
+		assert(backend.requests == baseline + 1);
+		pthread_mutex_unlock(&backend.lock);
+		if (sampled)
+			break;
+		usleep(1000);
+	}
+	assert(sampled);
+	fuse_adaptive_stop(&se);
+	pthread_mutex_lock(&backend.lock);
+	assert(backend.requests == baseline + 1);
+	backend.detail_mode = false;
+	pthread_mutex_unlock(&backend.lock);
+	pthread_mutex_destroy(&se.uring.runtime_lock);
+	free(config);
+}
+
+int main(int argc, char **argv)
 {
 	char directory[] = "/tmp/fuse-adaptive-control.XXXXXX";
 	char path[128];
@@ -519,6 +738,9 @@ int main(void)
 	test_disabled_and_failed_start();
 	test_protocol_and_monitor(path);
 	test_path_ownership(path);
+	assert(argc == 2);
+	test_policy_controller(argv[1]);
+	test_policy_monitor(path, argv[1]);
 	assert(rmdir(directory) == 0);
 	puts("adaptive monitor and control socket: PASS (mock kernel/QD backend)");
 	return 0;

@@ -5,6 +5,7 @@
 #include "fuse_adaptive_protocol.h"
 #include "fuse_uring_i.h"
 #include "fuse_workload.h"
+#include "fuse_qd_policy.h"
 
 #include <errno.h>
 #ifdef __linux__
@@ -34,7 +35,111 @@ struct fuse_adaptive {
 	struct fuse_workload_settings settings;
 	struct fuse_workload_detector detector;
 	struct fuse_workload_result result;
+	struct fuse_qd_policy policy;
+	struct fuse_qd_policy_result policy_result;
+	uint64_t policy_candidate, policy_transaction;
+	int policy_error;
 };
+
+static const char *adaptive_policy_name(struct fuse_adaptive *a)
+{
+	return a->se->uring.policy_name ?
+		a->se->uring.policy_name : "POLICY_NOT_CONFIGURED";
+}
+
+static void adaptive_reset_policy(struct fuse_adaptive *a)
+{
+	memset(&a->policy_result, 0, sizeof(a->policy_result));
+	a->policy_candidate = a->policy_transaction = 0;
+	a->policy_error = 0;
+	if (a->se->uring.policy_config)
+		fuse_qd_policy_init(&a->policy, a->se->uring.policy_config,
+				    a->se->uring.policy_name, a->settings.window_ms);
+}
+
+/* Existing lock order is runtime_lock -> monitor lock -> QD backend lock.
+ * Do not call the public wrapper with the monitor lock held. The generation
+ * and dirty checks below serialize application with detector reconfiguration.
+ */
+static void adaptive_apply_policy(struct fuse_adaptive *a)
+{
+#ifdef HAVE_URING
+	static const char applied_log[] =
+		"FUSE_QD_POLICY profile=%s rule=%s target_depth=%u transaction=%" PRIu64 "\n";
+	struct fuse_session *se = a->se;
+	struct fuse_uring_runtime_status status = { 0 };
+	struct fuse_uring_runtime_queue_status *queues = NULL;
+	uint64_t transaction = 0;
+	uint32_t target = 0;
+	const char *rule = NULL;
+	bool equal = true;
+	int count, rc;
+
+	pthread_mutex_lock(&se->uring.runtime_lock);
+	if (se->uring.adaptive != a)
+		goto unlock_runtime;
+	pthread_mutex_lock(&a->lock);
+	if (a->policy_candidate != a->policy.candidate_since) {
+		a->policy_candidate = a->policy.candidate_since;
+		a->policy_error = 0;
+		a->policy_transaction = 0;
+	}
+	if (!se->uring.policy_config || !a->configured || a->dirty || a->error ||
+	    !a->policy_result.stable || a->policy_error)
+		goto unlock;
+	target = a->policy_result.target_depth;
+	count = fuse_uring_runtime_status(se, &status, NULL, 0);
+	/* ENOTSUP also means that the runtime pool has not been created yet. */
+	if (count == -EAGAIN || count == -ENOTSUP || status.busy)
+		goto unlock;
+	if (count <= 0) {
+		a->policy_error = count ? count : -EIO;
+		goto unlock;
+	}
+	if (a->policy_transaction && status.transaction == a->policy_transaction &&
+	    status.error) {
+		a->policy_error = status.error;
+		goto unlock;
+	}
+	queues = calloc((size_t)count, sizeof(*queues));
+	if (!queues) {
+		a->policy_error = -ENOMEM;
+		goto unlock;
+	}
+	rc = fuse_uring_runtime_status(se, &status, queues, (size_t)count);
+	if (rc == -EAGAIN || rc == -ENOTSUP)
+		goto unlock;
+	if (rc < 0) {
+		a->policy_error = rc;
+		goto unlock;
+	}
+	if (status.busy)
+		goto unlock;
+	for (int i = 0; i < rc; i++)
+		if (queues[i].current_depth != target || queues[i].error ||
+		    queues[i].reclaim_bytes)
+			equal = false;
+	if (equal)
+		goto unlock;
+	rc = fuse_uring_request_qd(se, target, &transaction);
+	if (!rc) {
+		a->policy_transaction = transaction;
+		rule = a->policy_result.rule_name;
+	} else if (rc != -EBUSY && rc != -EAGAIN) {
+		a->policy_error = rc;
+	}
+unlock:
+	free(queues);
+	pthread_mutex_unlock(&a->lock);
+unlock_runtime:
+	pthread_mutex_unlock(&se->uring.runtime_lock);
+	if (rule)
+		fuse_log(FUSE_LOG_INFO, applied_log,
+			 adaptive_policy_name(a), rule, target, transaction);
+#else
+	(void)a;
+#endif
+}
 
 static uint64_t adaptive_now(void)
 {
@@ -119,6 +224,11 @@ int fuse_session_workload_configure(
 	a = se->uring.adaptive;
 	if (!a) {
 		rc = -EOPNOTSUPP;
+	} else if (se->uring.policy_config &&
+		   memcmp(settings, &se->uring.policy_config->settings,
+			  sizeof(*settings))) {
+		/* File-selected settings can only be reset, not overridden. */
+		rc = -EPERM;
 	} else {
 		uint64_t one = 1;
 
@@ -131,6 +241,7 @@ int fuse_session_workload_configure(
 		a->result.workload = FUSE_WORKLOAD_UNKNOWN;
 		a->result.profile = UINT32_MAX;
 		a->result.operation = UINT32_MAX;
+		adaptive_reset_policy(a);
 		pthread_mutex_unlock(&a->lock);
 		(void)write(a->configfd, &one, sizeof(one));
 	}
@@ -138,7 +249,7 @@ int fuse_session_workload_configure(
 	return rc;
 }
 
-static void write_workload(FILE *out, struct fuse_session *se)
+static void write_workload(FILE *out, struct fuse_adaptive *a)
 {
 	static const char *const names[] = {
 		"RR_1T_1F", "RR_NT_1F", "RW_1T_1F", "RW_NT_1F",
@@ -146,7 +257,17 @@ static void write_workload(FILE *out, struct fuse_session *se)
 		"UNKNOWN",  "MIXED",	"IDLE",
 	};
 	struct fuse_workload_result r;
-	int rc = fuse_session_workload_get(se, &r);
+	struct fuse_qd_policy_result p;
+	uint64_t transaction;
+	int rc, policy_error;
+
+	pthread_mutex_lock(&a->lock);
+	r = a->result;
+	p = a->policy_result;
+	rc = a->error;
+	policy_error = a->policy_error;
+	transaction = a->policy_transaction;
+	pthread_mutex_unlock(&a->lock);
 
 	if (rc) {
 		fprintf(out, "{\"error\":%d}\n", rc);
@@ -154,7 +275,8 @@ static void write_workload(FILE *out, struct fuse_session *se)
 	}
 	fputs("{\"error\":0,\"source\":\"fuse_iter_requested\",", out);
 	fprintf(out,
-		"\"policy\":\"POLICY_NOT_CONFIGURED\",\"workload\":\"%s\",",
+		"\"policy\":\"%s\",\"workload\":\"%s\",",
+		adaptive_policy_name(a),
 		r.workload <= FUSE_WORKLOAD_IDLE ? names[r.workload] :
 						   "UNKNOWN");
 	fprintf(out,
@@ -170,6 +292,14 @@ static void write_workload(FILE *out, struct fuse_session *se)
 		"\"operation\":%u,\"dominant_percent\":%u,\"sequential_percent\":%u,",
 		r.operation, r.dominant_percent, r.sequential_percent);
 	fprintf(out, "\"timestamp_ns\":%" PRIu64 ",", r.timestamp_ns);
+	fprintf(out, "\"policy_rule\":\"%s\",\"policy_target_depth\":%u,",
+		p.rule_name ? p.rule_name : "NONE", p.target_depth);
+	fprintf(out, "\"policy_stable_ns\":%" PRIu64 ",\"policy_stable\":%u,",
+		p.stable_ns, p.stable);
+	fprintf(out, "\"policy_files\":%u,\"policy_requesters\":%u,\"policy_read_percent\":%u,",
+		p.files, p.requesters, p.read_percent);
+	fprintf(out, "\"policy_error\":%d,\"policy_transaction\":%" PRIu64 ",",
+		policy_error, transaction);
 	fprintf(out, "\"generation\":%" PRIu64 "}\n", r.generation);
 }
 
@@ -250,7 +380,7 @@ static void serve_client(struct fuse_adaptive *a)
 			write_status(out, a->se);
 			break;
 		case FUSE_ADAPTIVE_WORKLOAD:
-			write_workload(out, a->se);
+			write_workload(out, a);
 			break;
 		case FUSE_ADAPTIVE_SET_DEPTH:
 			rc = fuse_session_uring_set_depth(a->se, req.depth,
@@ -320,6 +450,7 @@ static void *adaptive_monitor(void *opaque)
 			now >= next ? 0 : (next - now + 999999) / 1000000;
 		int timeout = wait_ms > INT_MAX ? INT_MAX : (int)wait_ms;
 		bool announce = false;
+		bool observed = false;
 
 		rc = poll(fds, 3, timeout);
 		if (rc < 0 && errno == EINTR)
@@ -338,6 +469,8 @@ static void *adaptive_monitor(void *opaque)
 				.version = FUSE_WORKLOAD_VERSION,
 				.flags = FUSE_WORKLOAD_ENABLE,
 			};
+			if (a->se->uring.policy_config)
+				config.flags |= FUSE_WORKLOAD_DETAIL;
 			memcpy(config.thresholds, a->settings.thresholds,
 			       sizeof(config.thresholds));
 			a->error = ioctl(a->se->fd, FUSE_DEV_IOC_MONITOR_CONFIG,
@@ -350,6 +483,7 @@ static void *adaptive_monitor(void *opaque)
 				announced = true;
 			}
 			fuse_workload_detector_init(&a->detector, &a->settings);
+			adaptive_reset_policy(a);
 			/* INIT publication may lag the reply that started this thread. */
 			a->dirty = a->error == -EAGAIN;
 			next = adaptive_now() +
@@ -359,8 +493,8 @@ static void *adaptive_monitor(void *opaque)
 		}
 		now = adaptive_now();
 		if (!a->dirty && now >= next) {
-			struct fuse_workload_snapshot snapshot = {
-				.version = FUSE_WORKLOAD_VERSION
+			struct fuse_workload_detail detail = {
+				.snapshot.version = FUSE_WORKLOAD_VERSION
 			};
 
 			/* Failed CONFIG must not classify an older kernel bucket table. */
@@ -370,21 +504,33 @@ static void *adaptive_monitor(void *opaque)
 				pthread_mutex_unlock(&a->lock);
 				continue;
 			}
-			rc = ioctl(a->se->fd, FUSE_DEV_IOC_MONITOR_SNAPSHOT,
-				   &snapshot);
+			rc = ioctl(a->se->fd, a->se->uring.policy_config ?
+				   FUSE_DEV_IOC_MONITOR_DETAIL : FUSE_DEV_IOC_MONITOR_SNAPSHOT,
+				   &detail);
 			a->error = rc < 0 ? -errno : 0;
 			rc = fuse_workload_detector_update(
-				&a->detector, rc < 0 ? NULL : &snapshot,
+				&a->detector, rc < 0 ? NULL : &detail.snapshot,
 				&a->result);
 			if (!a->error)
 				a->error = rc;
+			if (a->se->uring.policy_config) {
+				rc = fuse_qd_policy_update(&a->policy,
+					a->error ? NULL : &detail, &a->policy_result);
+				if (!a->error)
+					a->error = rc;
+			}
+			a->result.policy_configured = !!a->se->uring.policy_config;
+			observed = true;
 			next = now + (uint64_t)a->settings.window_ms * 1000000;
 		}
 		pthread_mutex_unlock(&a->lock);
 		if (announce)
 			fuse_log(FUSE_LOG_INFO,
-				 "FUSE_ADAPTIVE mode=on runtime_qd=1 workload_monitor=1 initial_depth=%u max_depth=%u policy=POLICY_NOT_CONFIGURED\n",
-				 a->se->uring.q_depth, a->se->uring.max_depth);
+				 "FUSE_ADAPTIVE mode=on runtime_qd=1 workload_monitor=1 initial_depth=%u max_depth=%u policy=%s\n",
+				 a->se->uring.q_depth, a->se->uring.max_depth,
+				 adaptive_policy_name(a));
+		if (observed && a->se->uring.policy_config)
+			adaptive_apply_policy(a);
 	}
 	return NULL;
 }
@@ -427,7 +573,10 @@ int fuse_adaptive_start(struct fuse_session *se)
 		goto fail;
 	}
 	fuse_workload_defaults(&a->settings);
+	if (se->uring.policy_config)
+		a->settings = se->uring.policy_config->settings;
 	fuse_workload_detector_init(&a->detector, &a->settings);
+	adaptive_reset_policy(a);
 	a->result.workload = FUSE_WORKLOAD_UNKNOWN;
 	a->result.profile = UINT32_MAX;
 	a->result.operation = UINT32_MAX;

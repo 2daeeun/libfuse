@@ -145,7 +145,42 @@ static void disabled_apis(const char *options)
 	fuse_session_destroy(se);
 }
 
-int main(void)
+static void policy_options(const char *path)
+{
+	char options[4096];
+	struct fuse_session *se;
+	static const char *const profiles[] = {
+		"dell-c2", "thinkpad-c2", "dell-c6", "thinkpad-c6"
+	};
+
+	for (size_t i = 0; i < sizeof(profiles) / sizeof(*profiles); i++) {
+		snprintf(options, sizeof(options),
+			 "io_uring,io_uring_adaptive=on,io_uring_q_depth_max=512,io_uring_policy=%s,io_uring_policy_file=%s",
+			 profiles[i], path);
+		se = session(options, NULL);
+		assert(se);
+		fuse_session_destroy(se);
+	}
+	snprintf(options, sizeof(options),
+		 "io_uring,io_uring_adaptive=on,io_uring_policy=thinkpad-c2,io_uring_policy_file=%s",
+		 path);
+	assert(!session(options, NULL)); /* Default capacity 64 cannot reach 512. */
+	snprintf(options, sizeof(options),
+		 "io_uring,io_uring_adaptive=on,io_uring_policy=missing,io_uring_policy_file=%s",
+		 path);
+	assert(!session(options, NULL));
+	assert(!session("io_uring,io_uring_policy=dell-c2", NULL));
+	assert(!session("io_uring,io_uring_adaptive=on,io_uring_policy=dell-c2", NULL));
+	snprintf(options, sizeof(options),
+		 "io_uring,io_uring_adaptive=on,io_uring_policy=%s,io_uring_policy_file=%s",
+		 "dell-c2", "relative.conf");
+	assert(!session(options, NULL));
+	se = session("io_uring,io_uring_policy=none", NULL);
+	assert(se);
+	fuse_session_destroy(se);
+}
+
+int main(int argc, char **argv)
 {
 	static const char * const enabled[] = {
 		"io_uring,io_uring_adaptive",
@@ -188,6 +223,8 @@ int main(void)
 		for (size_t j = 0; j < sizeof(caps) / sizeof(*caps); j++)
 			init_session(enabled[i], caps[j], true);
 	fuse_set_log_func(NULL);
+	assert(argc == 2);
+	policy_options(argv[1]);
 	puts("PASS adaptive ON/OFF options, INIT, startup log and disabled APIs");
 	return 0;
 }

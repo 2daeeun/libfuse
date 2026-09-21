@@ -20,6 +20,7 @@
 #include "util.h"
 #include "fuse_uring_i.h"
 #include "fuse_adaptive_i.h"
+#include "fuse_qd_policy.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -4439,6 +4440,8 @@ static const struct fuse_opt fuse_ll_opts[] = {
 	LL_OPTION("io_uring_adaptive", uring.runtime_qd, 1),
 	LL_OPTION("io_uring_adaptive=on", uring.runtime_qd, 1),
 	LL_OPTION("io_uring_adaptive=off", uring.runtime_qd, 0),
+	LL_OPTION("io_uring_policy=%s", uring.policy_name, 0),
+	LL_OPTION("io_uring_policy_file=%s", uring.policy_path, 0),
 	LL_OPTION("io_uring_q_depth_max=%u", uring.max_depth, -1),
 	LL_OPTION("io_uring_drain_timeout_ms=%u", uring.drain_timeout_ms, -1),
 	LL_OPTION("io_uring_control=%s", uring.control_path, 0),
@@ -4464,6 +4467,8 @@ void fuse_lowlevel_help(void)
 "    -o io_uring_q_depth=<n> io-uring queue depth\n"
 "    -o io_uring_adaptive=on|off runtime QD and monitor (default off)\n"
 "    -o io_uring_adaptive   alias for io_uring_adaptive=on\n"
+"    -o io_uring_policy=<name> profile in policy file (default none)\n"
+"    -o io_uring_policy_file=<path> absolute policy file, read once at startup\n"
 "    -o io_uring_q_depth_max=<n> runtime capacity (default 64)\n"
 "    -o io_uring_drain_timeout_ms=<n> drain timeout (default 5000)\n"
 "    -o io_uring_control=<path> owner-only local control socket\n"
@@ -4493,6 +4498,9 @@ void fuse_session_destroy(struct fuse_session *se)
 		free(se->io);
 	destroy_mount_opts(se->mo);
 	free(se->uring.control_path);
+	free(se->uring.policy_name);
+	free(se->uring.policy_path);
+	free(se->uring.policy_config);
 	pthread_mutex_destroy(&se->uring.runtime_lock);
 	free(se);
 }
@@ -4839,6 +4847,32 @@ fuse_session_new_versioned(struct fuse_args *args,
 		fuse_log(FUSE_LOG_ERR, "fuse: invalid adaptive io-uring options\n");
 		goto out2;
 	}
+	if (se->uring.policy_name && !strcmp(se->uring.policy_name, "none")) {
+		free(se->uring.policy_name);
+		se->uring.policy_name = NULL;
+	}
+	if (se->uring.policy_name || se->uring.policy_path) {
+		uint32_t required;
+
+		if (!se->uring.runtime_qd || !se->uring.policy_name ||
+		    !se->uring.policy_path || se->uring.policy_path[0] != '/') {
+			fuse_log(FUSE_LOG_ERR,
+				 "fuse: QD policy requires adaptive ON, a profile and an absolute policy file\n");
+			goto out2;
+		}
+		se->uring.policy_config = calloc(1, sizeof(*se->uring.policy_config));
+		if (!se->uring.policy_config)
+			goto out2;
+		err = fuse_qd_policy_load(se->uring.policy_path, se->uring.policy_config);
+		required = fuse_qd_policy_max_depth(se->uring.policy_config,
+						  se->uring.policy_name);
+		if (err || !required || required > se->uring.max_depth) {
+			fuse_log(FUSE_LOG_ERR,
+				 "fuse: invalid QD policy file/profile or insufficient max depth (error=%d required=%u max=%u)\n",
+				 err, required, se->uring.max_depth);
+			goto out2;
+		}
+	}
 	if(se->deny_others) {
 		/* Allowing access only by root is done by instructing
 		 * kernel to allow access by everyone, and then restricting
@@ -4910,6 +4944,9 @@ out3:
 		destroy_mount_opts(mo);
 out2:
 	free(se->uring.control_path);
+	free(se->uring.policy_name);
+	free(se->uring.policy_path);
+	free(se->uring.policy_config);
 	pthread_mutex_destroy(&se->uring.runtime_lock);
 	free(se);
 out1:

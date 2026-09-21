@@ -69,6 +69,9 @@ struct fuse_session_uring {
 	bool enable;
 	unsigned int q_depth;
 	int runtime_qd; /* fuse_opt flag destinations are int-sized. */
+	char *policy_name;
+	char *policy_path;
+	struct fuse_qd_policy_config *policy_config;
 	unsigned int max_depth;
 	unsigned int drain_timeout_ms;
 	char *control_path;

@@ -51,9 +51,15 @@ if host_machine.system().startswith('linux')
         ['test_workload_detector.c', '../lib/fuse_workload.c'],
         include_directories: include_dirs, install: false)
     test('adaptive workload detector', workload_test)
+    qd_policy_test = executable('test_qd_policy',
+        ['test_qd_policy.c', '../lib/fuse_qd_policy.c', '../lib/fuse_workload.c'],
+        include_directories: include_dirs, install: false)
+    test('adaptive QD policy', qd_policy_test,
+        args: [files('fixtures/qd-policy.conf')])
     adaptive_init_test = executable('test_adaptive_init', 'test_adaptive_init.c',
         dependencies: [ libfuse_dep ], install: false)
-    test('adaptive options and INIT', adaptive_init_test)
+    test('adaptive options and INIT', adaptive_init_test,
+        args: [files('fixtures/qd-policy.conf')])
     if get_option('utils')
         test('adaptive control CLI', find_program('python3'),
             args: [files('test_adaptive_cli.py'),
@@ -121,11 +127,11 @@ if private_cfg.get('HAVE_URING', false)
     test('io_uring runtime QD engine', uring_runtime_test)
     adaptive_control_test = executable(
         'test_adaptive_control',
-        ['test_adaptive_control.c', '../lib/fuse_workload.c'],
+        ['test_adaptive_control.c', '../lib/fuse_workload.c', '../lib/fuse_qd_policy.c'],
         include_directories: include_dirs,
         dependencies: [thread_dep, libnuma, dependency('liburing')],
         install: false)
     td += adaptive_control_test
     test('adaptive monitor and control socket', adaptive_control_test,
-        timeout: 15)
+        args: [files('fixtures/qd-policy.conf')], timeout: 15)
 endif

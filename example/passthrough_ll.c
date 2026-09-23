@@ -884,6 +884,19 @@ static void lo_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info 
 	fuse_reply_err(req, 0);
 }
 
+static void lo_update_open_flags(struct lo_data *lo, struct fuse_file_info *fi)
+{
+	/* Writeback may read partial pages through a write-only open handle. */
+	if (lo->writeback && (fi->flags & O_ACCMODE) == O_WRONLY) {
+		fi->flags &= ~O_ACCMODE;
+		fi->flags |= O_RDWR;
+	}
+
+	/* The kernel supplies the writeback offset, including for O_APPEND. */
+	if (lo->writeback)
+		fi->flags &= ~O_APPEND;
+}
+
 static void lo_tmpfile(fuse_req_t req, fuse_ino_t parent,
 		      mode_t mode, struct fuse_file_info *fi)
 {
@@ -896,6 +909,7 @@ static void lo_tmpfile(fuse_req_t req, fuse_ino_t parent,
 		fuse_log(FUSE_LOG_DEBUG, "lo_tmpfile(parent=%" PRIu64 ")\n",
 			parent);
 
+	lo_update_open_flags(lo, fi);
 	fd = openat(lo_fd(req, parent), ".",
 		    (fi->flags | O_TMPFILE) & ~O_NOFOLLOW, mode);
 	if (fd == -1)
@@ -931,6 +945,7 @@ static void lo_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		fuse_log(FUSE_LOG_DEBUG, "lo_create(parent=%" PRIu64 ", name=%s)\n",
 			parent, name);
 
+	lo_update_open_flags(lo, fi);
 	fd = openat(lo_fd(req, parent), name,
 		    (fi->flags | O_CREAT) & ~O_NOFOLLOW, mode);
 	if (fd == -1)
@@ -978,21 +993,13 @@ static int lo_do_open(fuse_req_t req, fuse_ino_t ino,
 		fuse_log(FUSE_LOG_DEBUG, "lo_open(ino=%" PRIu64 ", flags=%d)\n",
 			ino, fi->flags);
 
-	/* With writeback cache, kernel may send read requests even
-	   when userspace opened write-only */
-	if (lo->writeback && (fi->flags & O_ACCMODE) == O_WRONLY) {
-		fi->flags &= ~O_ACCMODE;
-		fi->flags |= O_RDWR;
-	}
-
 	/* With writeback cache, O_APPEND is handled by the kernel.
 	   This breaks atomicity (since the file may change in the
 	   underlying filesystem, so that the kernel's idea of the
 	   end of the file isn't accurate anymore). In this example,
 	   we just accept that. A more rigorous filesystem may want
 	   to return an error here */
-	if (lo->writeback && (fi->flags & O_APPEND))
-		fi->flags &= ~O_APPEND;
+	lo_update_open_flags(lo, fi);
 
 	sprintf(buf, "/proc/self/fd/%i", lo_fd(req, ino));
 	fd = open(buf, fi->flags & ~O_NOFOLLOW);

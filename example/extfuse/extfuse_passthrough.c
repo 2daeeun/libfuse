@@ -4139,6 +4139,7 @@ static void perf_tmpfile(fuse_req_t req, fuse_ino_t parent, mode_t mode,
 	}
 	invalidate_attr(parent);
 	pthread_rwlock_wrlock(&perf_state.namespace_lock);
+	lo_update_open_flags(lo, fi);
 	fd = openat(lo_fd(req, parent), ".",
 		    (fi->flags | O_TMPFILE) & ~O_NOFOLLOW, mode);
 	if (fd < 0) {
@@ -4248,6 +4249,7 @@ void perf_create(fuse_req_t req, fuse_ino_t parent, const char *name,
 		return;
 	}
 	invalidate_entry(parent, name);
+	lo_update_open_flags(lo, fi);
 	fd = openat(lo_fd(req, parent), name,
 		    (fi->flags | O_CREAT) & ~O_NOFOLLOW, mode);
 	if (fd == -1) {

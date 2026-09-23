@@ -367,7 +367,11 @@ int fuse_qd_policy_update(struct fuse_qd_policy *policy,
 	policy->last_end_ns = snapshot->end_ns;
 	result->files = detail->files;
 	result->requesters = detail->requesters;
-	if (!total || total < settings->min_requests || snapshot->flags ||
+	/* Passthrough marks the data path, not an incomplete iter observation.
+	 * Keep every other quality/unknown flag ineligible, as in the classifier.
+	 */
+	if (!total || total < settings->min_requests ||
+	    (snapshot->flags & ~FUSE_WORKLOAD_PASSTHROUGH) ||
 	    detail->seq_pairs < settings->min_pairs ||
 	    duration < window_ns / 2 || duration > window_ns * 2)
 		goto unknown;

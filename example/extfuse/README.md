@@ -1,15 +1,31 @@
 # ExtFUSE passthrough example
 
 This directory contains the modern ExtFUSE passthrough filesystem used by the
-semi-manual `fuse_exp/fig9_mo/hand` request-count experiment. It wraps this
-checkout's `example/passthrough_ll.c`, loads the ExtFUSE BPF program, and keeps
+historical semi-manual `fuse_exp/fig9_mo/hand` request-count experiment. It wraps
+this checkout's `example/passthrough_ll.c`, loads the ExtFUSE BPF program, and keeps
 the daemon, loader, and BPF build artifacts inside the libfuse build tree.
 
 The implementation combines three distinct categories:
 
 - the original ExtFUSE map and handler model;
 - compatibility with the paired modern Linux and libfuse branches;
-- local C0-C4 experiment, coherence, and request-count extensions.
+- local historical C0-C4 experiment, coherence, and request-count extensions.
+
+The historical C0-C4 labels and MDOpt/AllOpt names in older experiment records
+are not the newer `fuse-c0-c17-v1` feature matrix. Here `off`, `hit` and `allopt`
+are daemon API modes: respectively no BPF, BPF metadata handling with daemon
+data I/O, and BPF metadata handling with a selected backing-file route.
+These API names do not define the new case IDs.
+
+Current `fuse_exp/fig6`, `fig9_mo` and `phase-changing` runners use their shared
+`fig6/case_matrix.py` contract and a separately built local `extfuse-matrix`
+adapter. They explicitly select eBPF, native passthrough, writeback cache,
+splice and daemon transport. In particular, C12-C14 native passthrough has no
+BPF program, while C15-C17 combines native passthrough with BPF coherence.
+The adapter's no-BPF native callbacks are outside this example's direct
+`off` mode. The new matrix rejects the historical fixed READ/WRITE,
+paper-write-fast and WBCache-forwarding extensions described below. Build and
+runtime instructions for that matrix belong to the selected `fuse_exp` runner.
 
 It is disabled in ordinary libfuse builds. Configure a dedicated build tree:
 
@@ -32,8 +48,9 @@ The hand runner consumes only these libfuse-tree artifacts:
 No file under `fuse_exp/fig9_mo/runtime/` is a build or runtime input for the
 hand runner.
 
-AllOpt defaults to Linux native FUSE passthrough. It requires passthrough,
-ExtFUSE coherence V2, lazy attribute refresh, and the RELEASE barrier at INIT.
+The example's `allopt` API mode defaults to Linux native FUSE passthrough.
+It requires passthrough, ExtFUSE coherence V2, lazy attribute refresh, and the
+RELEASE barrier at INIT.
 It disables the upper writeback cache and returns native passthrough OPEN
 flags. READ/WRITE and mmap use the kernel's backing-file path; remaining daemon
 requests use the selected classic or io_uring transport. Native BEGIN/END
@@ -59,7 +76,8 @@ It rechecks the range and privileges under the lock. Truncation, extension,
 append, direct/async I/O and privilege changes retain exclusive locking;
 the lower filesystem still controls its write serialization. Each I/O keeps
 its own BPF BEGIN/END, lower operation and attribute completion. This targets
-shared-file RW contention without changing the C3/C4 native data path.
+shared-file RW contention without changing the native data path used by the
+historical C3/C4 configurations.
 `test_native_overwrite.py` and `test_native_mmap_lifetime.py` compile extracted
 production functions into userspace fixtures. They check locking, lifetime,
 stale-token rejection, conservative failure handling and one count per mmap;
@@ -73,24 +91,27 @@ Existing experiment runners that require WBCache forwarding and write streams
 need an explicit WBCache selection or a separate native configuration and
 activation check. Their current results do not describe the native default.
 
-The following experimental options are disabled by default and selected with
-strict Boolean environment values (`0` or `1`):
+The following historical experimental options are disabled by default and use
+strict Boolean environment values (`0` or `1`). Their accepted combinations
+are listed below; the C0-C17 adapter excludes these extensions:
 
 - `EXTFUSE_READ_UPCALL_ONLY=1` is retired and rejected. READ always keeps its
   BPF policy handler; callers may leave the variable unset or set it to `0`.
-- `EXTFUSE_PAPER_WRITE_FAST=1` is valid only for `hit`, `paper-like` C1/C2. It
+- `EXTFUSE_PAPER_WRITE_FAST=1` is valid only for `hit`, `paper-like` mode. It
   removes the per-write capability lock/map churn while the startup proof that
   `security.capability` is absent remains active. A concurrent policy revoke
   switches completion to the locked refill path before the WRITE reply.
-- `EXTFUSE_C2_FIXED_WRITE=1` is valid only for `hit`, `uring`, `paper-like` C2.
+- `EXTFUSE_C2_FIXED_WRITE=1` is valid only for `hit`, `uring`, `paper-like` mode.
+  The environment name retains its historical C2 label.
   It also requires `EXTFUSE_PAPER_WRITE_FAST=1`, the negotiated io_uring buffer
   pool, and a single-issuer queue, and marks opens for WRITE-only fixed I/O.
   This flag leaves READ on the ordinary copied daemon path. A fixed-WRITE
   failure is never replayed through a copied path.
-- `EXTFUSE_FIXED_READ=1` is valid only for `hit`, `uring`, `paper-like` C2.
+- `EXTFUSE_FIXED_READ=1` is valid only for `hit`, `uring`, `paper-like` mode.
   It requires the negotiated buffer pool and a single-issuer queue, independently
-  of the fixed-WRITE flag. Figure 6 enables it explicitly for new C2 RR/SR cells;
-  leaving it unset or `0` preserves the previous copied READ path. The generic
+  of the fixed-WRITE flag. Historical Figure 6 C2 RR/SR cells enabled it
+  explicitly; the new C0-C17 matrix keeps it off. Leaving it unset or `0`
+  preserves the copied READ path. The generic
   fixed-I/O open flag is set only for `O_RDONLY` handles, so writable handles
   retain their existing WRITE policy.
 - `EXTFUSE_WBCACHE_WRITE_STREAM=1` requires `allopt`, `paper-like`, and
@@ -189,11 +210,12 @@ only its empty-path/flags handling. This does not establish a throughput gain
 without repeated measurements. The non-mount `test_read_cache_fd.py` checks
 descriptor identity and error behavior.
 
-Metadata-only (`hit`, C1/C2) mounts serialize generation changes and snapshot
+Metadata-only (`hit`) mounts serialize generation changes and snapshot
 publication with inode-hashed, cache-line-separated locks, not the backing
 registry lock. Multi-inode mutations acquire distinct stripes in sorted order;
 entry-map invalidation still serializes with entry publication and takes the
-same inode stripe as READ/WRITE. AllOpt retains its backing/coherence locking.
+same inode stripe as READ/WRITE. The `allopt` API mode retains its backing and
+coherence locking.
 For overlapping metadata-only I/O, a successfully published active map token
 can cover several active guards. Userspace tracks guards and their sequences;
 cohort reference counts separately track the requests sharing each guard.
@@ -208,17 +230,17 @@ startup. Where the allowed CPUs on the queue's NUMA node admit a distinct-core
 rotation, it avoids pinning workers to the request CPUs' SMT siblings without
 mapping multiple queues onto one CPU. Single-CPU masks, unavailable topology,
 and masks without a suitable rotation retain the previous placement policy.
-This affects C2/C4 daemon transport. Neither native nor WBCache-forwarded data
+This affects io_uring daemon transport. Neither native nor WBCache-forwarded data
 I/O traverses the daemon ring: enabling that ring
-alone does not guarantee C4 >= C3, or a strict ordering in all workloads.
+alone does not establish a performance ordering between transport configurations.
 
 `python3 -B example/extfuse/test_cache_contract.py` checks state/placement
 models and source contracts (including 32/64/128 workers). The compiled
 `io_uring thread affinity` test checks the actual C placement helper; source
 checks alone do not establish runtime fallback counts or throughput.
 
-All C0-C4 negotiate `SYNCFS_SUPPORT`; metadata-hit C1-C4 additionally negotiate
-`EXTFUSE_SYNCFS_PURE` (C0 keeps ExtFUSE disabled). The daemon
+All modes negotiate `SYNCFS_SUPPORT`; modes with ExtFUSE enabled additionally
+negotiate `EXTFUSE_SYNCFS_PURE` (`off` keeps ExtFUSE disabled). The daemon
 opens a normal lower-root directory fd (the existing O_PATH fd cannot service
 syncfs), performs the real lower syncfs, and returns its actual error. A pure
 drain does not invalidate attr/xattr tokens. INIT records `syncfs_support`,
@@ -281,8 +303,9 @@ hook stales any resident row at the actual lower-I/O boundary, and a later
 daemon GETATTR publishes the lazy refresh.  Strict and legacy native modes keep
 their existing epoch or tombstone safeguards.
 
-By default paper-like C2 keeps logical READ/WRITE callbacks in the daemon and
-uses the ordinary io_uring payload path. `EXTFUSE_C2_FIXED_WRITE=1` changes only
+By default `hit`, `uring`, `paper-like` keeps logical READ/WRITE callbacks in
+the daemon and uses the ordinary io_uring payload path.
+`EXTFUSE_C2_FIXED_WRITE=1` changes only
 WRITE: the request's registered pages are submitted directly to the lower fd.
 The async context owns its cohort membership and pinned lower identity until
 completion. The last member closes the mutation, performs any capability-policy
@@ -292,8 +315,8 @@ ineligible. No pthread mutex is held from submission to completion, and a
 submission or I/O failure is reported without a copied replay. READ never opts
 in to the write-only open flag.
 
-Paper-fast C1/C2 share WRITE BEGIN, completion, and error handling. Quiescent
-completions capture the ATTR snapshot token while
+Paper-fast `hit` classic/io_uring paths share WRITE BEGIN, completion, and
+error handling. Quiescent completions capture the ATTR snapshot token while
 ending the mutation, then reuse it for pinned-inode publication. This removes
 one repeated inode-stripe lock acquisition per quiescent completion. The lower
 snapshot stays outside the lock; capability revocation/refill and token
@@ -423,17 +446,17 @@ unstable, missing, or evicted cache state, so diagnostic runs must still verify
 that no daemon metadata callback occurred rather than inferring it from source
 validation.
 
-All metadata-hit profiles retain the READ handler. C1/C2 daemon READ uses an
+All metadata-hit profiles retain the READ handler. The `hit` daemon READ uses an
 attr-only mutation and the transport's prepare callback to close the mutation
 and publish a validated pinned-inode snapshot after lower data consumption but
 before the reply becomes visible. This includes short reads, EOF and error
-paths; cache errors never replace a completed lower result. C3/C4 READ keeps
+paths; cache errors never replace a completed lower result. The `allopt` READ keeps
 the ordinary BPF forwarding decision and its explicit lower-I/O guard. Before
 completion the kernel may refill only atime, with exact tokens and a current
 seed row, without overwriting writeback size/mtime. Concurrent mutation or
 dirty/writeback state leaves the cache invalid. The `gate` profile retains
 its full epoch guard. These correctness checks do not guarantee zero fallback
-under mutation, eviction or failure, nor a universal C0-C4 throughput ordering.
+under mutation, eviction or failure, nor a universal throughput ordering.
 Synchronous native READ and splice READ rely on the existing completion-time
 atime invalidation before metadata END, avoiding a duplicate accessed callback.
 Asynchronous READ retains both its early and completion-time invalidation.

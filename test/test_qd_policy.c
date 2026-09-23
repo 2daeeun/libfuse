@@ -257,8 +257,10 @@ static void persistence_and_resets(void)
 	result = update(&policy, &detail);
 	assert(result.rule_id == 4 && result.profile == 1 && !result.stable_ns);
 	for (flag = 1; flag <= FUSE_WORKLOAD_DAX; flag <<= 1) {
+		if (flag == FUSE_WORKLOAD_PASSTHROUGH)
+			continue;
 		detail = sample(3, 18);
-		detail.snapshot.flags = flag; /* Includes PASSTHROUGH. */
+		detail.snapshot.flags = flag;
 		assert(!update(&policy, &detail).rule_id);
 		detail = sample(3, 19);
 		assert(!update(&policy, &detail).stable_ns);
@@ -455,6 +457,49 @@ static void configuration_files(void)
 	}
 }
 
+static void passthrough_policy(void)
+{
+	static const uint32_t invalid_flags[] = {
+		FUSE_WORKLOAD_WORKER, FUSE_WORKLOAD_APPEND, FUSE_WORKLOAD_DAX,
+		UINT32_C(1) << 31,
+	};
+	struct fuse_qd_policy_config parsed;
+	struct fuse_qd_policy policy;
+	struct fuse_workload_detail detail;
+	struct fuse_qd_policy_result result;
+	unsigned int second, i;
+
+	/* A synthetic native rule, not a renamed historical measured policy. */
+	assert(!load_text("rule native-fixture mixed-read 1 1 4096 rand 50 32\n",
+			 &parsed));
+	assert(!fuse_qd_policy_init(&policy, &parsed, "native-fixture", 1000));
+	for (second = 1; second <= 11; second++) {
+		detail = sample(3, second);
+		detail.snapshot.flags = FUSE_WORKLOAD_PASSTHROUGH;
+		result = update(&policy, &detail);
+		assert(result.rule_id == 1 && result.target_depth == 32);
+		assert(result.stable_ns == (second - 1) * SECOND);
+		assert(result.stable == (second == 11));
+		assert(detail.snapshot.flags == FUSE_WORKLOAD_PASSTHROUGH);
+	}
+	for (i = 0; i < ARRAY_SIZE(invalid_flags); i++) {
+		detail = sample(3, second++);
+		detail.snapshot.flags = FUSE_WORKLOAD_PASSTHROUGH |
+			invalid_flags[i];
+		result = update(&policy, &detail);
+		assert(!result.rule_id && !result.target_depth && !result.stable);
+		/* A rejected native window must reset the full persistence timer. */
+		for (unsigned int elapsed = 0; elapsed <= 10; elapsed++) {
+			detail = sample(3, second++);
+			detail.snapshot.flags = FUSE_WORKLOAD_PASSTHROUGH;
+			result = update(&policy, &detail);
+			assert(result.rule_id == 1 && result.target_depth == 32);
+			assert(result.stable_ns == elapsed * SECOND);
+			assert(result.stable == (elapsed == 10));
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 	assert(argc == 2);
@@ -466,6 +511,7 @@ int main(int argc, char **argv)
 	persistence_and_resets();
 	invalid_and_overflow();
 	configuration_files();
+	passthrough_policy();
 	puts("QD policy tests passed");
 	return 0;
 }

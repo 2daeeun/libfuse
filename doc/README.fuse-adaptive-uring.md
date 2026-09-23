@@ -92,20 +92,29 @@ reports requested settings, pending state, and the last monitor error.
 Edit `config/qd-policy.conf` to change workload conditions, target QD and
 observation settings. No C code or rebuild is needed for policy edits. The
 daemon reads the file once at session creation; edit it before starting the
-next mount. Live reload is not implemented. To enable the supplied ThinkPad C2
-rules, add:
+next mount. Live reload is not implemented. For a policy qualified for the
+current host and feature configuration, add the following options, replacing
+`PROFILE` and the absolute filename with that policy's identifiers:
 
 ```text
 -o io_uring,io_uring_adaptive=on,io_uring_q_depth=2,io_uring_q_depth_max=512
--o io_uring_policy=thinkpad-c2,io_uring_policy_file=/absolute/path/libfuse/config/qd-policy.conf
+-o io_uring_policy=PROFILE,io_uring_policy_file=/absolute/path/new-policy.conf
 ```
 
-Other supplied profiles are `dell-c2`, `dell-c6` and `thinkpad-c6`. Select the
-profile that matches the machine and filesystem configuration being tested;
-the daemon does not infer these from hostnames. Profiles are arbitrary safe
-identifiers, so additional profiles require only file edits. The sample file
-contains exactly the seven requested experimental rules. Their measured gains
-are motivation for testing, not guaranteed performance of this implementation.
+The supplied `thinkpad-c2`, `dell-c2`, `dell-c6` and `thinkpad-c6` profiles in
+`config/qd-policy.conf` retain the **historical C0-C6 experiment numbering**.
+They do not identify C2 or C6 in the newer `fuse-c0-c17-v1` matrix. The historical
+seven rules and their measurements are preserved, not requalified or renamed.
+In the new matrix C2 is classic FUSE with writeback cache, C6 is classic FUSE
+with eBPF, and io_uring applies to C4/C5/C10/C11/C14/C17. Historical MDOpt/AllOpt
+bundles also included options that the new matrix keeps independently defined.
+
+Select a separately qualified profile for the actual host and feature set.
+libfuse does not infer hosts, case numbers or case schemas: profile names are
+arbitrary safe identifiers, so additional profiles require only file edits.
+The C0-C17 runners provide the experiment mapping and legacy-profile guards;
+direct libfuse callers must maintain the same provenance themselves. Renaming
+an old profile does not establish that its target QD suits the new configuration.
 The selected profile's largest target must fit `io_uring_q_depth_max`; otherwise
 session creation fails. Missing/malformed files, unknown profiles and ambiguous
 rules also fail before mounting. Omitting both policy options retains manual
@@ -138,9 +147,13 @@ and requester identities across both read and write operations, exactly up to
 32 and saturating at 33. Thus a rule requiring 32 does not accept 31 or 33+.
 Requester counts are observed active identities, not a guarantee about the
 application's configured thread count. Mixed sequential rules use combined
-read/write offset adjacency per inode. Append, async-worker, DAX, passthrough
-and incomplete observation windows do not match these rules. This policy is
-intended for the supplied C2/C6 data paths.
+read/write offset adjacency per inode. Append, async-worker, DAX, unknown flags
+and incomplete observation windows do not match these rules. The passthrough
+flag alone records the data path and permits matching. All
+size/cardinality/ratio, minimum-count, sequence and persistence
+requirements remain in force; passthrough combined with any unsupported flag
+is still rejected. This permits a separately qualified native C14/C17 policy
+to request a QD change; it does not qualify any historical target for those cases.
 
 A matching rule and size profile must persist across consecutive valid
 windows for `stable_ms`; the first classified window starts the timer. With

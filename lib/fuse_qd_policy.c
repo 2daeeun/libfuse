@@ -40,6 +40,41 @@ static void ratio_bounds(unsigned int ratio, unsigned int tolerance,
 	}
 }
 
+static void rule_ratio_bounds(const struct fuse_qd_policy_rule *rule,
+			      unsigned int tolerance, unsigned int *low,
+			      unsigned int *high)
+{
+	if (rule->ranged) {
+		*low = rule->read_percent;
+		*high = rule->read_percent_max;
+	} else {
+		ratio_bounds(rule->read_percent, tolerance, low, high);
+	}
+}
+
+static bool intersects(uint64_t low, uint64_t high, uint64_t other_low,
+		       uint64_t other_high)
+{
+	return low <= other_high && other_low <= high;
+}
+
+/* Range tokens are explicit MIN:MAX pairs, not globs or open bounds. */
+static bool range(char *text, uint64_t limit, uint64_t minimum,
+		  uint64_t *low, uint64_t *high)
+{
+	char *colon = strchr(text, ':');
+	bool valid;
+
+	if (!colon || strchr(colon + 1, ':'))
+		return false;
+	*colon = 0;
+	valid = number(text, limit, low) &&
+		number(colon + 1, limit, high) && *low >= minimum &&
+		*low <= *high;
+	*colon = ':';
+	return valid;
+}
+
 static bool valid_rules(const struct fuse_qd_policy_config *config)
 {
 	unsigned int i, j, low, high, other_low, other_high;
@@ -47,8 +82,7 @@ static bool valid_rules(const struct fuse_qd_policy_config *config)
 	for (i = 0; i < config->nr_rules; i++) {
 		const struct fuse_qd_policy_rule *r = &config->rules[i];
 
-		ratio_bounds(r->read_percent, config->ratio_tolerance, &low,
-			     &high);
+		rule_ratio_bounds(r, config->ratio_tolerance, &low, &high);
 		for (j = 0; j < i; j++) {
 			const struct fuse_qd_policy_rule *p = &config->rules[j];
 
@@ -56,14 +90,31 @@ static bool valid_rules(const struct fuse_qd_policy_config *config)
 				continue;
 			if (!strcmp(r->name, p->name))
 				return false;
-			if (r->size != p->size || r->files != p->files ||
-			    r->requesters != p->requesters ||
-			    r->sequential != p->sequential)
+			if (!intersects(r->size, r->size_max, p->size,
+					p->size_max) ||
+			    !intersects(r->files, r->files_max, p->files,
+					p->files_max) ||
+			    !intersects(r->requesters, r->requesters_max,
+					p->requesters, p->requesters_max) ||
+			    (r->sequential != p->sequential &&
+			     r->sequential != FUSE_QD_ANY &&
+			     p->sequential != FUSE_QD_ANY))
 				continue;
-			ratio_bounds(p->read_percent, config->ratio_tolerance,
-				     &other_low, &other_high);
-			if (low <= other_high && other_low <= high)
-				return false;
+			rule_ratio_bounds(p, config->ratio_tolerance, &other_low,
+					  &other_high);
+			if (!intersects(low, high, other_low, other_high))
+				continue;
+			/* Legacy mixed rules exclude pure endpoints even when
+			 * tolerance reaches 0 or 100 percent.
+			 */
+			if ((high == 0 || other_high == 0 || low == 100 ||
+			     other_low == 100) &&
+			    ((!r->ranged && r->read_percent &&
+			      r->read_percent != 100) ||
+			     (!p->ranged && p->read_percent &&
+			      p->read_percent != 100)))
+				continue;
+			return false;
 		}
 	}
 	return config->nr_rules != 0;
@@ -88,7 +139,7 @@ static int read_config(FILE *file, struct fuse_qd_policy_config *config)
 	};
 	char line[512], *tokens[10], *cursor, *comment;
 	unsigned int seen = 0, count, i;
-	uint64_t n[6];
+	uint64_t n[6], upper[4];
 
 	while (fgets(line, sizeof(line), file)) {
 		if (!strchr(line, '\n') && !feof(file))
@@ -108,30 +159,50 @@ static int read_config(FILE *file, struct fuse_qd_policy_config *config)
 		}
 		if (!count)
 			continue;
-		if (!strcmp(tokens[0], "rule")) {
+		if (!strcmp(tokens[0], "rule") ||
+		    !strcmp(tokens[0], "rule-range")) {
 			struct fuse_qd_policy_rule *r;
+			bool ranged = !strcmp(tokens[0], "rule-range");
 
 			if (count != 9 ||
 			    config->nr_rules == FUSE_QD_POLICY_MAX_RULES ||
 			    !identifier(tokens[1]) || !identifier(tokens[2]) ||
 			    !strcmp(tokens[1], "none") ||
-			    !number(tokens[3], 32, &n[0]) || !n[0] ||
-			    !number(tokens[4], 32, &n[1]) || !n[1] ||
-			    !number(tokens[5], UINT64_MAX, &n[2]) || !n[2] ||
 			    (strcmp(tokens[6], "seq") &&
-			     strcmp(tokens[6], "rand")) ||
-			    !number(tokens[7], 100, &n[3]) ||
+			     strcmp(tokens[6], "rand") &&
+			     (!ranged || strcmp(tokens[6], "any"))) ||
 			    !number(tokens[8], UINT32_MAX, &n[4]) || !n[4])
 				return -EINVAL;
+			if (ranged) {
+				if (!range(tokens[3], 32, 1, &n[0], &upper[0]) ||
+				    !range(tokens[4], 32, 1, &n[1], &upper[1]) ||
+				    !range(tokens[5], UINT64_MAX, 1, &n[2],
+					   &upper[2]) ||
+				    !range(tokens[7], 100, 0, &n[3], &upper[3]))
+					return -EINVAL;
+			} else {
+				if (!number(tokens[3], 32, &n[0]) || !n[0] ||
+				    !number(tokens[4], 32, &n[1]) || !n[1] ||
+				    !number(tokens[5], UINT64_MAX, &n[2]) || !n[2] ||
+				    !number(tokens[7], 100, &n[3]))
+					return -EINVAL;
+				memcpy(upper, n, sizeof(upper));
+			}
 			r = &config->rules[config->nr_rules++];
 			memcpy(r->context, tokens[1], strlen(tokens[1]) + 1);
 			memcpy(r->name, tokens[2], strlen(tokens[2]) + 1);
 			r->requesters = n[0];
 			r->files = n[1];
 			r->size = n[2];
-			r->sequential = !strcmp(tokens[6], "seq");
+			r->sequential = !strcmp(tokens[6], "any") ? FUSE_QD_ANY :
+					!strcmp(tokens[6], "seq");
 			r->read_percent = n[3];
 			r->depth = n[4];
+			r->requesters_max = upper[0];
+			r->files_max = upper[1];
+			r->size_max = upper[2];
+			r->read_percent_max = upper[3];
+			r->ranged = ranged;
 			continue;
 		}
 		if (!strcmp(tokens[0], "thresholds")) {
@@ -265,15 +336,20 @@ static bool matches(const struct fuse_qd_policy_rule *rule,
 {
 	unsigned int rw, low, high;
 
-	if (detail->files != rule->files ||
-	    detail->requesters != rule->requesters)
+	if (detail->files < rule->files || detail->files > rule->files_max ||
+	    detail->requesters < rule->requesters ||
+	    detail->requesters > rule->requesters_max)
 		return false;
 	for (rw = 0; rw < 2; rw++)
 		if (count[rw] &&
-		    (detail->snapshot.op[rw].min_size != rule->size ||
-		     detail->snapshot.op[rw].max_size != rule->size))
+		    (detail->snapshot.op[rw].min_size < rule->size ||
+		     detail->snapshot.op[rw].max_size > rule->size_max))
 			return false;
-	if (!rule->read_percent || rule->read_percent == 100) {
+	if (rule->ranged) {
+		if (count[0] < fraction(total, rule->read_percent, true) ||
+		    count[0] > fraction(total, rule->read_percent_max, false))
+			return false;
+	} else if (!rule->read_percent || rule->read_percent == 100) {
 		if (count[rule->read_percent ? 1 : 0])
 			return false;
 	} else {
@@ -283,7 +359,9 @@ static bool matches(const struct fuse_qd_policy_rule *rule,
 		    count[0] > fraction(total, high, false))
 			return false;
 	}
-	return rule->sequential ?
+	if (rule->sequential == FUSE_QD_ANY)
+		return true;
+	return rule->sequential == FUSE_QD_SEQUENTIAL ?
 		       detail->seq_contiguous >=
 			       fraction(detail->seq_pairs,
 					settings->sequential_percent, true) :

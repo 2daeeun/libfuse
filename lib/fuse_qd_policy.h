@@ -9,14 +9,24 @@ struct fuse_workload_detail;
 #define FUSE_QD_POLICY_MAX_RULES 128
 #define FUSE_QD_POLICY_NAME_SIZE 64
 
+enum fuse_qd_policy_pattern {
+	FUSE_QD_RANDOM,
+	FUSE_QD_SEQUENTIAL,
+	FUSE_QD_ANY,
+};
+
 struct fuse_qd_policy_rule {
 	char context[FUSE_QD_POLICY_NAME_SIZE], name[FUSE_QD_POLICY_NAME_SIZE];
 	uint64_t size;
 	uint32_t files, requesters, sequential, read_percent, depth;
+	/* Exact rules keep their historical ratio tolerance and endpoint rules. */
+	uint64_t size_max;
+	uint32_t files_max, requesters_max, read_percent_max, ranged;
 };
 
 /* Immutable after load. Mixed ratios use request counts, not bytes; pure
  * read/write rules require exactly 100%. Context names come from the file;
+ * Range rules have inclusive bounds and no implicit ratio tolerance.
  * "none" is reserved for disabling the policy. Settings include thresholds.
  */
 struct fuse_qd_policy_config {

@@ -728,6 +728,73 @@ static void test_policy_monitor(char *path, const char *policy_file)
 	free(config);
 }
 
+/* Load the opt-in TEC file through the production matcher/controller. */
+static void test_range_controller(const char *policy_file)
+{
+	static const char * const contexts[] = {
+		"thinkpad-tec-c2", "thinkpad-tec-c6",
+	};
+	struct fuse_qd_policy_config *config = calloc(1, sizeof(*config));
+
+	assert(config && !fuse_qd_policy_load(policy_file, config));
+	for (unsigned int context = 0; context < 2; context++) {
+		struct fuse_session se;
+		struct fuse_adaptive a = { 0 };
+		struct fuse_workload_detail detail = { 0 };
+		struct fuse_workload_snapshot *s = &detail.snapshot;
+		unsigned int baseline = backend.requests;
+
+		init_session(&se, NULL);
+		se.uring.policy_name = (char *)contexts[context];
+		se.uring.policy_config = config;
+		se.uring.adaptive = &a;
+		a.se = &se;
+		a.configfd = -1;
+		a.settings = config->settings;
+		a.configured = true;
+		assert(!pthread_mutex_init(&a.lock, NULL));
+		adaptive_reset_policy(&a);
+		backend.busy = false;
+		backend.status_error = backend.status_errno = 0;
+		backend.depth = backend.target = 32;
+		s->version = FUSE_WORKLOAD_VERSION;
+		s->generation = 1;
+		detail.requesters = 1;
+		detail.seq_pairs = 999;
+		for (unsigned int rw = 0; rw < 2; rw++) {
+			struct fuse_workload_op_stats *op = &s->op[rw];
+
+			op->count[0] = rw ? 10 : 990;
+			op->bytes[0] = op->count[0] * 4096;
+			op->min_size = 1070;
+			op->max_size = 4187;
+			op->files = 2;
+			op->requesters = 1;
+		}
+		for (unsigned int i = 0; i <= 10; i++) {
+			detail.files = 3 + i;
+			s->window_id++;
+			s->start_ns = s->end_ns;
+			s->end_ns += UINT64_C(1000000000);
+			assert(!fuse_qd_policy_update(&a.policy, &detail,
+						      &a.policy_result));
+			adaptive_apply_policy(&a);
+			assert(backend.requests == baseline + (i == 10));
+		}
+		assert(backend.target == 2 && a.policy_transaction);
+		backend.busy = false;
+		backend.depth = 2;
+		adaptive_apply_policy(&a);
+		assert(backend.requests == baseline + 1);
+		assert(!fuse_session_workload_configure(&se, &a.settings));
+		assert(!a.policy_result.stable && !a.policy_transaction);
+		se.uring.adaptive = NULL;
+		pthread_mutex_destroy(&a.lock);
+		pthread_mutex_destroy(&se.uring.runtime_lock);
+	}
+	free(config);
+}
+
 int main(int argc, char **argv)
 {
 	char directory[] = "/tmp/fuse-adaptive-control.XXXXXX";
@@ -738,9 +805,10 @@ int main(int argc, char **argv)
 	test_disabled_and_failed_start();
 	test_protocol_and_monitor(path);
 	test_path_ownership(path);
-	assert(argc == 2);
+	assert(argc == 3);
 	test_policy_controller(argv[1]);
 	test_policy_monitor(path, argv[1]);
+	test_range_controller(argv[2]);
 	assert(rmdir(directory) == 0);
 	puts("adaptive monitor and control socket: PASS (mock kernel/QD backend)");
 	return 0;

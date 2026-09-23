@@ -47,6 +47,8 @@ td += native_request_counter_test
 test('native request counter', native_request_counter_test)
 
 if host_machine.system().startswith('linux')
+    test('writeback open/create/tmpfile flags', find_program('python3'),
+        args: [files('../example/extfuse/test_writeback_open_flags.py')])
     workload_test = executable('test_workload_detector',
         ['test_workload_detector.c', '../lib/fuse_workload.c'],
         include_directories: include_dirs, install: false)
@@ -133,5 +135,5 @@ if private_cfg.get('HAVE_URING', false)
         install: false)
     td += adaptive_control_test
     test('adaptive monitor and control socket', adaptive_control_test,
-        args: [files('fixtures/qd-policy.conf')], timeout: 15)
+        args: [files('fixtures/qd-policy.conf'), files('../config/qd-policy-tec.conf')], timeout: 15)
 endif

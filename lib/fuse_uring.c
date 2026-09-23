@@ -95,6 +95,8 @@ struct fuse_ring_queue {
 	struct fuse_ring_ent control_ent;
 	struct fuse_uring_runtime_state query_result;
 	bool control_pending;
+	/* OFF-only startup/shutdown inventory; never sampled on the I/O path. */
+	bool allocation_started;
 	bool rearming;
 	int control_result;
 	unsigned int current_depth;
@@ -709,6 +711,89 @@ static int fuse_queue_setup_io_uring(struct io_uring *ring, size_t qid,
 	return 0;
 }
 
+struct fuse_uring_allocation {
+	uint64_t entries;
+	uint64_t payload_bytes;
+	uint64_t registered_bytes;
+	uint64_t header_bytes;
+	bool valid;
+};
+
+static bool fuse_uring_allocation_add(uint64_t *total, size_t length)
+{
+	if (length > UINT64_MAX - *total)
+		return false;
+	*total += length;
+	return true;
+}
+
+/* Only call in the owner before readiness publication, or after owner join.
+ * Count owned allocation lengths, not QD-derived capacity or resident pages.
+ * In zero-copy mode ent->op_payload is a mutable, non-owning pool slice.
+ */
+static struct fuse_uring_allocation
+fuse_uring_allocation_inventory(const struct fuse_ring_queue *queue)
+{
+	const struct fuse_ring_pool *pool = queue->ring_pool;
+	struct fuse_uring_allocation out = { .valid = true };
+
+	if (pool->runtime_qd || !queue->allocation_started ||
+	    queue->current_depth != pool->queue_depth ||
+	    !pool->queue_depth || !queue->req_header_sz)
+		out.valid = false;
+	if (pool->zero_copy) {
+		if (!queue->payload_pool || !queue->payload_pool_sz ||
+		    !queue->sparse_buffers_registered)
+			out.valid = false;
+		if (queue->payload_pool)
+			out.payload_bytes = queue->payload_pool_sz;
+		out.registered_bytes = queue->runtime_status.registered_bytes;
+		if (out.registered_bytes != out.payload_bytes)
+			out.valid = false;
+	}
+	for (size_t idx = 0; idx < pool->queue_depth; idx++) {
+		const struct fuse_ring_ent *ent = &queue->ent[idx];
+
+		if (ent->req_header) {
+			out.entries++;
+			if (!fuse_uring_allocation_add(&out.header_bytes,
+						queue->req_header_sz))
+				out.valid = false;
+		}
+		if (!pool->zero_copy) {
+			if (!ent->op_payload || !ent->req_payload_sz)
+				out.valid = false;
+			if (ent->op_payload &&
+			    !fuse_uring_allocation_add(&out.payload_bytes,
+						ent->req_payload_sz))
+				out.valid = false;
+		}
+	}
+	if (out.entries != pool->queue_depth || !out.payload_bytes)
+		out.valid = false;
+	return out;
+}
+
+static void fuse_uring_log_allocation(struct fuse_ring_queue *queue,
+				      const char *stage)
+{
+	struct fuse_uring_allocation value;
+
+	if (queue->ring_pool->runtime_qd)
+		return;
+	value = fuse_uring_allocation_inventory(queue);
+	fuse_log(FUSE_LOG_INFO,
+		 "FUSE_URING_ALLOCATION version=1 stage=%s qid=%d depth=%u entries=%" PRIu64
+		 " payload_bytes=%" PRIu64
+		 " registered_bytes=%" PRIu64 " header_bytes=%" PRIu64
+		 " sq_entries=%u cq_entries=%u registration=%s valid=%u\n",
+		 stage, queue->qid, queue->current_depth, value.entries,
+		 value.payload_bytes, value.registered_bytes, value.header_bytes,
+		 queue->ring.sq.ring_entries, queue->ring.cq.ring_entries,
+		 queue->allocation_started ? "submitted" : "not-submitted",
+		 value.valid);
+}
+
 static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 {
 	uint64_t read_submitted = 0;
@@ -750,6 +835,8 @@ static void fuse_session_destruct_uring(struct fuse_ring_pool *fuse_ring)
 			pthread_join(queue->tid, NULL);
 			queue->tid = 0;
 		}
+
+		fuse_uring_log_allocation(queue, "end");
 
 		if (queue->eventfd >= 0) {
 			close(queue->eventfd);
@@ -1687,6 +1774,10 @@ static int fuse_uring_submit_registered_queue(struct fuse_ring_queue *queue)
 	if (submitted != expected)
 		return -EIO;
 
+	if (!pool->runtime_qd) {
+		queue->allocation_started = true;
+		fuse_uring_log_allocation(queue, "start");
+	}
 	ready = atomic_fetch_add_explicit(&pool->ready_queues, 1,
 					 memory_order_acq_rel) + 1;
 	if (ready == pool->nr_queues) {

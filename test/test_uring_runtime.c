@@ -443,8 +443,111 @@ static void test_partial_session(void)
 	teardown();
 }
 
+static char allocation_line[1024];
+static unsigned int allocation_logs;
+
+static void capture_allocation(enum fuse_log_level level, const char *fmt,
+			       va_list ap)
+{
+	(void)level;
+	allocation_logs++;
+	vsnprintf(allocation_line, sizeof(allocation_line), fmt, ap);
+}
+
+/* Inventory test: no ring setup, mount, or large payload allocation needed. */
+static void test_fixed_allocation(bool zero_copy, unsigned int depth)
+{
+	struct fuse_ring_pool pool = {
+		.zero_copy = zero_copy, .queue_depth = depth,
+	};
+	struct fuse_ring_queue *q = calloc(1, fuse_ring_queue_size(depth));
+	struct fuse_uring_req_header *headers = calloc(depth, sizeof(*headers));
+	struct fuse_uring_allocation value;
+	uint64_t bytes = 0;
+
+	assert(q && headers);
+	q->ring_pool = &pool;
+	q->current_depth = depth;
+	q->allocation_started = true;
+	q->req_header_sz = sizeof(*headers);
+	q->ring.sq.ring_entries = 2 * depth;
+	q->ring.cq.ring_entries = 4 * depth;
+	if (zero_copy) {
+		q->payload_pool_sz = depth * 4096;
+		q->payload_pool = malloc(q->payload_pool_sz);
+		assert(q->payload_pool);
+		q->sparse_buffers_registered = true;
+		q->runtime_status.registered_bytes = q->payload_pool_sz;
+		bytes = q->payload_pool_sz;
+	}
+	for (unsigned int i = 0; i < depth; i++) {
+		q->ent[i].req_header = &headers[i];
+		/* Deliberately distinct lengths: capacity arithmetic is not inventory. */
+		q->ent[i].req_payload_sz = i + 1;
+		if (zero_copy) {
+			/* Aliased and NULL slice pointers must not change owned bytes. */
+			q->ent[i].op_payload = i % 2 ? q->payload_pool : NULL;
+		} else {
+			q->ent[i].op_payload = malloc(i + 1);
+			assert(q->ent[i].op_payload);
+			bytes += i + 1;
+		}
+	}
+	value = fuse_uring_allocation_inventory(q);
+	assert(value.valid && value.entries == depth);
+	assert(value.payload_bytes == bytes);
+	assert(value.registered_bytes == (zero_copy ? bytes : 0));
+	assert(value.header_bytes == depth * sizeof(*headers));
+
+	allocation_logs = 0;
+	fuse_set_log_func(capture_allocation);
+	fuse_uring_log_allocation(q, "start");
+	assert(allocation_logs == 1);
+	assert(strstr(allocation_line, "FUSE_URING_ALLOCATION version=1 stage=start "));
+	assert(strstr(allocation_line, "registration=submitted valid=1\n"));
+	pool.runtime_qd = true;
+	fuse_uring_log_allocation(q, "start");
+	assert(allocation_logs == 1); /* Existing ON telemetry is unchanged. */
+	pool.runtime_qd = false;
+	q->allocation_started = false;
+	fuse_uring_log_allocation(q, "end");
+	assert(allocation_logs == 2);
+	assert(strstr(allocation_line, "registration=not-submitted valid=0\n"));
+	fuse_set_log_func(NULL);
+	q->allocation_started = true;
+	q->ent[0].req_header = NULL;
+	assert(!fuse_uring_allocation_inventory(q).valid);
+	q->ent[0].req_header = &headers[0];
+	if (zero_copy) {
+		q->runtime_status.registered_bytes--;
+		assert(!fuse_uring_allocation_inventory(q).valid);
+		free(q->payload_pool);
+	} else {
+		free(q->ent[0].op_payload);
+		q->ent[0].op_payload = NULL;
+		assert(!fuse_uring_allocation_inventory(q).valid);
+		for (unsigned int i = 1; i < depth; i++)
+			free(q->ent[i].op_payload);
+	}
+	/* A large sum stays 64-bit; overflow invalidates rather than wraps. */
+	bytes = UINT32_MAX;
+	assert(fuse_uring_allocation_add(&bytes, 4096));
+	assert(bytes == (uint64_t)UINT32_MAX + 4096);
+	bytes = UINT64_MAX;
+	assert(!fuse_uring_allocation_add(&bytes, 1));
+	assert(bytes == UINT64_MAX);
+	free(headers);
+	free(q);
+}
+
 int main(void)
 {
+	unsigned int fixed_depths[] = { 2, 32, 512 };
+
+	for (size_t i = 0; i < ARRAY_SIZE(fixed_depths); i++) {
+		test_fixed_allocation(false, fixed_depths[i]);
+		test_fixed_allocation(true, fixed_depths[i]);
+	}
 	test_transitions(false);
 	test_partial_session();
 	for (unsigned int i = 0; i < 4; i++)
@@ -454,6 +557,6 @@ int main(void)
 	for (unsigned int i = 0; i < 5; i++)
 		test_failure(true, i);
 #endif
-	puts("runtime QD transitions, allocation/register/rearm failures, timeout rollback: PASS");
+	puts("fixed allocation inventory, runtime QD transitions and rollback: PASS");
 	return 0;
 }

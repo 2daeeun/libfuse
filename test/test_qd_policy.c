@@ -500,6 +500,152 @@ static void passthrough_policy(void)
 	}
 }
 
+/* Synthetic windows use the observed TEC shape, not a replay of disk I/O. */
+static struct fuse_workload_detail tec_sample(unsigned int second,
+					    uint64_t reads, uint64_t total)
+{
+	struct fuse_workload_detail d = sample(3, second);
+
+	d.files = 3 + second % 16;
+	d.requesters = 1 + second % 2;
+	d.seq_pairs = total - 1;
+	d.seq_contiguous = 0; /* The TEC range explicitly accepts any pattern. */
+	for (unsigned int rw = 0; rw < 2; rw++) {
+		struct fuse_workload_op_stats *op = &d.snapshot.op[rw];
+		uint64_t count = rw ? total - reads : reads;
+
+		memset(op, 0, sizeof(*op));
+		if (!count)
+			continue;
+		op->count[0] = count;
+		op->bytes[0] = count * 4096;
+		op->min_size = 1070;
+		op->max_size = 4187;
+		op->files = count > 1 ? 2 : 1;
+		op->requesters = count > 1 ? d.requesters : 1;
+		op->seq_pairs = count - 1;
+	}
+	return d;
+}
+
+static void range_rules(void)
+{
+	static const char *const invalid[] = {
+		"rule-range p n 1 2:32 1024:8192 any 95:100 2\n",
+		"rule-range p n 2:1 2:32 1024:8192 any 95:100 2\n",
+		"rule-range p n 0:2 2:32 1024:8192 any 95:100 2\n",
+		"rule-range p n 1:33 2:32 1024:8192 any 95:100 2\n",
+		"rule-range p n 1:2 2:33 1024:8192 any 95:100 2\n",
+		"rule-range p n 1:2 2:32 0:8192 any 95:100 2\n",
+		"rule-range p n 1:2 2:32 8192:1024 any 95:100 2\n",
+		"rule-range p n 1:2 2:32 1:18446744073709551616 any 95:100 2\n",
+		"rule-range p n 1:2 2:32 1024:8192 any 95:101 2\n",
+		"rule-range p n 1:2 2:32 1024:8192 any 100:95 2\n",
+		"rule-range p n 1:2 2:32 1024:8192 any 95::100 2\n",
+		"rule-range p n 1:2 2:32 1024:8192 bogus 95:100 2\n",
+		"rule p n 1 1 4096 any 100 2\n",
+		"rule-range p a 1:2 2:32 1024:8192 any 95:100 2\n"
+		"rule-range p b 2:3 3:4 4096:16384 seq 90:95 2\n",
+		"rule p a 1 1 4096 rand 50 32\n"
+		"rule-range p b 1:2 1:32 1024:8192 any 55:100 2\n",
+		"rule-range p a 1:2 1:32 1024:8192 any 55:100 2\n"
+		"rule p b 1 1 4096 rand 50 32\n",
+	};
+	struct fuse_qd_policy_config parsed;
+	struct fuse_qd_policy policy;
+	struct fuse_workload_detail d;
+	struct fuse_qd_policy_result r;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(invalid); i++)
+		assert(load_text(invalid[i], &parsed) == -EINVAL);
+	/* Nonoverlapping intervals and legacy open pure endpoints are legal. */
+	assert(!load_text(
+		"rule p a 1 1 4096 rand 50 32\n"
+		"rule-range p b 1:2 1:32 1024:8192 any 56:100 2\n",
+		&parsed));
+	assert(!load_text(
+		"rule p a 1 1 4096 rand 95 32\n"
+		"rule-range p b 1:1 1:1 4096:4096 rand 100:100 2\n",
+		&parsed));
+	assert(!load_text(
+		"rule p a 1 1 4096 rand 5 32\n"
+		"rule-range p b 1:1 1:1 4096:4096 rand 0:0 2\n",
+		&parsed));
+	assert(!load_text(
+		"rule-range tec small-read 1:2 2:32 1024:8192 any 95:100 2\n",
+		&parsed));
+	assert(fuse_qd_policy_max_depth(&parsed, "tec") == 2);
+	assert(!fuse_qd_policy_init(&policy, &parsed, "tec", 1000));
+	for (unsigned int second = 1; second <= 12; second++) {
+		d = tec_sample(second, second % 2 ? 9900 : 10000, 10000);
+		d.snapshot.flags = FUSE_WORKLOAD_PASSTHROUGH;
+		r = update(&policy, &d);
+		assert(r.rule_id == 1 && r.target_depth == 2);
+		assert(r.stable == (second >= 11));
+	}
+	/* Inclusive bounds use counts, with no tolerance or rounded display. */
+	d = tec_sample(13, 9500, 10000);
+	assert(update(&policy, &d).stable);
+	d = tec_sample(14, 9499, 10000);
+	assert(!update(&policy, &d).rule_id);
+	d = tec_sample(15, 9500, 10001);
+	assert(!update(&policy, &d).rule_id);
+	for (unsigned int second = 16; second <= 26; second++) {
+		d = tec_sample(second, 9900, 10000);
+		assert(update(&policy, &d).stable == (second == 26));
+	}
+	for (unsigned int test = 0; test < 9; test++) {
+		d = tec_sample(1, 9900, 10000);
+		switch (test) {
+		case 0:
+			d.snapshot.op[0].min_size = 1023;
+			break;
+		case 1:
+			d.snapshot.op[1].max_size = 8193;
+			break;
+		case 2:
+			d.files = 33;
+			break;
+		case 3:
+			d.requesters = 3;
+			break;
+		case 4:
+			d.seq_pairs = 15;
+			break;
+		case 5:
+			d.snapshot.flags = FUSE_WORKLOAD_PASSTHROUGH |
+				FUSE_WORKLOAD_APPEND;
+			break;
+		case 6:
+			d = tec_sample(1, 15, 15);
+			break;
+		case 7:
+			d.snapshot.end_ns += 3 * SECOND;
+			break;
+		case 8:
+			d.snapshot.op[0].count[1] = 4950;
+			d.snapshot.op[0].bytes[1] = 4950 * 4096;
+			d.snapshot.op[0].count[0] = 4950;
+			d.snapshot.op[0].bytes[0] = 4950 * 4096;
+			break;
+		}
+		assert(!update(&policy, &d).rule_id);
+	}
+	d = tec_sample(1, 10000, 10000);
+	d.files = 2;
+	d.requesters = 1;
+	d.snapshot.op[0].requesters = 1;
+	d.snapshot.op[0].min_size = 1024;
+	d.snapshot.op[0].max_size = 8192;
+	assert(update(&policy, &d).rule_id == 1);
+	d.files = 32;
+	d.requesters = d.snapshot.op[0].requesters = 2;
+	assert(update(&policy, &d).rule_id == 1);
+	d.snapshot.generation++;
+	assert(!update(&policy, &d).stable_ns);
+	assert(!update(&policy, NULL).rule_id);
+}
+
 int main(int argc, char **argv)
 {
 	assert(argc == 2);
@@ -512,6 +658,7 @@ int main(int argc, char **argv)
 	invalid_and_overflow();
 	configuration_files();
 	passthrough_policy();
+	range_rules();
 	puts("QD policy tests passed");
 	return 0;
 }

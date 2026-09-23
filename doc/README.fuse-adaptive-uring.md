@@ -51,6 +51,34 @@ evidence does not imply that a QD transaction completed: check the control
 socket status and all queues separately. OFF evidence describes the adaptive
 switch; ordinary io_uring activation must still be checked independently.
 
+Fixed-QD OFF sessions additionally emit one `FUSE_URING_ALLOCATION` INFO record
+per queue at startup and shutdown:
+
+```text
+FUSE_URING_ALLOCATION version=1 stage=start qid=0 depth=2 entries=2 payload_bytes=2097152 registered_bytes=2097152 header_bytes=8192 sq_entries=4 cq_entries=8 registration=submitted valid=1
+```
+
+These illustrative values are not defaults. Startup is after successful
+submission of this queue's REGISTER SQEs and before publishing readiness;
+shutdown (`stage=end`) is after joining its owner and before releasing the
+ring or payload. `registration=submitted` proves submission, not kernel-side
+admission or a runtime depth query. A failed/incomplete setup has no valid
+startup record; its shutdown inventory can report `valid=0` and
+`registration=not-submitted`. Consumers must require a complete queue set and
+matching valid startup/shutdown records, plus normal session completion.
+
+`payload_bytes` sums the lengths of successful, still-owned allocations:
+the immutable pool allocation in fixed-buffer mode, or individual entry
+allocations in copied mode. Mutable entry slice pointers do not add ownership.
+`registered_bytes` is the successfully registered pool length, already included
+in payload bytes. `header_bytes` counts separately owned header allocations.
+These lengths exclude allocator/page rounding, ring memory, kernel allocations
+and resident-memory measurements. `sq_entries`/`cq_entries` are actual liburing
+ring capacities, distinct from the FUSE `depth`. OFF has no payload resize path,
+so matching endpoint inventory can describe its constant owned allocation.
+No monitor, control socket, per-request counter, or sampling loop is enabled
+by these records; adaptive ON retains its existing telemetry.
+
 Use an existing private directory owned by the daemon user. The daemon binds
 an owner-only UNIX seqpacket socket; an existing pathname is an error, and is
 never removed on startup. Cleanup only removes the socket inode created by
@@ -141,6 +169,34 @@ that size. Arbitrary positive sizes can be specified; the four legacy size
 profiles do not constrain rule sizes. Unmatched, idle, insufficient or uncertain
 windows reset policy persistence and leave QD unchanged.
 
+Opt-in range rules use a separate directive; existing `rule` lines keep their
+exact size/cardinality and mixed-ratio tolerance semantics:
+
+```text
+rule-range PROFILE RULE_NAME REQUESTERS_MIN:MAX FILES_MIN:MAX SIZE_MIN:MAX seq|rand|any READ_PERCENT_MIN:MAX TARGET_QD
+```
+
+Bounds are inclusive decimal integers. Requesters/files stay within 1..32,
+sizes are positive, and read percentages stay within 0..100. Read ranges use
+the raw read/total counts without `ratio_tolerance` or display rounding. Every
+observed read/write size must fit the interval. `any` removes only the offset
+pattern condition; quality flags, minimum counts/pairs, dominant size bucket,
+and persistence checks still apply. Saturated 33+ cardinalities cannot match.
+Overlapping exact/range or range/range rules in the same profile are rejected,
+even when their target depths agree. Different rule names do not disambiguate
+overlap. Changes within one matched range do not restart its persistence timer.
+
+`config/qd-policy-tec.conf` preserves an exploratory ThinkPad TEC5 profile for 1..2
+requesters, 2..32 files, 1024..8192-byte attempts and 95..100% reads, targeting
+QD 2 after ten seconds of stable matching. It requires range-rule support;
+`config/qd-policy.conf` is unchanged for existing exact-rule users and older
+binaries. The target is an experiment choice, not an online throughput optimum.
+Its `thinkpad-tec-c2` and `thinkpad-tec-c6` names use the same historical case
+numbering. `config/qd-policy-tec5-growth.conf` likewise preserves the historical
+`tec5-c2-grow32` and `tec5-c2-grow512` transfer experiments. None of these
+profiles supplies a newly qualified C0-C17 policy. The inputs include page-cache
+hits and do not measure device queue utilization.
+
 The policy observes app-facing FUSE iter attempts as described below. With a
 policy selected, the new detail snapshot counts distinct inode incarnations
 and requester identities across both read and write operations, exactly up to
@@ -149,8 +205,8 @@ Requester counts are observed active identities, not a guarantee about the
 application's configured thread count. Mixed sequential rules use combined
 read/write offset adjacency per inode. Append, async-worker, DAX, unknown flags
 and incomplete observation windows do not match these rules. The passthrough
-flag alone records the data path and permits matching. All
-size/cardinality/ratio, minimum-count, sequence and persistence
+flag alone records the data path and permits matching, including exact and
+range rules. All size/cardinality/ratio, minimum-count, sequence and persistence
 requirements remain in force; passthrough combined with any unsupported flag
 is still rejected. This permits a separately qualified native C14/C17 policy
 to request a QD change; it does not qualify any historical target for those cases.

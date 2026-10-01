@@ -40,6 +40,10 @@ _Static_assert(FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH == (1ULL << 42),
 	       "unexpected writeback-cache passthrough capability bit");
 _Static_assert(FUSE_EXTFUSE_WBCACHE_PASSTHROUGH == (1ULL << 51),
 	       "unexpected writeback-cache passthrough wire bit");
+_Static_assert(FUSE_CAP_WBCACHE_PASSTHROUGH_DIO == (1ULL << 52),
+	       "unexpected writeback-cache DIO capability bit");
+_Static_assert(FUSE_WBCACHE_PASSTHROUGH_DIO == (1ULL << 61),
+	       "unexpected writeback-cache DIO wire bit");
 _Static_assert(FOPEN_EXTFUSE_WBCACHE_PASSTHROUGH == (1U << 8),
 	       "unexpected writeback-cache passthrough open bit");
 _Static_assert(FUSE_OVER_IO_URING == (1ULL << 41),
@@ -116,6 +120,11 @@ enum test_mode {
 	MODE_WANTED_WBCACHE_ATTR_RELEASE_BARRIER,
 	MODE_WANTED_READ_UPCALL_ONLY,
 	MODE_WANTED_WBCACHE_WRITE_STREAM,
+	MODE_WANTED_WBCACHE_DIO,
+	MODE_WBCACHE_DIO_WITHOUT_WRITEBACK,
+	MODE_WBCACHE_DIO_WITH_NATIVE,
+	MODE_WBCACHE_DIO_WITH_EXTFUSE,
+	MODE_FORCE_WBCACHE_DIO,
 	MODE_FORCE_INVALID_WANT,
 	MODE_FORCE_ATTR_REFRESH_WANT,
 	MODE_FORCE_ATTR_RELEASE_BARRIER_WANT,
@@ -142,6 +151,7 @@ struct test_state {
 	bool wbcache_helper_enabled;
 	bool read_upcall_only_helper_enabled;
 	bool wbcache_write_stream_helper_enabled;
+	bool wbcache_dio_helper_enabled;
 	_Alignas(max_align_t)
 	unsigned char reply[sizeof(struct fuse_out_header) +
 			    sizeof(struct fuse_init_out)];
@@ -171,7 +181,25 @@ static void test_init(void *userdata, struct fuse_conn_info *conn)
 	state->saw_wbcache_write_stream_capability = fuse_get_feature_flag(
 		conn, FUSE_CAP_EXTFUSE_WBCACHE_WRITE_STREAM);
 
-	if (state->mode == MODE_WANTED_WBCACHE_WRITE_STREAM) {
+	if (state->mode == MODE_WANTED_WBCACHE_DIO ||
+	    state->mode == MODE_WBCACHE_DIO_WITHOUT_WRITEBACK ||
+	    state->mode == MODE_WBCACHE_DIO_WITH_NATIVE ||
+	    state->mode == MODE_WBCACHE_DIO_WITH_EXTFUSE) {
+		state->wbcache_dio_helper_enabled = fuse_set_feature_flag(
+			conn, FUSE_CAP_WBCACHE_PASSTHROUGH_DIO);
+		if (state->mode != MODE_WBCACHE_DIO_WITHOUT_WRITEBACK)
+			fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
+		else
+			fuse_unset_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
+		if (state->mode == MODE_WBCACHE_DIO_WITH_NATIVE)
+			fuse_set_feature_flag(conn, FUSE_CAP_PASSTHROUGH);
+		if (state->mode == MODE_WBCACHE_DIO_WITH_EXTFUSE)
+			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE);
+		conn->max_backing_stack_depth = FUSE_BACKING_STACKED_UNDER;
+	} else if (state->mode == MODE_FORCE_WBCACHE_DIO) {
+		conn->want_ext |= FUSE_CAP_WBCACHE_PASSTHROUGH_DIO |
+				     FUSE_CAP_WRITEBACK_CACHE;
+	} else if (state->mode == MODE_WANTED_WBCACHE_WRITE_STREAM) {
 		state->helper_enabled =
 			fuse_set_feature_flag(conn, FUSE_CAP_EXTFUSE);
 		fuse_set_feature_flag(conn, FUSE_CAP_WRITEBACK_CACHE);
@@ -603,6 +631,24 @@ static int run_case_flags(bool advertise, bool advertise_uring,
 			"paper WBCache passthrough opt-in was not serialized\n");
 		goto out_session;
 	}
+	if (mode == MODE_WANTED_WBCACHE_DIO &&
+	    (!state.wbcache_dio_helper_enabled ||
+	     (reply_flags & (FUSE_WRITEBACK_CACHE |
+			    FUSE_WBCACHE_PASSTHROUGH_DIO)) !=
+			   (FUSE_WRITEBACK_CACHE |
+			    FUSE_WBCACHE_PASSTHROUGH_DIO) ||
+	     (reply_flags & (FUSE_FS_EXTFUSE | FUSE_PASSTHROUGH |
+			    FUSE_EXTFUSE_WBCACHE_PASSTHROUGH)) ||
+	     reply_init->max_stack_depth != 1)) {
+		fprintf(stderr, "%s: standalone WBCache DIO negotiation failed\n",
+			name);
+		goto out_session;
+	}
+	if (mode == MODE_NOT_WANTED &&
+	    (reply_flags & FUSE_WBCACHE_PASSTHROUGH_DIO)) {
+		fprintf(stderr, "%s: WBCache DIO enabled without opt-in\n", name);
+		goto out_session;
+	}
 	if (mode == MODE_WANTED_READ_UPCALL_ONLY &&
 	    (!state.read_upcall_only_helper_enabled ||
 	     !(reply_flags & FUSE_EXTFUSE_READ_UPCALL_ONLY) ||
@@ -658,6 +704,28 @@ int main(void)
 		FUSE_WRITEBACK_CACHE |
 		FUSE_EXTFUSE_WBCACHE_PASSTHROUGH;
 	int failed = 0;
+	const uint64_t dio_flags = FUSE_WRITEBACK_CACHE |
+				   FUSE_WBCACHE_PASSTHROUGH_DIO;
+
+	failed |= run_case_flags(false, false, false, false, false, false,
+				dio_flags, MODE_NOT_WANTED, false,
+				"wbcache-dio-advertised-not-wanted");
+	failed |= run_case_flags(false, false, false, false, false, false,
+				dio_flags, MODE_WANTED_WBCACHE_DIO, false,
+				"wbcache-dio-without-ebpf");
+	failed |= run_case_flags(false, false, false, false, false, false,
+				dio_flags, MODE_WBCACHE_DIO_WITHOUT_WRITEBACK,
+				true, "wbcache-dio-without-writeback-rejected");
+	failed |= run_case_flags(false, false, false, false, false, false,
+				dio_flags | FUSE_PASSTHROUGH,
+				MODE_WBCACHE_DIO_WITH_NATIVE, true,
+				"wbcache-dio-with-native-rejected");
+	failed |= run_case_flags(true, false, false, false, false, false,
+				dio_flags, MODE_WBCACHE_DIO_WITH_EXTFUSE, true,
+				"wbcache-dio-with-extfuse-rejected");
+	failed |= run_case_flags(false, false, false, false, false, false,
+				FUSE_WRITEBACK_CACHE, MODE_FORCE_WBCACHE_DIO,
+				true, "wbcache-dio-unadvertised-rejected");
 
 	failed |= run_case(false, false, false, false, false, false, MODE_NOT_WANTED,
 			   false, "not-advertised-not-wanted");

@@ -2892,6 +2892,15 @@ static bool want_flag_dependencies_valid(uint64_t want)
 		wbcache_attr_refresh_dependencies |
 		FUSE_CAP_EXTFUSE_PASSTHROUGH_ATTR_REFRESH;
 
+	if ((want & FUSE_CAP_WBCACHE_PASSTHROUGH_DIO) &&
+	    (!(want & FUSE_CAP_WRITEBACK_CACHE) ||
+	     (want & (FUSE_CAP_PASSTHROUGH | FUSE_CAP_EXTFUSE |
+		      FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH)))) {
+		fuse_log(FUSE_LOG_ERR,
+			 "fuse: writeback-cache DIO forwarding requires writeback cache and excludes native passthrough and ExtFUSE\n");
+		return false;
+	}
+
 	if ((want & FUSE_CAP_EXTFUSE_PASSTHROUGH_COHERENCE) &&
 	    (want & coherence_dependencies) != coherence_dependencies) {
 		fuse_log(FUSE_LOG_ERR,
@@ -3245,6 +3254,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			se->conn.capable_ext |= FUSE_CAP_IO_URING_RUNTIME;
 		if (inargflags & FUSE_HAS_WORKLOAD_MONITOR)
 			se->conn.capable_ext |= FUSE_CAP_WORKLOAD_MONITOR;
+		if (inargflags & FUSE_WBCACHE_PASSTHROUGH_DIO)
+			se->conn.capable_ext |= FUSE_CAP_WBCACHE_PASSTHROUGH_DIO;
 
 	} else {
 		se->conn.max_readahead = 0;
@@ -3417,7 +3428,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_DIRECT_IO_ALLOW_MMAP;
 	if (se->conn.want_ext &
 	    (FUSE_CAP_PASSTHROUGH |
-	     FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH)) {
+	     FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH |
+	     FUSE_CAP_WBCACHE_PASSTHROUGH_DIO)) {
 		if (se->conn.want_ext & FUSE_CAP_PASSTHROUGH)
 			outargflags |= FUSE_PASSTHROUGH;
 		/*
@@ -3467,6 +3479,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 		outargflags |= FUSE_EXTFUSE_SYNCFS_PURE;
 	if (se->conn.want_ext & FUSE_CAP_EXTFUSE_PAPER_READ_GUARD)
 		outargflags |= FUSE_EXTFUSE_PAPER_READ_GUARD;
+	if (se->conn.want_ext & FUSE_CAP_WBCACHE_PASSTHROUGH_DIO)
+		outargflags |= FUSE_WBCACHE_PASSTHROUGH_DIO;
 
 	if (se->uring.runtime_qd)
 		outargflags |= FUSE_HAS_IO_URING_RUNTIME | FUSE_HAS_WORKLOAD_MONITOR;
@@ -3508,7 +3522,8 @@ _do_init(fuse_req_t req, const fuse_ino_t nodeid, const void *op_in,
 			outarg.time_gran);
 		if (se->conn.want_ext &
 		    (FUSE_CAP_PASSTHROUGH |
-		     FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH))
+		     FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH |
+		     FUSE_CAP_WBCACHE_PASSTHROUGH_DIO))
 			fuse_log(FUSE_LOG_DEBUG, "   max_stack_depth=%u\n",
 				outarg.max_stack_depth);
 		if (se->conn.want_ext & FUSE_CAP_EXTFUSE)

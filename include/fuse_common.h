@@ -97,9 +97,10 @@ struct fuse_file_info {
 	uint32_t parallel_direct_writes : 1;
 
 	/**
-	 * Keep the FUSE page cache and let an ExtFUSE policy forward ordinary
-	 * page-backed READ/WRITE requests to backing_id.  This is distinct from
-	 * native FOPEN_PASSTHROUGH, which bypasses the upper page cache.
+	 * Keep the FUSE page cache and forward page-backed READ/WRITE requests
+	 * to backing_id. Requires FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH or
+	 * FUSE_CAP_WBCACHE_PASSTHROUGH_DIO. This is distinct from native
+	 * FOPEN_PASSTHROUGH, which bypasses the upper page cache.
 	 */
 	uint32_t extfuse_wbcache_passthrough : 1;
 
@@ -712,6 +713,15 @@ struct fuse_loop_config_v1 {
 #define FUSE_CAP_WORKLOAD_MONITOR (1ULL << 51)
 
 /**
+ * Experimental registered-backing-file forwarding below the FUSE writeback
+ * cache. Aligned page requests use lower direct I/O; tails may use the lower
+ * buffered fallback. Requires writeback cache and excludes native passthrough
+ * and ExtFUSE policy. All reads and writes retain the upper FUSE cache.
+ * This capability makes no performance guarantee.
+ */
+#define FUSE_CAP_WBCACHE_PASSTHROUGH_DIO (1ULL << 52)
+
+/**
  * Ioctl flags
  *
  * FUSE_IOCTL_COMPAT: 32bit compat ioctl on 64bit machine
@@ -851,8 +861,8 @@ struct fuse_conn_info {
 	uint32_t time_gran;
 
 	/**
-	 * When FUSE_CAP_PASSTHROUGH or
-	 * FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH is enabled, this is the maximum
+	 * When FUSE_CAP_PASSTHROUGH, FUSE_CAP_EXTFUSE_WBCACHE_PASSTHROUGH or
+	 * FUSE_CAP_WBCACHE_PASSTHROUGH_DIO is enabled, this is the maximum
 	 * allowed stacking depth of the backing files.  In current kernel, the maximum
 	 * allowed stack depth if FILESYSTEM_MAX_STACK_DEPTH (2), which includes
 	 * the FUSE passthrough layer, so the maximum stacking depth for backing
